@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "relcoord-version-service"
+version = "0.1.0"
+description = "Image version service for relcoord."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "hypercorn>=0.17.3,<1.0.0",
+  "starlette>=0.48.0,<1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28.1,<1.0.0",
+  "pytest>=8.4.2,<9.0.0",
+]
+
+[project.scripts]
+relcoord = "relcoord.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/relcoord"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
