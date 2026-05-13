@@ -3,10 +3,12 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "relcoord-version-service"
+name = "relcoord"
 version = "0.1.0"
 description = "Image version service for relcoord."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = [
   "hypercorn>=0.17.3,<1.0.0",
@@ -17,6 +19,9 @@ dependencies = [
 dev = [
   "httpx>=0.28.1,<1.0.0",
   "pytest>=8.4.2,<9.0.0",
+  "pytest",
+  "ty",
+  "ruff",
 ]
 
 [project.scripts]

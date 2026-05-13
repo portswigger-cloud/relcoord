@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 PortSwigger Ltd
+
+
 class ValidationError(Exception):
     """Raised when a request cannot be validated."""
 
@@ -10,7 +14,9 @@ class ValidationError(Exception):
 class EquivalentVersionExistsError(Exception):
     """Raised when a second build-metadata-only variant is registered."""
 
-    def __init__(self, image: str, existing_version: str, requested_version: str) -> None:
+    def __init__(
+        self, image: str, existing_version: str, requested_version: str
+    ) -> None:
         message = (
             f"image {image!r} already has version {existing_version!r} with the same "
             f"Semantic Version precedence as {requested_version!r}"

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from starlette.testclient import TestClient
 
 from relcoord.app import create_app
@@ -21,7 +23,12 @@ def test_register_and_resolve_latest_version() -> None:
     )
     latest = client.post(
         "/v1/images/latest",
-        json={"images": ["registry.example.com/team/api", "registry.example.com/team/worker"]},
+        json={
+            "images": [
+                "registry.example.com/team/api",
+                "registry.example.com/team/worker",
+            ]
+        },
     )
 
     assert created.status_code == 201

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -47,10 +49,14 @@ class SemanticVersion:
 
         prerelease_value = match.group(4)
         build_value = match.group(5)
-        prerelease = tuple(
-            PrereleaseIdentifier(raw=identifier)
-            for identifier in prerelease_value.split(".")
-        ) if prerelease_value else ()
+        prerelease = (
+            tuple(
+                PrereleaseIdentifier(raw=identifier)
+                for identifier in prerelease_value.split(".")
+            )
+            if prerelease_value
+            else ()
+        )
         build = tuple(build_value.split(".")) if build_value else ()
         return cls(
             original=value,
@@ -75,7 +81,11 @@ class SemanticVersion:
         if not isinstance(other, SemanticVersion):
             return NotImplemented
 
-        if (self.major, self.minor, self.patch) != (other.major, other.minor, other.patch):
+        if (self.major, self.minor, self.patch) != (
+            other.major,
+            other.minor,
+            other.patch,
+        ):
             return (self.major, self.minor, self.patch) < (
                 other.major,
                 other.minor,

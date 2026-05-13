@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
 from relcoord.errors import EquivalentVersionExistsError
@@ -11,10 +13,14 @@ class InMemoryImageVersionRepository(ImageVersionRepository):
         self._versions_by_image: dict[str, dict[str, StoredVersion]] = {}
         self._precedence_index: dict[str, dict[tuple[object, ...], str]] = {}
 
-    async def register(self, image: str, semantic_version: SemanticVersion) -> RegisterResult:
+    async def register(
+        self, image: str, semantic_version: SemanticVersion
+    ) -> RegisterResult:
         image_versions = self._versions_by_image.setdefault(image, {})
         if semantic_version.original in image_versions:
-            return RegisterResult(image=image, version=semantic_version.original, created=False)
+            return RegisterResult(
+                image=image, version=semantic_version.original, created=False
+            )
 
         precedence_index = self._precedence_index.setdefault(image, {})
         precedence_key = semantic_version.precedence_key()
@@ -32,7 +38,9 @@ class InMemoryImageVersionRepository(ImageVersionRepository):
             semantic_version=semantic_version,
         )
         precedence_index[precedence_key] = semantic_version.original
-        return RegisterResult(image=image, version=semantic_version.original, created=True)
+        return RegisterResult(
+            image=image, version=semantic_version.original, created=True
+        )
 
     async def latest_for_image(self, image: str) -> str | None:
         image_versions = self._versions_by_image.get(image)
