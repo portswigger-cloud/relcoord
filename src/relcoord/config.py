@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass
-import os
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -12,8 +13,10 @@ class Settings:
     port: int = 8000
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_toml(cls, path: str | Path) -> "Settings":
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
         return cls(
-            host=os.getenv("RELCOORD_VERSION_SERVICE_HOST", cls.host),
-            port=int(os.getenv("RELCOORD_VERSION_SERVICE_PORT", str(cls.port))),
+            host=data.get("host", cls.host),
+            port=data.get("port", cls.port),
         )
