@@ -22,6 +22,20 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Compute Docker image tag
+        id: image-version
+        run: |
+          image_version="$(uv run --locked --extra dev bktools-image-version-hash)"
+          echo "tag=public.ecr.aws/w5l8e4i9/relcoord:${image_version}" >> "$GITHUB_OUTPUT"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -41,4 +55,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: public.ecr.aws/w5l8e4i9/relcoord:latest
+          tags: ${{ steps.image-version.outputs.tag }}

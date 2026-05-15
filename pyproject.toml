@@ -9,7 +9,7 @@ description = "Image version service for relcoord."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
   "click>=8.1.0,<9.0.0",
   "hypercorn>=0.17.3,<1.0.0",
@@ -23,7 +23,11 @@ dev = [
   "pytest",
   "ty",
   "ruff",
+  "bktools",
 ]
+
+[[tool.uv.index]]
+url = "https://repo.noa.re/"
 
 [project.scripts]
 relcoord = "relcoord.main:main"
