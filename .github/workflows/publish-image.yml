@@ -33,7 +33,7 @@ jobs:
       - name: Compute Docker image tag
         id: image-version
         run: |
-          image_version="$(uv run --locked --extra dev bktools-image-version-hash)"
+          image_version="$(uv run --locked --group dev bktools-image-version-hash)"
           echo "tag=public.ecr.aws/w5l8e4i9/relcoord:${image_version}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
