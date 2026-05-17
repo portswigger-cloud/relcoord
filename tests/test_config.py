@@ -115,6 +115,25 @@ def test_settings_rejects_duplicate_role_names(tmp_path: Path) -> None:
         Settings.from_toml(config)
 
 
+def test_settings_explains_multiline_inline_table_parse_errors(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [persistence]
+        uri = "ws://surrealdb:8000/"
+        idmouse = {
+            url = "http://idmouse:9000/token",
+            token_path = "/tmp/idmouse-token"
+        }
+        """
+    )
+
+    with pytest.raises(ValueError, match=r"tomllib parses TOML 1\.0\.0"):
+        Settings.from_toml(config)
+
+
 def test_settings_rejects_persistence_without_idmouse(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(
