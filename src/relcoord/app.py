@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
@@ -13,6 +17,8 @@ from starlette.routing import Route
 from relcoord.errors import TimestampConflictError, ValidationError
 from relcoord.repository import ImageVersionRepository
 from relcoord.service import ImageVersionService
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(repository: ImageVersionRepository) -> Starlette:
@@ -81,12 +87,41 @@ def create_app(repository: ImageVersionRepository) -> Starlette:
         return JSONResponse({"versions": versions})
 
     return Starlette(
+        middleware=[Middleware(RequestLoggingMiddleware)],
         routes=[
             Route("/healthz", health, methods=["GET"]),
             Route("/v1/image-versions", register_image_version, methods=["POST"]),
             Route("/v1/images/latest", latest_versions, methods=["POST"]),
-        ]
+        ],
     )
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        start = perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = (perf_counter() - start) * 1000
+            logger.exception(
+                "HTTP request %s %s failed after %.2f ms",
+                request.method,
+                request.url.path,
+                elapsed_ms,
+            )
+            raise
+
+        elapsed_ms = (perf_counter() - start) * 1000
+        logger.info(
+            "HTTP request %s %s completed with status %s in %.2f ms",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
+        return response
 
 
 async def _read_json(request: Request) -> dict[str, Any]:

@@ -12,8 +12,10 @@ license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
   "click>=8.1.0,<9.0.0",
+  "httpx>=0.28.1,<1.0.0",
   "hypercorn>=0.17.3,<1.0.0",
   "starlette>=0.48.0,<1.0.0",
+  "surrealdb>=2.0.0,<3.0.0",
 ]
 
 [dependency-groups]

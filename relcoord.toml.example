@@ -1,0 +1,13 @@
+# Example relcoord configuration.
+
+host = "0.0.0.0"
+port = 8080
+
+[persistence]
+uri = "ws://localhost:8000"
+namespace = "default"
+database = "relcoord"
+
+[persistence.idmouse]
+url = "http://localhost:9000/token/relcoord"
+token_path = "/tmp/idmouse-bearer-token"
