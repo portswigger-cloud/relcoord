@@ -12,9 +12,7 @@ from jwt import InvalidTokenError, PyJWKClient, PyJWKClientError
 
 DEFAULT_ALGORITHMS: tuple[str, ...] = ("RS256",)
 KUBERNETES_SERVICE_HOST = "https://kubernetes.default.svc"
-KUBERNETES_CA_CERT_PATH = Path(
-    "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-)
+KUBERNETES_CA_CERT_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 KUBERNETES_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 ALLOWED_ALGORITHMS: frozenset[str] = frozenset(
     {
