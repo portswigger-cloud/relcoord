@@ -30,18 +30,8 @@ def create_app(store: ImageInfoStore) -> Starlette:
     async def register_image_version(request: Request) -> Response:
         try:
             payload = await _read_json(request)
-            image = _required_non_empty_string(
-                payload,
-                "image",
-                error="invalid_image",
-                message="image must be a non-empty string",
-            )
-            version = _required_non_empty_string(
-                payload,
-                "version",
-                error="invalid_version",
-                message="version must be a non-empty string",
-            )
+            image = ensure_string(payload, "image")
+            version = ensure_string(payload, "version")
             timestamp = payload["timestamp"] if "timestamp" in payload else None
             if "timestamp" in payload and timestamp is None:
                 raise ValidationError(
@@ -74,30 +64,10 @@ def create_app(store: ImageInfoStore) -> Starlette:
     async def change(request: Request) -> Response:
         try:
             payload = await _read_json(request)
-            repo = _required_non_empty_string(
-                payload,
-                "repo",
-                error="invalid_repo",
-                message="repo must be a non-empty string",
-            )
-            commit = _required_non_empty_string(
-                payload,
-                "commit",
-                error="invalid_commit",
-                message="commit must be a non-empty string",
-            )
-            image = _optional_non_empty_string(
-                payload,
-                "image",
-                error="invalid_image",
-                message="image must be a non-empty string",
-            )
-            tag = _optional_non_empty_string(
-                payload,
-                "tag",
-                error="invalid_tag",
-                message="tag must be a non-empty string",
-            )
+            repo = ensure_string(payload, "repo")
+            commit = ensure_string(payload, "commit")
+            image = ensure_string(payload, "image") if "image" in payload else None
+            tag = ensure_string(payload, "tag") if "tag" in payload else None
             if (image is None) != (tag is None):
                 raise ValidationError(
                     error="invalid_image_tag_pairing",
@@ -199,25 +169,13 @@ async def _read_json(request: Request) -> dict[str, Any]:
     return payload
 
 
-def _required_non_empty_string(
-    payload: dict[str, Any], field: str, *, error: str, message: str
-) -> str:
+def ensure_string(payload: dict[str, Any], field: str) -> str:
     value = payload.get(field)
     if not isinstance(value, str) or not value.strip():
-        raise ValidationError(error=error, message=message)
-    return value
-
-
-def _optional_non_empty_string(
-    payload: dict[str, Any], field: str, *, error: str, message: str
-) -> str | None:
-    if field not in payload:
-        return None
-    value = payload[field]
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValidationError(error=error, message=message)
+        raise ValidationError(
+            error=f"invalid_{field}",
+            message=f"{field} must be a non-empty string",
+        )
     return value
 
 
