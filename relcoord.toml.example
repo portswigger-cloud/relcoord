@@ -11,3 +11,18 @@ database = "relcoord"
 [persistence.idmouse]
 url = "http://localhost:9000/token/relcoord"
 token_path = "/tmp/idmouse-bearer-token"
+
+# Bearer-token authentication for write endpoints. Each [[role]] entry
+# describes one acceptable JWT issuer. A request to /v1/image-versions or
+# /v1/change must present a Bearer token that validates against at least one
+# role. Read endpoints (/healthz, /v1/images/latest) are not authenticated.
+
+[[role]]
+name = "kubernetes-default"
+audience = "relcoord"
+issuer = "https://kubernetes.default.svc"
+jwks-uri = "https://kubernetes.default.svc/openid/v1/jwks"
+algorithms = ["RS256"]
+
+[role.claims]
+sub = "system:serviceaccount:default:default"

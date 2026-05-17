@@ -14,6 +14,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from relcoord.auth import AuthError, TokenValidator, extract_bearer_token
 from relcoord.errors import TimestampConflictError, ValidationError
 from relcoord.service import ImageVersionService
 from relcoord.store import ImageInfoStore
@@ -21,13 +22,29 @@ from relcoord.store import ImageInfoStore
 logger = logging.getLogger(__name__)
 
 
-def create_app(store: ImageInfoStore) -> Starlette:
+def create_app(
+    store: ImageInfoStore, token_validator: TokenValidator | None = None
+) -> Starlette:
     service = ImageVersionService(store=store)
+
+    def _require_auth(request: Request) -> Response | None:
+        if token_validator is None:
+            return None
+        try:
+            header = request.headers.get("authorization")
+            token = extract_bearer_token(header)
+            token_validator.validate(token)
+        except AuthError as exc:
+            return _json_error(status_code=401, error="unauthorized", message=str(exc))
+        return None
 
     async def health(_: Request) -> Response:
         return JSONResponse({"status": "ok"})
 
     async def register_image_version(request: Request) -> Response:
+        unauthorized = _require_auth(request)
+        if unauthorized is not None:
+            return unauthorized
         try:
             payload = await _read_json(request)
             image = ensure_string(payload, "image")
@@ -62,6 +79,9 @@ def create_app(store: ImageInfoStore) -> Starlette:
         )
 
     async def change(request: Request) -> Response:
+        unauthorized = _require_auth(request)
+        if unauthorized is not None:
+            return unauthorized
         try:
             payload = await _read_json(request)
             repo = ensure_string(payload, "repo")
