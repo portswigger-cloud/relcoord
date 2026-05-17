@@ -21,3 +21,17 @@ Start the service locally:
 ```bash
 uv run relcoord
 ```
+
+By default the service uses in-memory storage. See `relcoord.toml.example`
+for a remote SurrealDB backend configured with idmouse-issued database tokens:
+
+```toml
+[persistence]
+uri = "ws://localhost:8000/"
+namespace = "default"
+database = "relcoord"
+
+[persistence.idmouse]
+url = "http://localhost:9000/token"
+token_path = "/tmp/idmouse-bearer-token"
+```

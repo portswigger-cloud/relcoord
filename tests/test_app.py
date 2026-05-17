@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
+import logging
 from datetime import datetime
 
 import pytest
@@ -20,6 +21,15 @@ def test_healthz(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_logs_requests(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="relcoord.app")
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert "HTTP request GET /healthz completed with status 200" in caplog.text
 
 
 def test_register_and_resolve_latest_version(client: TestClient) -> None:
