@@ -17,7 +17,7 @@ from surrealdb import AsyncSurreal
 from relcoord.config import IdmouseSettings, PersistenceSettings
 from relcoord.errors import TimestampConflictError
 from relcoord.models import RegisterResult
-from relcoord.repository import ImageVersionRepository
+from relcoord.store import ImageInfoStore
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class IdmouseClient:
             await self._client.aclose()
 
 
-class SurrealImageVersionRepository(ImageVersionRepository):
+class SurrealImageInfoStore(ImageInfoStore):
     def __init__(
         self,
         db: Any,
@@ -89,9 +89,7 @@ class SurrealImageVersionRepository(ImageVersionRepository):
         self._renew_task: asyncio.Task[None] | None = None
 
     @classmethod
-    async def connect(
-        cls, config: PersistenceSettings
-    ) -> "SurrealImageVersionRepository":
+    async def connect(cls, config: PersistenceSettings) -> "SurrealImageInfoStore":
         db = AsyncSurreal(config.uri)
         await db.connect(config.uri)
 
@@ -104,16 +102,16 @@ class SurrealImageVersionRepository(ImageVersionRepository):
         )
 
         await db.use(config.namespace, config.database)
-        repository = cls(db, idmouse_client)
-        await repository.setup_db()
+        store = cls(db, idmouse_client)
+        await store.setup_db()
         logger.info(
             "Connected to SurrealDB at %s using namespace %s and database %s",
             config.uri,
             config.namespace,
             config.database,
         )
-        repository._start_token_renewal(idmouse_client, initial_lease)
-        return repository
+        store._start_token_renewal(idmouse_client, initial_lease)
+        return store
 
     async def setup_db(self) -> None:
         await self._db.query(

@@ -7,13 +7,13 @@ import pytest
 from starlette.testclient import TestClient
 
 from relcoord.app import create_app
-from relcoord.in_memory_repository import InMemoryImageVersionRepository
+from relcoord.in_memory_store import InMemoryImageInfoStore
 
 
 @pytest.fixture
 def client() -> TestClient:
-    repository = InMemoryImageVersionRepository()
-    return TestClient(create_app(repository))
+    store = InMemoryImageInfoStore()
+    return TestClient(create_app(store))
 
 
 def test_healthz(client: TestClient) -> None:
@@ -161,6 +161,87 @@ def test_reject_invalid_timestamp(client: TestClient, timestamp: str | None) -> 
         "error": "invalid_timestamp",
         "message": "timestamp must be a valid RFC 3339 timestamp with timezone",
     }
+
+
+def test_change_registers_image_version_when_image_and_tag_present(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/v1/change",
+        json={
+            "repo": "acme/api",
+            "commit": "abc123",
+            "image": "registry.example.com/team/api",
+            "tag": "1.2.3",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["repo"] == "acme/api"
+    assert body["commit"] == "abc123"
+    assert body["registered"]["image"] == "registry.example.com/team/api"
+    assert body["registered"]["version"] == "1.2.3"
+    assert body["registered"]["created"] is True
+
+    latest = client.post(
+        "/v1/images/latest",
+        json={"images": ["registry.example.com/team/api"]},
+    )
+    assert latest.json() == {"versions": {"registry.example.com/team/api": "1.2.3"}}
+
+
+def test_change_without_image_and_tag_acknowledges_without_registering(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/v1/change",
+        json={"repo": "acme/config", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "repo": "acme/config",
+        "commit": "deadbeef",
+        "registered": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("json", "expected_error"),
+    [
+        ({"commit": "abc123"}, "invalid_repo"),
+        ({"repo": "acme/api"}, "invalid_commit"),
+        (
+            {"repo": "acme/api", "commit": "abc123", "image": "registry.example.com/x"},
+            "invalid_image_tag_pairing",
+        ),
+        (
+            {"repo": "acme/api", "commit": "abc123", "tag": "1.2.3"},
+            "invalid_image_tag_pairing",
+        ),
+        (
+            {"repo": "acme/api", "commit": "abc123", "image": "", "tag": "1.2.3"},
+            "invalid_image",
+        ),
+        (
+            {
+                "repo": "acme/api",
+                "commit": "abc123",
+                "image": "registry.example.com/x",
+                "tag": "",
+            },
+            "invalid_tag",
+        ),
+    ],
+)
+def test_change_rejects_invalid_payloads(
+    client: TestClient, json: dict[str, object], expected_error: str
+) -> None:
+    response = client.post("/v1/change", json=json)
+
+    assert response.status_code == 400
+    assert response.json()["error"] == expected_error
 
 
 def test_reject_timestamp_conflict(client: TestClient) -> None:
