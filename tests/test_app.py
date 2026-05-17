@@ -60,7 +60,10 @@ def test_register_and_resolve_latest_version(client: TestClient) -> None:
 def test_register_accepts_opaque_version(client: TestClient) -> None:
     response = client.post(
         "/v1/image-versions",
-        json={"image": "registry.example.com/team/api", "version": "release-2026-05-17"},
+        json={
+            "image": "registry.example.com/team/api",
+            "version": "release-2026-05-17",
+        },
     )
 
     body = response.json()
@@ -133,9 +136,7 @@ def test_reject_invalid_latest_request_fields(
 
 
 @pytest.mark.parametrize("timestamp", ["not-a-timestamp", "2026-05-17T10:15:30", None])
-def test_reject_invalid_timestamp(
-    client: TestClient, timestamp: str | None
-) -> None:
+def test_reject_invalid_timestamp(client: TestClient, timestamp: str | None) -> None:
     response = client.post(
         "/v1/image-versions",
         json={
