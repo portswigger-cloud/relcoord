@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -10,6 +11,11 @@ import jwt
 from jwt import InvalidTokenError, PyJWKClient, PyJWKClientError
 
 DEFAULT_ALGORITHMS: tuple[str, ...] = ("RS256",)
+KUBERNETES_SERVICE_HOST = "https://kubernetes.default.svc"
+KUBERNETES_CA_CERT_PATH = Path(
+    "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+)
+KUBERNETES_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 ALLOWED_ALGORITHMS: frozenset[str] = frozenset(
     {
         "HS256",
@@ -164,7 +170,7 @@ def _jwks_uri_for_role(role: RoleConfig) -> str:
         f"{role.issuer.rstrip('/')}/.well-known/openid-configuration"
     )
     try:
-        response = httpx.get(openid_configuration_url, timeout=10.0)
+        response = _get_openid_configuration(role.issuer, openid_configuration_url)
         response.raise_for_status()
         openid_configuration = response.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -184,6 +190,24 @@ def _jwks_uri_for_role(role: RoleConfig) -> str:
             f"OpenID configuration for role '{role.name}' must include jwks_uri"
         )
     return jwks_uri
+
+
+def _get_openid_configuration(issuer: str, url: str) -> httpx.Response:
+    kwargs: dict[str, Any] = {"timeout": 10.0}
+    if issuer == KUBERNETES_SERVICE_HOST:
+        kwargs.update(_kubernetes_request_options())
+    return httpx.get(url, **kwargs)
+
+
+def _kubernetes_request_options() -> dict[str, Any]:
+    options: dict[str, Any] = {}
+    if KUBERNETES_CA_CERT_PATH.exists():
+        options["verify"] = KUBERNETES_CA_CERT_PATH
+    if KUBERNETES_TOKEN_PATH.exists():
+        token = KUBERNETES_TOKEN_PATH.read_text().strip()
+        if token:
+            options["headers"] = {"Authorization": f"Bearer {token}"}
+    return options
 
 
 def _required_string(

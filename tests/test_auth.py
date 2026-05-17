@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -147,6 +148,47 @@ def test_validator_discovers_jwks_uri_from_issuer(signing_key: PyJWK) -> None:
     )
     mock_jwks_client.assert_called_once_with(
         "https://issuer.example.com/keys", cache_keys=True
+    )
+
+
+def test_validator_uses_kubernetes_service_account_for_issuer_discovery(
+    tmp_path: Path, signing_key: PyJWK
+) -> None:
+    ca_cert = tmp_path / "ca.crt"
+    token = tmp_path / "token"
+    ca_cert.write_text("ca certificate")
+    token.write_text("local-kubernetes-token\n")
+    role = RoleConfig(
+        name="default",
+        audience="relcoord",
+        issuer="https://kubernetes.default.svc",
+    )
+
+    with (
+        patch("relcoord.auth.KUBERNETES_CA_CERT_PATH", ca_cert),
+        patch("relcoord.auth.KUBERNETES_TOKEN_PATH", token),
+        patch("relcoord.auth.httpx.get") as mock_get,
+        patch("relcoord.auth.PyJWKClient") as mock_jwks_client,
+    ):
+        mock_get.return_value = httpx.Response(
+            200,
+            json={"jwks_uri": "https://kubernetes.default.svc/openid/v1/jwks"},
+            request=httpx.Request(
+                "GET",
+                "https://kubernetes.default.svc/.well-known/openid-configuration",
+            ),
+        )
+        mock_client = MagicMock()
+        mock_client.get_signing_key_from_jwt.return_value = signing_key
+        mock_jwks_client.return_value = mock_client
+
+        TokenValidator([role])
+
+    mock_get.assert_called_once_with(
+        "https://kubernetes.default.svc/.well-known/openid-configuration",
+        timeout=10.0,
+        verify=ca_cert,
+        headers={"Authorization": "Bearer local-kubernetes-token"},
     )
 
 
