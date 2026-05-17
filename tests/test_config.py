@@ -62,6 +62,59 @@ def test_settings_accepts_idmouse_bearer_token_file_alias(tmp_path: Path) -> Non
     assert settings.persistence.idmouse.token_path == token_file
 
 
+def test_settings_parses_role_entries(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[role]]
+        name = "kubernetes-default"
+        audience = "relcoord"
+        issuer = "https://kubernetes.default.svc"
+        jwks-uri = "https://kubernetes.default.svc/openid/v1/jwks"
+
+        [role.claims]
+        sub = "system:serviceaccount:default:default"
+
+        [[role]]
+        name = "buildkite"
+        audience = "relcoord"
+        issuer = "https://agent.buildkite.com"
+        jwks-uri = "https://agent.buildkite.com/.well-known/jwks"
+        algorithms = ["RS256", "ES256"]
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert len(settings.roles) == 2
+    assert settings.roles[0].name == "kubernetes-default"
+    assert settings.roles[0].jwks_uri == "https://kubernetes.default.svc/openid/v1/jwks"
+    assert settings.roles[0].claims == {"sub": "system:serviceaccount:default:default"}
+    assert settings.roles[1].algorithms == ("RS256", "ES256")
+
+
+def test_settings_rejects_duplicate_role_names(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[role]]
+        name = "x"
+        audience = "relcoord"
+        issuer = "https://issuer"
+        jwks-uri = "https://issuer/.well-known/jwks.json"
+
+        [[role]]
+        name = "x"
+        audience = "relcoord"
+        issuer = "https://issuer"
+        jwks-uri = "https://issuer/.well-known/jwks.json"
+        """
+    )
+
+    with pytest.raises(ValueError, match="duplicate role 'x'"):
+        Settings.from_toml(config)
+
+
 def test_settings_rejects_persistence_without_idmouse(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(

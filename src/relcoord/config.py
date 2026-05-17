@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from relcoord.auth import RoleConfig
 
 
 def _read_secret_file(path: Path) -> str:
@@ -63,6 +65,7 @@ class Settings:
     host: str = "0.0.0.0"
     port: int = 8000
     persistence: PersistenceSettings | None = None
+    roles: list[RoleConfig] = field(default_factory=list)
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "Settings":
@@ -71,12 +74,26 @@ class Settings:
         persistence = data.get("persistence")
         if persistence is not None and not isinstance(persistence, dict):
             raise ValueError("persistence must be a table")
+        raw_roles = data.get("role", [])
+        if not isinstance(raw_roles, list):
+            raise ValueError("role must be an array of tables")
+        roles: list[RoleConfig] = []
+        seen: set[str] = set()
+        for entry in raw_roles:
+            if not isinstance(entry, dict):
+                raise ValueError("each role entry must be a table")
+            role = RoleConfig.from_mapping(entry)
+            if role.name in seen:
+                raise ValueError(f"duplicate role '{role.name}'")
+            seen.add(role.name)
+            roles.append(role)
         return cls(
             host=data.get("host", cls.host),
             port=data.get("port", cls.port),
             persistence=(
                 PersistenceSettings.from_mapping(persistence) if persistence else None
             ),
+            roles=roles,
         )
 
 

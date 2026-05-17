@@ -10,6 +10,7 @@ from hypercorn.asyncio import serve
 from hypercorn.config import Config as HypercornConfig
 
 from relcoord.app import create_app
+from relcoord.auth import TokenValidator
 from relcoord.config import Settings
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.store import ImageInfoStore
@@ -18,20 +19,37 @@ from relcoord.surreal_store import SurrealImageInfoStore
 DEFAULT_CONFIG_PATH = "relcoord.toml"
 LOG_FORMAT = "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s: %(message)s"
 
+logger = logging.getLogger(__name__)
 
-async def run(config_path: str) -> None:
+
+async def run(config_path: str, disable_auth: bool) -> None:
     settings = Settings.from_toml(config_path)
     config = HypercornConfig()
     config.bind = [f"{settings.host}:{settings.port}"]
+    token_validator = _build_token_validator(settings, disable_auth)
     store = await make_store(settings)
     try:
         # This has been raised upstream: https://github.com/pgjones/hypercorn/issues/353
         # noinspection PyTypeChecker
-        await serve(create_app(store), config)  # ty: ignore[invalid-argument-type]
+        app = create_app(store, token_validator)
+        await serve(app, config)  # ty: ignore[invalid-argument-type]
     finally:
         close = getattr(store, "close", None)
         if close is not None:
             await close()
+
+
+def _build_token_validator(
+    settings: Settings, disable_auth: bool
+) -> TokenValidator | None:
+    if disable_auth:
+        logger.warning("authentication disabled by --disable-auth")
+        return None
+    if not settings.roles:
+        raise RuntimeError(
+            "at least one [[role]] entry is required (or pass --disable-auth)"
+        )
+    return TokenValidator(settings.roles)
 
 
 async def make_store(settings: Settings) -> ImageInfoStore:
@@ -50,9 +68,15 @@ async def make_store(settings: Settings) -> ImageInfoStore:
     show_default=True,
     help="Path to the TOML configuration file.",
 )
-def main(config_path: str) -> None:
+@click.option(
+    "--disable-auth",
+    is_flag=True,
+    default=False,
+    help="Disable bearer-token authentication on write endpoints.",
+)
+def main(config_path: str, disable_auth: bool) -> None:
     configure_logging()
-    asyncio.run(run(config_path))
+    asyncio.run(run(config_path, disable_auth))
 
 
 def configure_logging() -> None:
