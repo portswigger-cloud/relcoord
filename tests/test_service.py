@@ -6,12 +6,12 @@ from datetime import UTC, datetime
 import pytest
 
 from relcoord.errors import TimestampConflictError, ValidationError
-from relcoord.in_memory_repository import InMemoryImageVersionRepository
+from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.service import ImageVersionService
 
 
 def test_register_version_is_idempotent() -> None:
-    service = ImageVersionService(InMemoryImageVersionRepository())
+    service = ImageVersionService(InMemoryImageInfoStore())
 
     created = asyncio.run(
         service.register_version(
@@ -35,7 +35,7 @@ def test_register_version_is_idempotent() -> None:
 
 def test_register_uses_call_time_when_timestamp_is_omitted() -> None:
     now = datetime(2026, 5, 17, 10, 15, 30, tzinfo=UTC)
-    service = ImageVersionService(InMemoryImageVersionRepository(), clock=lambda: now)
+    service = ImageVersionService(InMemoryImageInfoStore(), clock=lambda: now)
 
     result = asyncio.run(
         service.register_version("registry.example.com/team/api", "release-2026-05-17")
@@ -45,7 +45,7 @@ def test_register_uses_call_time_when_timestamp_is_omitted() -> None:
 
 
 def test_register_rejects_timestamp_conflict() -> None:
-    service = ImageVersionService(InMemoryImageVersionRepository())
+    service = ImageVersionService(InMemoryImageInfoStore())
 
     asyncio.run(
         service.register_version(
@@ -66,7 +66,7 @@ def test_register_rejects_timestamp_conflict() -> None:
 
 
 def test_register_rejects_timestamp_without_timezone() -> None:
-    service = ImageVersionService(InMemoryImageVersionRepository())
+    service = ImageVersionService(InMemoryImageInfoStore())
 
     with pytest.raises(ValidationError) as exc_info:
         asyncio.run(
@@ -81,7 +81,7 @@ def test_register_rejects_timestamp_without_timezone() -> None:
 
 
 def test_latest_versions_returns_latest_timestamp() -> None:
-    service = ImageVersionService(InMemoryImageVersionRepository())
+    service = ImageVersionService(InMemoryImageInfoStore())
 
     asyncio.run(
         service.register_version(
@@ -104,6 +104,6 @@ def test_latest_versions_returns_latest_timestamp() -> None:
 
 
 def test_latest_versions_allows_empty_image_lists() -> None:
-    service = ImageVersionService(InMemoryImageVersionRepository())
+    service = ImageVersionService(InMemoryImageInfoStore())
 
     assert asyncio.run(service.latest_versions([])) == {}

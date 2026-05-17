@@ -6,10 +6,10 @@ from datetime import datetime
 
 from relcoord.errors import TimestampConflictError
 from relcoord.models import RegisterResult, StoredVersion
-from relcoord.repository import ImageVersionRepository
+from relcoord.store import ImageInfoStore
 
 
-class InMemoryImageVersionRepository(ImageVersionRepository):
+class InMemoryImageInfoStore(ImageInfoStore):
     def __init__(self) -> None:
         self._versions_by_image: dict[str, dict[str, StoredVersion]] = {}
         self._timestamp_index: dict[str, dict[datetime, str]] = {}

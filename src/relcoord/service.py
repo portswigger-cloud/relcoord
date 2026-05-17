@@ -7,16 +7,16 @@ from datetime import UTC, datetime
 
 from relcoord.errors import ValidationError
 from relcoord.models import RegisterResult
-from relcoord.repository import ImageVersionRepository
+from relcoord.store import ImageInfoStore
 
 
 class ImageVersionService:
     def __init__(
         self,
-        repository: ImageVersionRepository,
+        store: ImageInfoStore,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self._repository = repository
+        self._store = store
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def register_version(
@@ -25,7 +25,7 @@ class ImageVersionService:
         validated_image = self._validate_image(image)
         validated_version = self._validate_version(version)
         validated_timestamp = self._validate_timestamp(timestamp)
-        return await self._repository.register(
+        return await self._store.register(
             validated_image, validated_version, validated_timestamp
         )
 
@@ -37,7 +37,7 @@ class ImageVersionService:
             )
 
         validated_images = [self._validate_image(image) for image in images]
-        return await self._repository.latest_for_images(validated_images)
+        return await self._store.latest_for_images(validated_images)
 
     def _validate_image(self, image: str) -> str:
         if not isinstance(image, str) or not image.strip():

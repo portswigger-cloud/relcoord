@@ -15,14 +15,14 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from relcoord.errors import TimestampConflictError, ValidationError
-from relcoord.repository import ImageVersionRepository
 from relcoord.service import ImageVersionService
+from relcoord.store import ImageInfoStore
 
 logger = logging.getLogger(__name__)
 
 
-def create_app(repository: ImageVersionRepository) -> Starlette:
-    service = ImageVersionService(repository=repository)
+def create_app(store: ImageInfoStore) -> Starlette:
+    service = ImageVersionService(store=store)
 
     async def health(_: Request) -> Response:
         return JSONResponse({"status": "ok"})
@@ -71,6 +71,63 @@ def create_app(repository: ImageVersionRepository) -> Starlette:
             status_code=status_code,
         )
 
+    async def change(request: Request) -> Response:
+        try:
+            payload = await _read_json(request)
+            repo = _required_non_empty_string(
+                payload,
+                "repo",
+                error="invalid_repo",
+                message="repo must be a non-empty string",
+            )
+            commit = _required_non_empty_string(
+                payload,
+                "commit",
+                error="invalid_commit",
+                message="commit must be a non-empty string",
+            )
+            image = _optional_non_empty_string(
+                payload,
+                "image",
+                error="invalid_image",
+                message="image must be a non-empty string",
+            )
+            tag = _optional_non_empty_string(
+                payload,
+                "tag",
+                error="invalid_tag",
+                message="tag must be a non-empty string",
+            )
+            if (image is None) != (tag is None):
+                raise ValidationError(
+                    error="invalid_image_tag_pairing",
+                    message="image and tag must be provided together",
+                )
+
+            registered: dict[str, Any] | None = None
+            if image is not None and tag is not None:
+                result = await service.register_version(image=image, version=tag)
+                registered = {
+                    "image": result.image,
+                    "version": result.version,
+                    "timestamp": _format_timestamp(result.timestamp),
+                    "created": result.created,
+                }
+        except ValidationError as exc:
+            return _json_error(status_code=400, error=exc.error, message=exc.message)
+        except TimestampConflictError as exc:
+            return _json_error(
+                status_code=400,
+                error="timestamp_conflict",
+                message=str(exc),
+            )
+
+        logger.info("Accepted change for repo %s at commit %s", repo, commit)
+        return JSONResponse(
+            {"repo": repo, "commit": commit, "registered": registered},
+            status_code=202,
+        )
+
     async def latest_versions(request: Request) -> Response:
         try:
             payload = await _read_json(request)
@@ -92,6 +149,7 @@ def create_app(repository: ImageVersionRepository) -> Starlette:
             Route("/healthz", health, methods=["GET"]),
             Route("/v1/image-versions", register_image_version, methods=["POST"]),
             Route("/v1/images/latest", latest_versions, methods=["POST"]),
+            Route("/v1/change", change, methods=["POST"]),
         ],
     )
 
@@ -145,6 +203,19 @@ def _required_non_empty_string(
     payload: dict[str, Any], field: str, *, error: str, message: str
 ) -> str:
     value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(error=error, message=message)
+    return value
+
+
+def _optional_non_empty_string(
+    payload: dict[str, Any], field: str, *, error: str, message: str
+) -> str | None:
+    if field not in payload:
+        return None
+    value = payload[field]
+    if value is None:
+        return None
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(error=error, message=message)
     return value

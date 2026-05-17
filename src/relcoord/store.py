@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 from relcoord.models import RegisterResult
 
 
-class ImageVersionRepository(ABC):
+class ImageInfoStore(ABC):
     @abstractmethod
     async def register(
         self, image: str, version: str, timestamp: datetime

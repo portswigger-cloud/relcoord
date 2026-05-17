@@ -12,43 +12,41 @@ from surrealdb import AsyncSurreal
 
 from relcoord.config import IdmouseSettings
 from relcoord.errors import TimestampConflictError
-from relcoord.surreal_repository import (
+from relcoord.surreal_store import (
     IdmouseClient,
     IdmouseTokenLease,
-    SurrealImageVersionRepository,
+    SurrealImageInfoStore,
     jwt_claims,
 )
 
 
-def test_surreal_repository_registers_and_resolves_latest_version() -> None:
+def test_surreal_store_registers_and_resolves_latest_version() -> None:
     async def run() -> None:
         db = AsyncSurreal("mem://")
         await db.connect("mem://")
         await db.use("test", "test")
-        repository = SurrealImageVersionRepository(db)
-        await repository.setup_db()
+        store = SurrealImageInfoStore(db)
+        await store.setup_db()
         try:
-            created = await repository.register(
+            created = await store.register(
                 "registry.example.com/team/api",
                 "1.0.0",
                 datetime(2026, 5, 17, 10, 15, 30, tzinfo=UTC),
             )
-            await repository.register(
+            await store.register(
                 "registry.example.com/team/api",
                 "2.0.0",
                 datetime(2026, 5, 18, 10, 15, 30, tzinfo=UTC),
             )
-            duplicate = await repository.register(
+            duplicate = await store.register(
                 "registry.example.com/team/api",
                 "1.0.0",
                 datetime(2026, 5, 19, 10, 15, 30, tzinfo=UTC),
             )
-            latest = await repository.latest_for_image("registry.example.com/team/api")
-            missing = await repository.latest_for_image(
-                "registry.example.com/team/worker"
-            )
+            latest = await store.latest_for_image("registry.example.com/team/api")
+            missing = await store.latest_for_image("registry.example.com/team/worker")
         finally:
-            await repository.close()
+            await store.close()
 
         assert created.created is True
         assert duplicate.created is False
@@ -59,27 +57,27 @@ def test_surreal_repository_registers_and_resolves_latest_version() -> None:
     asyncio.run(run())
 
 
-def test_surreal_repository_rejects_timestamp_conflict() -> None:
+def test_surreal_store_rejects_timestamp_conflict() -> None:
     async def run() -> None:
         db = AsyncSurreal("mem://")
         await db.connect("mem://")
         await db.use("test", "test")
-        repository = SurrealImageVersionRepository(db)
-        await repository.setup_db()
+        store = SurrealImageInfoStore(db)
+        await store.setup_db()
         try:
-            await repository.register(
+            await store.register(
                 "registry.example.com/team/api",
                 "1.0.0",
                 datetime(2026, 5, 17, 10, 15, 30, tzinfo=UTC),
             )
             with pytest.raises(TimestampConflictError):
-                await repository.register(
+                await store.register(
                     "registry.example.com/team/api",
                     "2.0.0",
                     datetime(2026, 5, 17, 10, 15, 30, tzinfo=UTC),
                 )
         finally:
-            await repository.close()
+            await store.close()
 
     asyncio.run(run())
 
