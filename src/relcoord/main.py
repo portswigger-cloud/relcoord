@@ -16,7 +16,7 @@ from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.store import ImageInfoStore
 from relcoord.surreal_store import SurrealImageInfoStore
 
-DEFAULT_CONFIG_PATH = "relcoord.toml"
+DEFAULT_CONFIG_PATH = "/config/relcoord.toml"
 LOG_FORMAT = "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s: %(message)s"
 
 logger = logging.getLogger(__name__)
