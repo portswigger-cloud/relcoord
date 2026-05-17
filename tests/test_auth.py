@@ -6,6 +6,7 @@ import json
 import time
 from unittest.mock import MagicMock, patch
 
+import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -114,6 +115,39 @@ def test_validator_accepts_token(private_pem: str, signing_key: PyJWK) -> None:
 
     assert claims.role == "default"
     assert claims.subject == "system:serviceaccount:default:default"
+
+
+def test_validator_discovers_jwks_uri_from_issuer(signing_key: PyJWK) -> None:
+    role = RoleConfig(
+        name="default",
+        audience="relcoord",
+        issuer="https://issuer.example.com/",
+    )
+    with (
+        patch("relcoord.auth.httpx.get") as mock_get,
+        patch("relcoord.auth.PyJWKClient") as mock_jwks_client,
+    ):
+        mock_get.return_value = httpx.Response(
+            200,
+            json={"jwks_uri": "https://issuer.example.com/keys"},
+            request=httpx.Request(
+                "GET",
+                "https://issuer.example.com/.well-known/openid-configuration",
+            ),
+        )
+        mock_client = MagicMock()
+        mock_client.get_signing_key_from_jwt.return_value = signing_key
+        mock_jwks_client.return_value = mock_client
+
+        TokenValidator([role])
+
+    mock_get.assert_called_once_with(
+        "https://issuer.example.com/.well-known/openid-configuration",
+        timeout=10.0,
+    )
+    mock_jwks_client.assert_called_once_with(
+        "https://issuer.example.com/keys", cache_keys=True
+    )
 
 
 def test_validator_rejects_wrong_audience(private_pem: str, signing_key: PyJWK) -> None:

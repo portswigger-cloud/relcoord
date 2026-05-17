@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 import jwt
 from jwt import InvalidTokenError, PyJWKClient, PyJWKClientError
 
@@ -36,7 +37,7 @@ class RoleConfig:
     name: str
     audience: str
     issuer: str
-    jwks_uri: str
+    jwks_uri: str | None = None
     algorithms: tuple[str, ...] = DEFAULT_ALGORITHMS
     claims: dict[str, str] = field(default_factory=dict)
 
@@ -45,7 +46,7 @@ class RoleConfig:
         name = _required_string(data, "name", context="role")
         audience = _required_string(data, "audience", context=f"role '{name}'")
         issuer = _required_string(data, "issuer", context=f"role '{name}'")
-        jwks_uri = _required_string(
+        jwks_uri = _optional_string(
             data, "jwks-uri", context=f"role '{name}'", alias="jwks_uri"
         )
         algorithms_value = data.get("algorithms", list(DEFAULT_ALGORITHMS))
@@ -103,7 +104,8 @@ class TokenValidator:
             seen.add(role.name)
         self._roles = list(roles)
         self._clients: dict[str, PyJWKClient] = {
-            role.name: PyJWKClient(role.jwks_uri, cache_keys=True) for role in roles
+            role.name: PyJWKClient(_jwks_uri_for_role(role), cache_keys=True)
+            for role in roles
         }
 
     def validate(self, bearer_token: str) -> ValidatedClaims:
@@ -154,12 +156,55 @@ def _claims_match(token_claims: dict[str, Any], required: dict[str, str]) -> boo
     return True
 
 
+def _jwks_uri_for_role(role: RoleConfig) -> str:
+    if role.jwks_uri is not None:
+        return role.jwks_uri
+
+    openid_configuration_url = (
+        f"{role.issuer.rstrip('/')}/.well-known/openid-configuration"
+    )
+    try:
+        response = httpx.get(openid_configuration_url, timeout=10.0)
+        response.raise_for_status()
+        openid_configuration = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ValueError(
+            "failed to discover JWKS URI for "
+            f"role '{role.name}' from '{openid_configuration_url}': {exc}"
+        ) from exc
+
+    if not isinstance(openid_configuration, dict):
+        raise ValueError(
+            f"OpenID configuration for role '{role.name}' must be a JSON object"
+        )
+
+    jwks_uri = openid_configuration.get("jwks_uri")
+    if not isinstance(jwks_uri, str) or not jwks_uri.strip():
+        raise ValueError(
+            f"OpenID configuration for role '{role.name}' must include jwks_uri"
+        )
+    return jwks_uri
+
+
 def _required_string(
     data: dict[str, Any], key: str, *, context: str, alias: str | None = None
 ) -> str:
     value = data.get(key)
     if value is None and alias is not None:
         value = data.get(alias)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{context} {key} must be a non-empty string")
+    return value
+
+
+def _optional_string(
+    data: dict[str, Any], key: str, *, context: str, alias: str | None = None
+) -> str | None:
+    value = data.get(key)
+    if value is None and alias is not None:
+        value = data.get(alias)
+    if value is None:
+        return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{context} {key} must be a non-empty string")
     return value

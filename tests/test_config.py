@@ -93,6 +93,23 @@ def test_settings_parses_role_entries(tmp_path: Path) -> None:
     assert settings.roles[1].algorithms == ("RS256", "ES256")
 
 
+def test_settings_allows_role_without_explicit_jwks_uri(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[role]]
+        name = "kubernetes-default"
+        audience = "relcoord"
+        issuer = "https://kubernetes.default.svc"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert len(settings.roles) == 1
+    assert settings.roles[0].jwks_uri is None
+
+
 def test_settings_rejects_duplicate_role_names(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(
