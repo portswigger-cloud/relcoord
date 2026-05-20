@@ -23,7 +23,7 @@ def test_settings_parse_surrealdb_idmouse_config(tmp_path: Path) -> None:
 
         [persistence.idmouse]
         url = "http://idmouse:9000/token"
-        token_path = "{token_file}"
+        token-path = "{token_file}"
         """
     )
 
@@ -40,7 +40,7 @@ def test_settings_parse_surrealdb_idmouse_config(tmp_path: Path) -> None:
     assert settings.persistence.idmouse.bearer_token() == "local-bearer-token"
 
 
-def test_settings_accepts_idmouse_bearer_token_file_alias(tmp_path: Path) -> None:
+def test_settings_rejects_old_idmouse_token_path_key(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     token_file = tmp_path / "idmouse-token"
     token_file.write_text("local-bearer-token\n")
@@ -51,15 +51,14 @@ def test_settings_accepts_idmouse_bearer_token_file_alias(tmp_path: Path) -> Non
 
         [persistence.idmouse]
         url = "http://idmouse:9000/token"
-        bearer_token_file = "{token_file}"
+        token_path = "{token_file}"
         """
     )
 
-    settings = Settings.from_toml(config)
-
-    assert settings.persistence is not None
-    assert settings.persistence.idmouse is not None
-    assert settings.persistence.idmouse.token_path == token_file
+    with pytest.raises(
+        ValueError, match="persistence.idmouse.token-path must be a non-empty string"
+    ):
+        Settings.from_toml(config)
 
 
 def test_settings_parses_role_entries(tmp_path: Path) -> None:
@@ -91,6 +90,61 @@ def test_settings_parses_role_entries(tmp_path: Path) -> None:
     assert settings.roles[0].jwks_uri == "https://kubernetes.default.svc/openid/v1/jwks"
     assert settings.roles[0].claims == {"sub": "system:serviceaccount:default:default"}
     assert settings.roles[1].algorithms == ("RS256", "ES256")
+
+
+def test_settings_parses_idcat_config(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    token_file = tmp_path / "idcat-token"
+    token_file.write_text("idcat-bearer-token\n")
+    config.write_text(
+        f"""
+        [idcat]
+        endpoint = "https://idcat.example.test/base"
+        github-app = "deployments"
+        token-path = "{token_file}"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.idcat is not None
+    assert settings.idcat.endpoint == "https://idcat.example.test/base"
+    assert settings.idcat.github_app == "deployments"
+    assert settings.idcat.bearer_token() == "idcat-bearer-token"
+
+
+def test_settings_rejects_old_idcat_github_app_key(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    token_file = tmp_path / "idcat-token"
+    token_file.write_text("idcat-bearer-token\n")
+    config.write_text(
+        f"""
+        [idcat]
+        endpoint = "https://idcat.example.test/base"
+        github_app = "deployments"
+        token-path = "{token_file}"
+        """
+    )
+
+    with pytest.raises(ValueError, match="idcat.github-app must be a non-empty string"):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_old_idcat_endpoint_key(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    token_file = tmp_path / "idcat-token"
+    token_file.write_text("idcat-bearer-token\n")
+    config.write_text(
+        f"""
+        [idcat]
+        idcat-endpoint = "https://idcat.example.test/base"
+        github-app = "deployments"
+        token-path = "{token_file}"
+        """
+    )
+
+    with pytest.raises(ValueError, match="idcat.endpoint must be a non-empty string"):
+        Settings.from_toml(config)
 
 
 def test_settings_allows_role_without_explicit_jwks_uri(tmp_path: Path) -> None:
@@ -142,7 +196,7 @@ def test_settings_explains_multiline_inline_table_parse_errors(
         uri = "ws://surrealdb:8000/"
         idmouse = {
             url = "http://idmouse:9000/token",
-            token_path = "/tmp/idmouse-token"
+            token-path = "/tmp/idmouse-token"
         }
         """
     )

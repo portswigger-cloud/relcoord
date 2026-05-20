@@ -10,7 +10,12 @@ database = "relcoord"
 
 [persistence.idmouse]
 url = "http://localhost:9000/token/relcoord"
-token_path = "/tmp/idmouse-bearer-token"
+token-path = "/tmp/idmouse-bearer-token"
+
+[idcat]
+endpoint = "https://idcat.example.com"
+github-app = "deployments"
+token-path = "/tmp/idcat-bearer-token"
 
 # Bearer-token authentication for write endpoints. Each [[role]] entry
 # describes one acceptable JWT issuer. A request to /v1/image-versions or

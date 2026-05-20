@@ -207,6 +207,12 @@ def test_change_without_image_and_tag_acknowledges_without_registering(
     }
 
 
+def test_git_clone_endpoint_is_not_registered(client: TestClient) -> None:
+    response = client.post("/v1/git/clone", json={"source": "https://example.com"})
+
+    assert response.status_code == 404
+
+
 @pytest.mark.parametrize(
     ("json", "expected_error"),
     [

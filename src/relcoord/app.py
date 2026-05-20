@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 
 
 def create_app(
-    store: ImageInfoStore, token_validator: TokenValidator | None = None
+    store: ImageInfoStore,
+    token_validator: TokenValidator | None = None,
 ) -> Starlette:
     service = ImageVersionService(store=store)
 
