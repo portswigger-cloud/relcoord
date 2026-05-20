@@ -27,5 +27,5 @@ database = "relcoord"
 
 [persistence.idmouse]
 url = "http://localhost:9000/token"
-token_path = "/tmp/idmouse-bearer-token"
+token-path = "/tmp/idmouse-bearer-token"
 ```

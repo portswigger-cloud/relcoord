@@ -21,12 +21,12 @@ class IdmouseSettings:
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "IdmouseSettings":
-        token_path = data.get("token_path", data.get("bearer_token_file"))
+        token_path = data.get("token-path")
         if not isinstance(data.get("url"), str) or not data["url"].strip():
             raise ValueError("persistence.idmouse.url must be a non-empty string")
         if not isinstance(token_path, str) or not token_path.strip():
             raise ValueError(
-                "persistence.idmouse.token_path must be a non-empty string"
+                "persistence.idmouse.token-path must be a non-empty string"
             )
         return cls(url=data["url"], token_path=Path(token_path))
 
@@ -61,10 +61,38 @@ class PersistenceSettings:
 
 
 @dataclass(frozen=True)
+class IdcatSettings:
+    endpoint: str
+    github_app: str
+    token_path: Path
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> "IdcatSettings":
+        endpoint = data.get("endpoint")
+        github_app = data.get("github-app")
+        token_path = data.get("token-path")
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            raise ValueError("idcat.endpoint must be a non-empty string")
+        if not isinstance(github_app, str) or not github_app.strip():
+            raise ValueError("idcat.github-app must be a non-empty string")
+        if not isinstance(token_path, str) or not token_path.strip():
+            raise ValueError("idcat.token-path must be a non-empty string")
+        return cls(
+            endpoint=endpoint,
+            github_app=github_app,
+            token_path=Path(token_path),
+        )
+
+    def bearer_token(self) -> str:
+        return _read_secret_file(self.token_path)
+
+
+@dataclass(frozen=True)
 class Settings:
     host: str = "0.0.0.0"
     port: int = 8000
     persistence: PersistenceSettings | None = None
+    idcat: IdcatSettings | None = None
     roles: list[RoleConfig] = field(default_factory=list)
 
     @classmethod
@@ -82,6 +110,9 @@ class Settings:
         persistence = data.get("persistence")
         if persistence is not None and not isinstance(persistence, dict):
             raise ValueError("persistence must be a table")
+        idcat = data.get("idcat")
+        if idcat is not None and not isinstance(idcat, dict):
+            raise ValueError("idcat must be a table")
         raw_roles = data.get("role", [])
         if not isinstance(raw_roles, list):
             raise ValueError("role must be an array of tables")
@@ -101,6 +132,7 @@ class Settings:
             persistence=(
                 PersistenceSettings.from_mapping(persistence) if persistence else None
             ),
+            idcat=IdcatSettings.from_mapping(idcat) if idcat else None,
             roles=roles,
         )
 
