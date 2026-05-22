@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import logging
+import re
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -16,6 +17,8 @@ from dulwich import porcelain
 from relcoord.config import IdcatSettings
 
 GITHUB_TOKEN_USERNAME = "x-access-token"
+_SCP_STYLE_GIT_URI = re.compile(r"(?:[^@/:]+@)?([^/:]+):(.+)")
+_SSH_STYLE_SCHEMES = {"ssh", "git+ssh"}
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +31,13 @@ class CloneResult:
 
 @dataclass(frozen=True)
 class GithubRepo:
+    owner: str
+    name: str
+
+
+@dataclass(frozen=True)
+class SshStyleGitUri:
+    hostname: str
     owner: str
     name: str
 
@@ -165,3 +175,46 @@ def github_repo_from_url(source: str) -> GithubRepo | None:
     if not components[0] or not name:
         return None
     return GithubRepo(owner=components[0], name=name)
+
+
+def ssh_style_git_uri_from_url(source: str) -> SshStyleGitUri | None:
+    parsed = urlparse(source)
+    if parsed.scheme in _SSH_STYLE_SCHEMES:
+        hostname = parsed.hostname
+        path = parsed.path.lstrip("/")
+    else:
+        match = _SCP_STYLE_GIT_URI.fullmatch(source)
+        if match is None:
+            return None
+        hostname = match.group(1)
+        path = match.group(2)
+
+    if hostname is None:
+        return None
+
+    components = [component for component in path.split("/") if component]
+    if len(components) != 2:
+        return None
+
+    name = components[1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    if not components[0] or not name:
+        return None
+    return SshStyleGitUri(hostname=hostname, owner=components[0], name=name)
+
+
+def is_ssh_style_git_uri(source: str) -> bool:
+    parsed = urlparse(source)
+    return parsed.scheme in _SSH_STYLE_SCHEMES or (
+        parsed.scheme == "" and _SCP_STYLE_GIT_URI.fullmatch(source) is not None
+    )
+
+
+def github_https_url_from_ssh_style_uri(source: str) -> str | None:
+    repo = ssh_style_git_uri_from_url(source)
+    if repo is None:
+        return None
+    if repo.hostname.lower() != "github.com":
+        return None
+    return f"https://github.com/{repo.owner}/{repo.name}.git"

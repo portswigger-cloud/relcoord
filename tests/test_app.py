@@ -237,6 +237,56 @@ def test_change_processes_deploy_config_when_processor_is_configured() -> None:
     }
 
 
+def test_change_converts_github_ssh_style_repo_uri() -> None:
+    class Processor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def process(self, repo: str, commit: str) -> object:
+            self.calls.append((repo, commit))
+            return type("Result", (), {"generated_count": 0})()
+
+    processor = Processor()
+    client = TestClient(
+        create_app(InMemoryImageInfoStore(), change_processor=processor)
+    )
+
+    response = client.post(
+        "/v1/change",
+        json={"repo": "git@github.com:acme/config.git", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 202
+    assert processor.calls == [("https://github.com/acme/config.git", "deadbeef")]
+    assert response.json()["repo"] == "https://github.com/acme/config.git"
+
+
+def test_change_rejects_non_github_ssh_style_repo_uri() -> None:
+    client = TestClient(create_app(InMemoryImageInfoStore()))
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "repo": "git@gitlab.example.com:acme/config.git",
+            "commit": "deadbeef",
+            "image": "registry.example.com/team/api",
+            "tag": "1.2.3",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "unsupported_ssh_git_uri",
+        "message": "ssh style git URIs are only supported for github.com repositories",
+    }
+
+    latest = client.post(
+        "/v1/images/latest",
+        json={"images": ["registry.example.com/team/api"]},
+    )
+    assert latest.json() == {"versions": {"registry.example.com/team/api": None}}
+
+
 def test_change_reports_missing_deploy_config() -> None:
     class Processor:
         def process(self, repo: str, commit: str) -> object:
