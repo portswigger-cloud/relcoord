@@ -237,7 +237,9 @@ def test_change_processes_deploy_config_when_processor_is_configured() -> None:
     }
 
 
-def test_change_reports_missing_deploy_config() -> None:
+def test_change_reports_missing_deploy_config(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class Processor:
         def process(self, repo: str, commit: str) -> object:
             raise DeployConfigError("missing .deploy")
@@ -245,6 +247,7 @@ def test_change_reports_missing_deploy_config() -> None:
     client = TestClient(
         create_app(InMemoryImageInfoStore(), change_processor=Processor())
     )
+    caplog.set_level(logging.WARNING, logger="relcoord.app")
 
     response = client.post(
         "/v1/change",
@@ -256,6 +259,10 @@ def test_change_reports_missing_deploy_config() -> None:
         "error": "invalid_deploy_config",
         "message": "missing .deploy",
     }
+    assert (
+        "Bad request POST /v1/change: invalid_deploy_config: missing .deploy"
+        in caplog.text
+    )
 
 
 def test_git_clone_endpoint_is_not_registered(client: TestClient) -> None:
@@ -265,21 +272,32 @@ def test_git_clone_endpoint_is_not_registered(client: TestClient) -> None:
 
 
 @pytest.mark.parametrize(
-    ("json", "expected_error"),
+    ("json", "expected_error", "expected_message"),
     [
-        ({"commit": "abc123"}, "invalid_repo"),
-        ({"repo": "acme/api"}, "invalid_commit"),
+        (
+            {"commit": "abc123"},
+            "invalid_repo",
+            "repo must be a non-empty string",
+        ),
+        (
+            {"repo": "acme/api"},
+            "invalid_commit",
+            "commit must be a non-empty string",
+        ),
         (
             {"repo": "acme/api", "commit": "abc123", "image": "registry.example.com/x"},
             "invalid_image_tag_pairing",
+            "image and tag must be provided together",
         ),
         (
             {"repo": "acme/api", "commit": "abc123", "tag": "1.2.3"},
             "invalid_image_tag_pairing",
+            "image and tag must be provided together",
         ),
         (
             {"repo": "acme/api", "commit": "abc123", "image": "", "tag": "1.2.3"},
             "invalid_image",
+            "image must be a non-empty string",
         ),
         (
             {
@@ -289,16 +307,30 @@ def test_git_clone_endpoint_is_not_registered(client: TestClient) -> None:
                 "tag": "",
             },
             "invalid_tag",
+            "tag must be a non-empty string",
         ),
     ],
 )
 def test_change_rejects_invalid_payloads(
-    client: TestClient, json: dict[str, object], expected_error: str
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+    json: dict[str, object],
+    expected_error: str,
+    expected_message: str,
 ) -> None:
+    caplog.set_level(logging.WARNING, logger="relcoord.app")
+
     response = client.post("/v1/change", json=json)
 
     assert response.status_code == 400
-    assert response.json()["error"] == expected_error
+    assert response.json() == {
+        "error": expected_error,
+        "message": expected_message,
+    }
+    assert (
+        f"Bad request POST /v1/change: {expected_error}: {expected_message}"
+        in caplog.text
+    )
 
 
 def test_reject_timestamp_conflict(client: TestClient) -> None:
