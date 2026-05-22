@@ -13,8 +13,10 @@ from relcoord.git import (
     GitCredentialError,
     GithubRepo,
     clone_repository,
+    github_https_url_from_ssh_style_uri,
     github_repo_from_url,
     installation_token_url,
+    is_ssh_style_git_uri,
 )
 
 
@@ -137,6 +139,35 @@ def test_github_repo_from_url_matches_idcat_helper_behavior() -> None:
     )
     assert github_repo_from_url("ssh://github.com/acme/api.git") is None
     assert github_repo_from_url("https://example.com/acme/api.git") is None
+
+
+def test_github_https_url_from_ssh_style_uri_converts_github_repos() -> None:
+    assert (
+        github_https_url_from_ssh_style_uri("git@github.com:acme/api.git")
+        == "https://github.com/acme/api.git"
+    )
+    assert (
+        github_https_url_from_ssh_style_uri("ssh://git@github.com/acme/api")
+        == "https://github.com/acme/api.git"
+    )
+    assert (
+        github_https_url_from_ssh_style_uri("git+ssh://git@github.com/acme/api.git")
+        == "https://github.com/acme/api.git"
+    )
+    assert (
+        github_https_url_from_ssh_style_uri("git@gitlab.example.com:acme/api.git")
+        is None
+    )
+    assert (
+        github_https_url_from_ssh_style_uri("https://github.com/acme/api.git") is None
+    )
+
+
+def test_is_ssh_style_git_uri_recognizes_supported_forms() -> None:
+    assert is_ssh_style_git_uri("git@github.com:acme/api.git") is True
+    assert is_ssh_style_git_uri("ssh://git@github.com/acme/api.git") is True
+    assert is_ssh_style_git_uri("git+ssh://git@github.com/acme/api.git") is True
+    assert is_ssh_style_git_uri("https://github.com/acme/api.git") is False
 
 
 def test_installation_token_url_preserves_idcat_base_path(tmp_path: Path) -> None:

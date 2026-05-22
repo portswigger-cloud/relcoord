@@ -18,6 +18,7 @@ from starlette.routing import Route
 from relcoord.auth import AuthError, TokenValidator, extract_bearer_token
 from relcoord.change import ChangeProcessingError, DeployConfigError
 from relcoord.errors import TimestampConflictError, ValidationError
+from relcoord.git import github_https_url_from_ssh_style_uri, is_ssh_style_git_uri
 from relcoord.service import ImageVersionService
 from relcoord.store import ImageInfoStore
 
@@ -99,6 +100,7 @@ def create_app(
         try:
             payload = await _read_json(request)
             repo = ensure_string(payload, "repo")
+            repo = _normalize_change_repo(repo)
             commit = ensure_string(payload, "commit")
             image = ensure_string(payload, "image") if "image" in payload else None
             tag = ensure_string(payload, "tag") if "tag" in payload else None
@@ -257,6 +259,20 @@ def _json_error(status_code: int, error: str, message: str) -> JSONResponse:
 
 def _format_timestamp(timestamp: datetime) -> str:
     return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_change_repo(repo: str) -> str:
+    if not is_ssh_style_git_uri(repo):
+        return repo
+
+    normalized = github_https_url_from_ssh_style_uri(repo)
+    if normalized is not None:
+        return normalized
+
+    raise ValidationError(
+        error="unsupported_ssh_git_uri",
+        message="ssh style git URIs are only supported for github.com repositories",
+    )
 
 
 def _change_result_payload(result: object) -> dict[str, Any]:
