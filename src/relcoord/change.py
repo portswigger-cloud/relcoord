@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import logging
-import os
 import shutil
-import stat
-import subprocess
 import tempfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
+from dulwich import porcelain
+from dulwich.repo import Repo
 from manifest_builder import generate
 
 from relcoord.config import IdcatSettings
-from relcoord.git import GITHUB_TOKEN_USERNAME, github_https_credentials
+from relcoord.git import github_https_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -98,21 +98,21 @@ class ChangeProcessor:
                 len(generated),
                 f": {generated_paths}" if generated_paths else "",
             )
-            manifest_commit = _git_stdout(
-                ["rev-parse", "HEAD"],
-                cwd=manifests_checkout,
-            )
+            manifest_commit = _head_commit(manifests_checkout)
             logger.info(
                 "change step 6/7: manifest-builder created manifests commit %s",
                 manifest_commit,
             )
-            with _git_auth_environment(self.manifests_repository, self.idcat) as env:
-                logger.info(
-                    "change step 7/7: pushing manifests commit %s to %s",
-                    manifest_commit,
-                    self.manifests_repository,
-                )
-                _run_git(["push"], cwd=manifests_checkout, env=env)
+            logger.info(
+                "change step 7/7: pushing manifests commit %s to %s",
+                manifest_commit,
+                self.manifests_repository,
+            )
+            _push_repository(
+                manifests_checkout,
+                self.manifests_repository,
+                self.idcat,
+            )
             logger.info(
                 "change complete: pushed manifests commit %s for source repo %s at commit %s",
                 manifest_commit,
@@ -138,8 +138,7 @@ def _checkout_commit(
     source: str, commit: str, target: Path, idcat: IdcatSettings | None
 ) -> None:
     _clone_repository(source, target, idcat, no_checkout=True)
-    _run_git(["fetch", "--depth", "1", "origin", commit], cwd=target)
-    _run_git(["checkout", "--detach", commit], cwd=target)
+    _dulwich_checkout(target, commit)
 
 
 def _clone_repository(
@@ -150,96 +149,92 @@ def _clone_repository(
     depth: str | None = None,
     no_checkout: bool = False,
 ) -> None:
-    with _git_auth_environment(source, idcat) as env:
-        args = ["clone"]
-        if depth is not None:
-            args.extend(["--depth", depth])
-        if no_checkout:
-            args.append("--no-checkout")
-        args.extend([source, str(target)])
-        _run_git(args, env=env)
-
-
-def _run_git(
-    args: list[str],
-    *,
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
+    credentials = github_https_credentials(source, idcat)
+    clone_output = BytesIO()
+    repo: Repo | None = None
     try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        _log_git_output(args, result)
-        return result
-    except subprocess.CalledProcessError as exc:
-        _log_git_output(args, exc)
-        message = exc.stderr.strip() or exc.stdout.strip() or str(exc)
-        raise ChangeProcessingError(f"git {' '.join(args)} failed: {message}") from exc
-
-
-def _git_stdout(
-    args: list[str],
-    *,
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
-) -> str:
-    return _run_git(args, cwd=cwd, env=env).stdout.strip()
-
-
-def _log_git_output(
-    args: list[str],
-    result: subprocess.CompletedProcess[str] | subprocess.CalledProcessError,
-) -> None:
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
-    if stdout:
-        logger.debug("git %s stdout: %s", " ".join(args), stdout)
-    if stderr:
-        logger.debug("git %s stderr: %s", " ".join(args), stderr)
-
-
-class _git_auth_environment:
-    def __init__(self, source: str, idcat: IdcatSettings | None) -> None:
-        self._source = source
-        self._idcat = idcat
-        self._tmpdir: Path | None = None
-        self._env: dict[str, str] | None = None
-
-    def __enter__(self) -> dict[str, str] | None:
-        credentials = github_https_credentials(self._source, self._idcat)
         if credentials.username is None:
-            return None
+            repo = porcelain.clone(
+                source,
+                target,
+                checkout=not no_checkout,
+                depth=int(depth) if depth is not None else None,
+                errstream=clone_output,
+            )
+        else:
+            repo = porcelain.clone(
+                source,
+                target,
+                checkout=not no_checkout,
+                depth=int(depth) if depth is not None else None,
+                errstream=clone_output,
+                username=credentials.username,
+                password=credentials.password or "",
+            )
+    except Exception as exc:
+        _log_dulwich_output("clone", clone_output)
+        raise ChangeProcessingError(
+            _dulwich_error_message("clone", exc, clone_output)
+        ) from exc
+    else:
+        _log_dulwich_output("clone", clone_output)
+    finally:
+        if repo is not None:
+            repo.close()
 
-        tmpdir = Path(tempfile.mkdtemp(prefix="relcoord-git-askpass-"))
-        askpass = tmpdir / "askpass.sh"
-        askpass.write_text(
-            "#!/bin/sh\n"
-            'case "$1" in\n'
-            "*Username*) printf '%s\\n' \"$RELCOORD_GIT_USERNAME\" ;;\n"
-            "*Password*) printf '%s\\n' \"$RELCOORD_GIT_PASSWORD\" ;;\n"
-            "*) printf '\\n' ;;\n"
-            "esac\n"
-        )
-        askpass.chmod(askpass.stat().st_mode | stat.S_IXUSR)
-        env = os.environ.copy()
-        env.update(
-            {
-                "GIT_ASKPASS": str(askpass),
-                "GIT_TERMINAL_PROMPT": "0",
-                "RELCOORD_GIT_USERNAME": credentials.username or GITHUB_TOKEN_USERNAME,
-                "RELCOORD_GIT_PASSWORD": credentials.password or "",
-            }
-        )
-        self._tmpdir = tmpdir
-        self._env = env
-        return env
 
-    def __exit__(self, *args: object) -> None:
-        if self._tmpdir is not None:
-            shutil.rmtree(self._tmpdir, ignore_errors=True)
+def _dulwich_checkout(target: Path, commit: str) -> None:
+    try:
+        porcelain.reset(target, "hard", commit)
+    except Exception as exc:
+        raise ChangeProcessingError(f"dulwich checkout {commit} failed: {exc}") from exc
+
+
+def _head_commit(repo_path: Path) -> str:
+    repo = Repo(repo_path)
+    try:
+        return repo.head().decode("ascii")
+    finally:
+        repo.close()
+
+
+def _push_repository(
+    repo_path: Path,
+    remote: str,
+    idcat: IdcatSettings | None,
+) -> None:
+    credentials = github_https_credentials(remote, idcat)
+    push_output = BytesIO()
+    try:
+        if credentials.username is None:
+            porcelain.push(
+                repo_path,
+                remote,
+                errstream=push_output,
+            )
+        else:
+            porcelain.push(
+                repo_path,
+                remote,
+                errstream=push_output,
+                username=credentials.username,
+                password=credentials.password or "",
+            )
+    except Exception as exc:
+        _log_dulwich_output("push", push_output)
+        raise ChangeProcessingError(
+            _dulwich_error_message("push", exc, push_output)
+        ) from exc
+    else:
+        _log_dulwich_output("push", push_output)
+
+
+def _dulwich_error_message(operation: str, exc: Exception, errstream: BytesIO) -> str:
+    message = errstream.getvalue().decode(errors="replace").strip() or str(exc)
+    return f"dulwich {operation} failed: {message}"
+
+
+def _log_dulwich_output(operation: str, errstream: BytesIO) -> None:
+    stderr = errstream.getvalue().decode(errors="replace").strip()
+    if stderr:
+        logger.debug("dulwich %s stderr: %s", operation, stderr)
