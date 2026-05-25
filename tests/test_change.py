@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import logging
-import subprocess
 from pathlib import Path
 
+from dulwich import porcelain
 import pytest
 
 from relcoord import change
@@ -43,10 +43,12 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         )
         return {manifests_checkout / "api.yaml", manifests_checkout / "worker.yaml"}
 
-    def fake_run_git(args: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
-        calls.append(("git", args, kwargs["cwd"].name, kwargs.get("env")))
-        stdout = "feedface\n" if args == ["rev-parse", "HEAD"] else ""
-        return subprocess.CompletedProcess(["git", *args], 0, stdout=stdout)
+    def fake_head_commit(repo_path: Path) -> str:
+        calls.append(("head", repo_path.name))
+        return "feedface"
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        calls.append(("push", repo_path.name, remote, idcat))
 
     monkeypatch.setattr(
         change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
@@ -54,7 +56,8 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
     monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
     monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
     monkeypatch.setattr(change, "generate", fake_generate)
-    monkeypatch.setattr(change, "_run_git", fake_run_git)
+    monkeypatch.setattr(change, "_head_commit", fake_head_commit)
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
 
     with caplog.at_level(logging.INFO, logger="relcoord.change"):
         result = ChangeProcessor("https://github.com/acme/manifests.git").process(
@@ -91,8 +94,8 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
             True,
             "registry.example.com/team/api:1.2.3",
         ),
-        ("git", ["rev-parse", "HEAD"], "manifests", None),
-        ("git", ["push"], "manifests", None),
+        ("head", "manifests"),
+        ("push", "manifests", "https://github.com/acme/manifests.git", None),
     ]
     assert (
         "change step 2/7: checking out source repo https://github.com/acme/config.git "
@@ -128,3 +131,35 @@ def test_change_processor_requires_top_level_deploy_directory(
         assert "does not contain a top-level .deploy directory" in str(exc)
     else:
         raise AssertionError("expected DeployConfigError")
+
+
+def test_checkout_commit_materializes_requested_commit(tmp_path: Path) -> None:
+    source = tmp_path / "source-repo"
+    repo = porcelain.init(source)
+    try:
+        (source / "README.md").write_text("first\n")
+        porcelain.add(repo, b"README.md")
+        first_commit = porcelain.commit(
+            repo,
+            message=b"first",
+            author=b"Test <test@example.com>",
+            committer=b"Test <test@example.com>",
+        )
+
+        (source / ".deploy").mkdir()
+        (source / ".deploy" / "api.yaml").write_text("image: example\n")
+        porcelain.add(repo, [b".deploy/api.yaml"])
+        porcelain.commit(
+            repo,
+            message=b"second",
+            author=b"Test <test@example.com>",
+            committer=b"Test <test@example.com>",
+        )
+    finally:
+        repo.close()
+
+    checkout = tmp_path / "checkout"
+    change._checkout_commit(str(source), first_commit.decode("ascii"), checkout, None)
+
+    assert (checkout / "README.md").read_text() == "first\n"
+    assert not (checkout / ".deploy").exists()
