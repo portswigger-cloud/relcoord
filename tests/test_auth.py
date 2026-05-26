@@ -445,7 +445,7 @@ def test_change_endpoint_requires_bearer_token(signing_key: PyJWK) -> None:
 
     response = client.post(
         "/v1/change",
-        json={"repo": "acme/api", "commit": "abc123"},
+        json={"config_repo": "acme/api", "commit": "abc123"},
     )
 
     assert response.status_code == 401
