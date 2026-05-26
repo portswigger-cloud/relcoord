@@ -130,15 +130,29 @@ def create_app(
             return unauthorized
         try:
             payload = await _read_json(request)
-            repo = ensure_string(payload, "repo")
+            repo = ensure_string(
+                payload,
+                "config_repo",
+                error="invalid_config_repo",
+                message="config_repo must be a non-empty string",
+            )
             repo = _normalize_change_repo(repo)
             commit = ensure_string(payload, "commit")
-            image = ensure_string(payload, "image") if "image" in payload else None
+            image = (
+                ensure_string(
+                    payload,
+                    "image_repo",
+                    error="invalid_image_repo",
+                    message="image_repo must be a non-empty string",
+                )
+                if "image_repo" in payload
+                else None
+            )
             tag = ensure_string(payload, "tag") if "tag" in payload else None
             if (image is None) != (tag is None):
                 raise ValidationError(
-                    error="invalid_image_tag_pairing",
-                    message="image and tag must be provided together",
+                    error="invalid_image_repo_tag_pairing",
+                    message="image_repo and tag must be provided together",
                 )
 
             registered: dict[str, Any] | None = None
@@ -194,7 +208,7 @@ def create_app(
 
         logger.info("Accepted change for repo %s at commit %s", repo, commit)
         body: dict[str, Any] = {
-            "repo": repo,
+            "config_repo": repo,
             "commit": commit,
             "registered": registered,
         }
@@ -272,12 +286,18 @@ async def _read_json(request: Request) -> dict[str, Any]:
     return payload
 
 
-def ensure_string(payload: dict[str, Any], field: str) -> str:
+def ensure_string(
+    payload: dict[str, Any],
+    field: str,
+    *,
+    error: str | None = None,
+    message: str | None = None,
+) -> str:
     value = payload.get(field)
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(
-            error=f"invalid_{field}",
-            message=f"{field} must be a non-empty string",
+            error=error or f"invalid_{field}",
+            message=message or f"{field} must be a non-empty string",
         )
     return value
 

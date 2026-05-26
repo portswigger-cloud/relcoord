@@ -176,16 +176,16 @@ def test_change_registers_image_version_when_image_and_tag_present(
     response = client.post(
         "/v1/change",
         json={
-            "repo": "acme/api",
+            "config_repo": "acme/api",
             "commit": "abc123",
-            "image": "registry.example.com/team/api",
+            "image_repo": "registry.example.com/team/api",
             "tag": "1.2.3",
         },
     )
 
     assert response.status_code == 202
     body = response.json()
-    assert body["repo"] == "acme/api"
+    assert body["config_repo"] == "acme/api"
     assert body["commit"] == "abc123"
     assert body["registered"]["image"] == "registry.example.com/team/api"
     assert body["registered"]["version"] == "1.2.3"
@@ -219,9 +219,9 @@ def test_change_passes_image_reference_to_processor() -> None:
     response = client.post(
         "/v1/change",
         json={
-            "repo": "acme/api",
+            "config_repo": "acme/api",
             "commit": "abc123",
-            "image": "registry.example.com/team/api",
+            "image_repo": "registry.example.com/team/api",
             "tag": "1.2.3",
         },
     )
@@ -239,12 +239,12 @@ def test_change_without_image_and_tag_acknowledges_without_registering(
     with caplog.at_level(logging.INFO, logger="relcoord.app"):
         response = client.post(
             "/v1/change",
-            json={"repo": "acme/config", "commit": "deadbeef"},
+            json={"config_repo": "acme/config", "commit": "deadbeef"},
         )
 
     assert response.status_code == 202
     assert response.json() == {
-        "repo": "acme/config",
+        "config_repo": "acme/config",
         "commit": "deadbeef",
         "registered": None,
         "processed": {"generated": 0},
@@ -283,13 +283,16 @@ def test_change_processes_deploy_config_when_processor_is_configured(
     with caplog.at_level(logging.INFO, logger="relcoord.app"):
         response = client.post(
             "/v1/change",
-            json={"repo": "https://github.com/acme/config.git", "commit": "deadbeef"},
+            json={
+                "config_repo": "https://github.com/acme/config.git",
+                "commit": "deadbeef",
+            },
         )
 
     assert response.status_code == 202
     assert processor.calls == [("https://github.com/acme/config.git", "deadbeef", None)]
     assert response.json() == {
-        "repo": "https://github.com/acme/config.git",
+        "config_repo": "https://github.com/acme/config.git",
         "commit": "deadbeef",
         "registered": None,
         "processed": {"generated": 3},
@@ -325,7 +328,10 @@ def test_change_processor_logs_from_worker_thread(
     with caplog.at_level(logging.INFO):
         response = client.post(
             "/v1/change",
-            json={"repo": "https://github.com/acme/config.git", "commit": "deadbeef"},
+            json={
+                "config_repo": "https://github.com/acme/config.git",
+                "commit": "deadbeef",
+            },
         )
 
     assert response.status_code == 202
@@ -355,12 +361,12 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
 
     response = client.post(
         "/v1/change",
-        json={"repo": "git@github.com:acme/config.git", "commit": "deadbeef"},
+        json={"config_repo": "git@github.com:acme/config.git", "commit": "deadbeef"},
     )
 
     assert response.status_code == 202
     assert processor.calls == [("https://github.com/acme/config.git", "deadbeef", None)]
-    assert response.json()["repo"] == "https://github.com/acme/config.git"
+    assert response.json()["config_repo"] == "https://github.com/acme/config.git"
 
 
 def test_change_rejects_non_github_ssh_style_repo_uri(
@@ -378,9 +384,9 @@ def test_change_rejects_non_github_ssh_style_repo_uri(
     response = client.post(
         "/v1/change",
         json={
-            "repo": "git@gitlab.example.com:acme/config.git",
+            "config_repo": "git@gitlab.example.com:acme/config.git",
             "commit": "deadbeef",
-            "image": "registry.example.com/team/api",
+            "image_repo": "registry.example.com/team/api",
             "tag": "1.2.3",
         },
     )
@@ -421,7 +427,10 @@ def test_change_reports_missing_deploy_config(
 
     response = client.post(
         "/v1/change",
-        json={"repo": "https://github.com/acme/config.git", "commit": "deadbeef"},
+        json={
+            "config_repo": "https://github.com/acme/config.git",
+            "commit": "deadbeef",
+        },
     )
 
     assert response.status_code == 400
@@ -446,34 +455,43 @@ def test_git_clone_endpoint_is_not_registered(client: TestClient) -> None:
     [
         (
             {"commit": "abc123"},
-            "invalid_repo",
-            "repo must be a non-empty string",
+            "invalid_config_repo",
+            "config_repo must be a non-empty string",
         ),
         (
-            {"repo": "acme/api"},
+            {"config_repo": "acme/api"},
             "invalid_commit",
             "commit must be a non-empty string",
         ),
         (
-            {"repo": "acme/api", "commit": "abc123", "image": "registry.example.com/x"},
-            "invalid_image_tag_pairing",
-            "image and tag must be provided together",
+            {
+                "config_repo": "acme/api",
+                "commit": "abc123",
+                "image_repo": "registry.example.com/x",
+            },
+            "invalid_image_repo_tag_pairing",
+            "image_repo and tag must be provided together",
         ),
         (
-            {"repo": "acme/api", "commit": "abc123", "tag": "1.2.3"},
-            "invalid_image_tag_pairing",
-            "image and tag must be provided together",
-        ),
-        (
-            {"repo": "acme/api", "commit": "abc123", "image": "", "tag": "1.2.3"},
-            "invalid_image",
-            "image must be a non-empty string",
+            {"config_repo": "acme/api", "commit": "abc123", "tag": "1.2.3"},
+            "invalid_image_repo_tag_pairing",
+            "image_repo and tag must be provided together",
         ),
         (
             {
-                "repo": "acme/api",
+                "config_repo": "acme/api",
                 "commit": "abc123",
-                "image": "registry.example.com/x",
+                "image_repo": "",
+                "tag": "1.2.3",
+            },
+            "invalid_image_repo",
+            "image_repo must be a non-empty string",
+        ),
+        (
+            {
+                "config_repo": "acme/api",
+                "commit": "abc123",
+                "image_repo": "registry.example.com/x",
                 "tag": "",
             },
             "invalid_tag",
