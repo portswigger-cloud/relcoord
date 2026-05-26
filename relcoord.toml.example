@@ -14,6 +14,14 @@ database = "relcoord"
 url = "http://localhost:9000/token/relcoord"
 token-path = "/tmp/idmouse-bearer-token"
 
+# Alternative DynamoDB persistence backend. The table needs string keys pk and sk.
+#
+# [persistence]
+# backend = "dynamodb"
+# table-name = "relcoord-image-versions"
+# region-name = "eu-west-2"
+# endpoint-url = "http://localhost:8000"
+
 [idcat]
 endpoint = "https://idcat.example.com"
 github-app = "deployments"

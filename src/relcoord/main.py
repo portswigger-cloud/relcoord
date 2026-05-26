@@ -18,6 +18,7 @@ from relcoord.app import (
 from relcoord.auth import TokenValidator
 from relcoord.change import ChangeProcessor as ManifestChangeProcessor
 from relcoord.config import Settings
+from relcoord.dynamodb_store import DynamoDBImageInfoStore
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.store import ImageInfoStore
 from relcoord.surreal_store import SurrealImageInfoStore
@@ -66,6 +67,8 @@ def _build_token_validator(
 async def make_store(settings: Settings) -> ImageInfoStore:
     if settings.persistence is None or settings.persistence.backend == "in-memory":
         return InMemoryImageInfoStore()
+    if settings.persistence.backend == "dynamodb":
+        return await DynamoDBImageInfoStore.connect(settings.persistence)
     return await SurrealImageInfoStore.connect(settings.persistence)
 
 

@@ -61,6 +61,42 @@ def test_settings_parse_in_memory_persistence_without_surrealdb_config(
     assert settings.persistence.idmouse is None
 
 
+def test_settings_parse_dynamodb_config(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [persistence]
+        backend = "dynamodb"
+        table-name = "relcoord-image-versions"
+        region-name = "eu-west-2"
+        endpoint-url = "http://localhost:8000"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.persistence is not None
+    assert settings.persistence.backend == "dynamodb"
+    assert settings.persistence.table_name == "relcoord-image-versions"
+    assert settings.persistence.region_name == "eu-west-2"
+    assert settings.persistence.endpoint_url == "http://localhost:8000"
+
+
+def test_settings_rejects_dynamodb_without_table_name(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [persistence]
+        backend = "dynamodb"
+        """
+    )
+
+    with pytest.raises(
+        ValueError, match="persistence.table-name must be a non-empty string"
+    ):
+        Settings.from_toml(config)
+
+
 def test_settings_rejects_unknown_persistence_backend(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(
@@ -72,7 +108,9 @@ def test_settings_rejects_unknown_persistence_backend(tmp_path: Path) -> None:
 
     with pytest.raises(
         ValueError,
-        match="persistence.backend must be either 'in-memory' or 'surrealdb'",
+        match=(
+            "persistence.backend must be one of 'in-memory', 'surrealdb', or 'dynamodb'"
+        ),
     ):
         Settings.from_toml(config)
 
