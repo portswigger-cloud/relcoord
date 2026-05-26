@@ -31,6 +31,7 @@ def test_clone_repository_uses_python_git_implementation(tmp_path: Path) -> None
         message=b"initial",
         author=b"Relcoord <relcoord@example.com>",
         committer=b"Relcoord <relcoord@example.com>",
+        sign=False,
     ).decode("ascii")
     repo.close()
 

@@ -11,6 +11,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
+  "boto3>=1.34.0,<2.0.0",
   "click>=8.1.0,<9.0.0",
   "dulwich>=1.2.1,<2.0.0",
   "httpx>=0.28.1,<1.0.0",

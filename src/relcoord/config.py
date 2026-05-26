@@ -36,20 +36,24 @@ class IdmouseSettings:
 
 @dataclass(frozen=True)
 class PersistenceSettings:
-    backend: Literal["in-memory", "surrealdb"] = "surrealdb"
+    backend: Literal["in-memory", "surrealdb", "dynamodb"] = "surrealdb"
     uri: str | None = None
     idmouse: IdmouseSettings | None = None
     namespace: str = "default"
     database: str = "relcoord"
+    table_name: str | None = None
+    region_name: str | None = None
+    endpoint_url: str | None = None
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "PersistenceSettings":
         backend_value = _string_or_default(data, "backend", cls.backend)
-        if backend_value not in ("in-memory", "surrealdb"):
+        if backend_value not in ("in-memory", "surrealdb", "dynamodb"):
             raise ValueError(
-                "persistence.backend must be either 'in-memory' or 'surrealdb'"
+                "persistence.backend must be one of "
+                "'in-memory', 'surrealdb', or 'dynamodb'"
             )
-        backend = cast(Literal["in-memory", "surrealdb"], backend_value)
+        backend = cast(Literal["in-memory", "surrealdb", "dynamodb"], backend_value)
 
         if backend == "in-memory":
             return cls(
@@ -62,6 +66,20 @@ class PersistenceSettings:
                     if "idmouse" in data
                     else None
                 ),
+                table_name=_optional_persistence_string(data, "table-name"),
+                region_name=_optional_persistence_string(data, "region-name"),
+                endpoint_url=_optional_persistence_string(data, "endpoint-url"),
+            )
+
+        if backend == "dynamodb":
+            table_name = data.get("table-name")
+            if not isinstance(table_name, str) or not table_name.strip():
+                raise ValueError("persistence.table-name must be a non-empty string")
+            return cls(
+                backend=backend,
+                table_name=table_name,
+                region_name=_optional_persistence_string(data, "region-name"),
+                endpoint_url=_optional_persistence_string(data, "endpoint-url"),
             )
 
         if not isinstance(data.get("uri"), str) or not data["uri"].strip():

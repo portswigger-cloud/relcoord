@@ -7,6 +7,7 @@ import pytest
 
 from relcoord.change import ChangeProcessor
 from relcoord.config import PersistenceSettings, Settings
+from relcoord.dynamodb_store import DynamoDBImageInfoStore
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.main import configure_logging, make_change_processor, make_store
 
@@ -40,3 +41,26 @@ def test_make_store_uses_in_memory_backend() -> None:
     )
 
     assert isinstance(store, InMemoryImageInfoStore)
+
+
+def test_make_store_uses_dynamodb_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = InMemoryImageInfoStore()
+
+    async def connect(config: PersistenceSettings) -> InMemoryImageInfoStore:
+        assert config.table_name == "relcoord-image-versions"
+        return expected
+
+    monkeypatch.setattr(DynamoDBImageInfoStore, "connect", connect)
+
+    store = asyncio.run(
+        make_store(
+            Settings(
+                persistence=PersistenceSettings(
+                    backend="dynamodb",
+                    table_name="relcoord-image-versions",
+                )
+            )
+        )
+    )
+
+    assert store is expected

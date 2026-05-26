@@ -37,3 +37,16 @@ database = "relcoord"
 url = "http://localhost:9000/token"
 token-path = "/tmp/idmouse-bearer-token"
 ```
+
+The service can also store image versions in DynamoDB:
+
+```toml
+[persistence]
+backend = "dynamodb"
+table-name = "relcoord-image-versions"
+region-name = "eu-west-2"
+```
+
+The DynamoDB table must already exist with string partition key `pk` and string
+sort key `sk`. AWS credentials are resolved using the standard boto3 provider
+chain. For local development against DynamoDB Local, set `endpoint-url`.

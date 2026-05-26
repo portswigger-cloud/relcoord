@@ -159,6 +159,7 @@ def test_checkout_commit_materializes_requested_commit(tmp_path: Path) -> None:
             message=b"first",
             author=b"Test <test@example.com>",
             committer=b"Test <test@example.com>",
+            sign=False,
         )
 
         (source / ".deploy").mkdir()
@@ -169,6 +170,7 @@ def test_checkout_commit_materializes_requested_commit(tmp_path: Path) -> None:
             message=b"second",
             author=b"Test <test@example.com>",
             committer=b"Test <test@example.com>",
+            sign=False,
         )
     finally:
         repo.close()
