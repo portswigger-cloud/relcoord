@@ -19,7 +19,9 @@ class Ref:
     name: str
 
 
-def test_deployment_detector_accepts_annotated_changes_and_absent_removed_objects() -> None:
+def test_deployment_detector_accepts_annotated_changes_and_absent_removed_objects() -> (
+    None
+):
     requests: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -40,7 +42,7 @@ def test_deployment_detector_accepts_annotated_changes_and_absent_removed_object
                             "kind": "ConfigMap",
                             "namespaced": True,
                             "verbs": ["get"],
-                        }
+                        },
                     ]
                 },
             )

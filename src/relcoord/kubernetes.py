@@ -43,7 +43,9 @@ class KubernetesResource:
                 raise DeploymentDetectionError(
                     f"{ref.kind}/{ref.name} must have a namespace"
                 )
-            return f"{self.path_prefix}/namespaces/{ref.namespace}/{self.name}/{ref.name}"
+            return (
+                f"{self.path_prefix}/namespaces/{ref.namespace}/{self.name}/{ref.name}"
+            )
         return f"{self.path_prefix}/{self.name}/{ref.name}"
 
 
@@ -192,7 +194,9 @@ class KubernetesDeploymentDetector:
                 f"{exc.response.status_code}: {exc.response.text}"
             ) from exc
         except httpx.RequestError as exc:
-            raise DeploymentDetectionError(f"Kubernetes API GET {path} failed: {exc}") from exc
+            raise DeploymentDetectionError(
+                f"Kubernetes API GET {path} failed: {exc}"
+            ) from exc
         try:
             data = response.json()
         except ValueError as exc:
