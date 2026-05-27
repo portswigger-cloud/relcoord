@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Any, Protocol, cast
 
 from dulwich import porcelain
 from dulwich.repo import Repo
@@ -15,6 +18,7 @@ from manifest_builder import generate
 
 from relcoord.config import IdcatSettings
 from relcoord.git import github_https_credentials
+from relcoord.kubernetes import KubernetesDeploymentDetector
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,20 @@ class DeployConfigError(ChangeProcessingError):
     pass
 
 
+class DeploymentDetectionError(ChangeProcessingError):
+    pass
+
+
+class DeploymentDetector(Protocol):
+    def wait_for_success(
+        self,
+        *,
+        deploy_id: str,
+        created_or_modified: set[Any],
+        removed: set[Any],
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
 class ChangeResult:
     repo: str
@@ -34,12 +52,15 @@ class ChangeResult:
     deploy_config: Path
     manifests_checkout: Path
     generated_count: int
+    deploy_id: str | None = None
 
 
 @dataclass(frozen=True)
 class ChangeProcessor:
     manifests_repository: str
     idcat: IdcatSettings | None = None
+    detect_deployment: bool = False
+    deployment_detector: DeploymentDetector | None = None
 
     def process(self, repo: str, commit: str, image: str | None) -> ChangeResult:
         workdir = Path(tempfile.mkdtemp(prefix="relcoord-change-"))
@@ -83,7 +104,7 @@ class ChangeProcessor:
                 "change step 5/7: invoking manifest-builder with deploy config %s",
                 deploy_config,
             )
-            generated = generate(
+            generation_result = generate(
                 deploy_config,
                 manifests_checkout,
                 repo_root=Path("/"),
@@ -91,6 +112,7 @@ class ChangeProcessor:
                 image=image,
                 namespace=_namespace_from_repo(repo),
             )
+            generated = _written_paths(generation_result)
             generated_paths = ", ".join(
                 str(path.relative_to(manifests_checkout)) for path in sorted(generated)
             )
@@ -99,6 +121,12 @@ class ChangeProcessor:
                 len(generated),
                 f": {generated_paths}" if generated_paths else "",
             )
+            deploy_id = _deploy_id(generation_result)
+            if self.detect_deployment and deploy_id is None:
+                raise DeploymentDetectionError(
+                    "manifest-builder did not return a deploy_id; "
+                    "deployment detection requires git-backed generation"
+                )
             manifest_commit = _head_commit(manifests_checkout)
             logger.info(
                 "change step 6/7: manifest-builder created manifests commit %s",
@@ -120,12 +148,19 @@ class ChangeProcessor:
                 repo,
                 commit,
             )
+            if self.detect_deployment:
+                _start_deployment_detection(
+                    generation_result,
+                    deploy_id,
+                    self.deployment_detector,
+                )
             return ChangeResult(
                 repo=repo,
                 commit=commit,
                 deploy_config=deploy_config,
                 manifests_checkout=manifests_checkout,
                 generated_count=len(generated),
+                deploy_id=deploy_id,
             )
         except ChangeProcessingError:
             raise
@@ -133,6 +168,85 @@ class ChangeProcessor:
             raise ChangeProcessingError(str(exc)) from exc
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _written_paths(generation_result: object) -> set[Path]:
+    written_paths = getattr(generation_result, "written_paths", None)
+    if written_paths is None:
+        return set(cast(Iterable[Path], generation_result))
+    return cast(set[Path], written_paths)
+
+
+def _deploy_id(generation_result: object) -> str | None:
+    deploy_id = getattr(generation_result, "deploy_id", None)
+    return deploy_id if isinstance(deploy_id, str) else None
+
+
+def _start_deployment_detection(
+    generation_result: object,
+    deploy_id: str | None,
+    detector: DeploymentDetector | None,
+) -> None:
+    if deploy_id is None:
+        raise DeploymentDetectionError(
+            "manifest-builder did not return a deploy_id; "
+            "deployment detection requires git-backed generation"
+        )
+    created_or_modified = set(getattr(generation_result, "created_or_modified"))
+    removed = set(getattr(generation_result, "removed"))
+    logger.info(
+        "starting deployment detection for manifest-builder deploy-id %s",
+        deploy_id,
+    )
+    thread = threading.Thread(
+        target=_run_deployment_detection,
+        name=f"relcoord-deployment-detection-{deploy_id}",
+        kwargs={
+            "deploy_id": deploy_id,
+            "created_or_modified": created_or_modified,
+            "removed": removed,
+            "detector": detector,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+
+def _run_deployment_detection(
+    *,
+    deploy_id: str,
+    created_or_modified: set[Any],
+    removed: set[Any],
+    detector: DeploymentDetector | None,
+) -> None:
+    owned_detector = KubernetesDeploymentDetector() if detector is None else None
+    active_detector = owned_detector if owned_detector is not None else detector
+    if active_detector is None:
+        logger.error(
+            "deployment detection failed for manifest-builder deploy-id %s: "
+            "deployment detector is not configured",
+            deploy_id,
+        )
+        return
+    try:
+        active_detector.wait_for_success(
+            deploy_id=deploy_id,
+            created_or_modified=created_or_modified,
+            removed=removed,
+        )
+    except Exception:
+        logger.exception(
+            "deployment detection failed for manifest-builder deploy-id %s",
+            deploy_id,
+        )
+    else:
+        logger.info(
+            "deployment detected for manifest-builder deploy-id %s",
+            deploy_id,
+        )
+    finally:
+        if owned_detector is not None:
+            owned_detector.close()
 
 
 def _checkout_commit(

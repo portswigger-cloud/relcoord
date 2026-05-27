@@ -128,6 +128,32 @@ def test_settings_parses_manifests_repository(tmp_path: Path) -> None:
     assert settings.manifests_repository == "https://github.com/acme/manifests.git"
 
 
+def test_settings_parses_detect_deployment(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("detect-deployment = true\n")
+
+    settings = Settings.from_toml(config)
+
+    assert settings.detect_deployment is True
+
+
+def test_settings_defaults_detect_deployment_to_false(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("")
+
+    settings = Settings.from_toml(config)
+
+    assert settings.detect_deployment is False
+
+
+def test_settings_rejects_non_boolean_detect_deployment(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('detect-deployment = "yes"\n')
+
+    with pytest.raises(ValueError, match="detect-deployment must be a boolean"):
+        Settings.from_toml(config)
+
+
 def test_settings_rejects_empty_manifests_repository(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text('manifests-repository = ""\n')

@@ -28,11 +28,15 @@ def test_make_change_processor_requires_manifests_repository() -> None:
 
 def test_make_change_processor_uses_manifests_repository() -> None:
     processor = make_change_processor(
-        Settings(manifests_repository="https://github.com/acme/manifests.git")
+        Settings(
+            manifests_repository="https://github.com/acme/manifests.git",
+            detect_deployment=True,
+        )
     )
 
     assert isinstance(processor, ChangeProcessor)
     assert processor.manifests_repository == "https://github.com/acme/manifests.git"
+    assert processor.detect_deployment is True
 
 
 def test_make_store_uses_in_memory_backend() -> None:
