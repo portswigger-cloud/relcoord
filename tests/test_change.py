@@ -191,7 +191,12 @@ def test_change_processor_detects_deployment_when_enabled(
 
     assert result.generated_count == 1
     assert result.deploy_id == "0123456789abcdef"
-    assert calls[-1] == ("push", "manifests", "https://github.com/acme/manifests.git", None)
+    assert calls[-1] == (
+        "push",
+        "manifests",
+        "https://github.com/acme/manifests.git",
+        None,
+    )
     assert detector.called.wait(timeout=1)
     assert detector.kwargs == {
         "deploy_id": "0123456789abcdef",
