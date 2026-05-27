@@ -132,6 +132,7 @@ class Settings:
     host: str = "0.0.0.0"
     port: int = 8000
     manifests_repository: str | None = None
+    detect_deployment: bool = False
     persistence: PersistenceSettings | None = None
     idcat: IdcatSettings | None = None
     roles: list[RoleConfig] = field(default_factory=list)
@@ -171,6 +172,11 @@ class Settings:
             host=data.get("host", cls.host),
             port=data.get("port", cls.port),
             manifests_repository=_optional_string(data, "manifests-repository"),
+            detect_deployment=_bool_or_default(
+                data,
+                "detect-deployment",
+                cls.detect_deployment,
+            ),
             persistence=(
                 PersistenceSettings.from_mapping(persistence) if persistence else None
             ),
@@ -192,6 +198,13 @@ def _optional_string(data: dict[str, Any], key: str) -> str | None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")
+    return value
+
+
+def _bool_or_default(data: dict[str, Any], key: str, default: bool) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean")
     return value
 
 

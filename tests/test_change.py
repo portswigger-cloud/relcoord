@@ -1,13 +1,30 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import logging
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from dulwich import porcelain
 import pytest
 
 from relcoord import change
-from relcoord.change import ChangeProcessor, DeployConfigError
+from relcoord.change import ChangeProcessor, DeployConfigError, DeploymentDetectionError
+
+
+@dataclass(frozen=True)
+class Ref:
+    kind: str
+    namespace: str | None
+    name: str
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    written_paths: set[Path]
+    created_or_modified: set[Ref]
+    removed: set[Ref]
+    deploy_id: str | None
 
 
 def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
@@ -113,6 +130,114 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         "change step 7/7: pushing manifests commit feedface to "
         "https://github.com/acme/manifests.git"
     ) in caplog.text
+
+
+def test_change_processor_detects_deployment_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    created = {Ref(kind="Deployment", namespace="config", name="api")}
+    removed = {Ref(kind="ConfigMap", namespace="config", name="old-api")}
+
+    class Detector:
+        def __init__(self) -> None:
+            self.called = threading.Event()
+            self.kwargs: dict[str, object] | None = None
+
+        def wait_for_success(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.called.set()
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        calls.append(("checkout", repo, commit, target.name, idcat))
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        calls.append(("clone", repo, target.name, idcat, kwargs))
+        target.mkdir(parents=True)
+
+    def fake_generate(*args, **kwargs) -> GenerationResult:
+        calls.append(("generate", args[0].name, args[1].name))
+        manifests_checkout = args[1]
+        return GenerationResult(
+            written_paths={manifests_checkout / "api.yaml"},
+            created_or_modified=created,
+            removed=removed,
+            deploy_id="0123456789abcdef",
+        )
+
+    def fake_head_commit(repo_path: Path) -> str:
+        calls.append(("head", repo_path.name))
+        return "feedface"
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        calls.append(("push", repo_path.name, remote, idcat))
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", fake_head_commit)
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
+
+    detector = Detector()
+    result = ChangeProcessor(
+        "https://github.com/acme/manifests.git",
+        detect_deployment=True,
+        deployment_detector=detector,
+    ).process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert result.generated_count == 1
+    assert result.deploy_id == "0123456789abcdef"
+    assert calls[-1] == ("push", "manifests", "https://github.com/acme/manifests.git", None)
+    assert detector.called.wait(timeout=1)
+    assert detector.kwargs == {
+        "deploy_id": "0123456789abcdef",
+        "created_or_modified": created,
+        "removed": removed,
+    }
+
+
+def test_change_processor_requires_deploy_id_for_deployment_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(*args, **kwargs) -> GenerationResult:
+        manifests_checkout = args[1]
+        return GenerationResult(
+            written_paths={manifests_checkout / "api.yaml"},
+            created_or_modified=set(),
+            removed=set(),
+            deploy_id=None,
+        )
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        calls.append("push")
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
+
+    with pytest.raises(DeploymentDetectionError, match="did not return a deploy_id"):
+        ChangeProcessor(
+            "https://github.com/acme/manifests.git",
+            detect_deployment=True,
+        ).process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert calls == []
 
 
 def test_change_processor_requires_top_level_deploy_directory(

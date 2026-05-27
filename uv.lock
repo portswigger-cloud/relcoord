@@ -626,7 +626,7 @@ wheels = [
 
 [[package]]
 name = "manifest-builder"
-version = "0.4.1.dev34+gf0ede6896"
+version = "0.4.1.dev35+ge3809438c"
 source = { registry = "https://repo.noa.re/" }
 dependencies = [
     { name = "click" },
@@ -635,7 +635,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://repo.noa.re/manifest-builder/manifest_builder-0.4.1.dev34%2Bgf0ede6896-py3-none-any.whl", hash = "sha256:6d3b23e9d5f0b47c4c637e0f5cace0e2b19d176a0fed1277c5abdb5ad9c9f600", size = 44506 },
+    { url = "https://repo.noa.re/manifest-builder/manifest_builder-0.4.1.dev35%2Bge3809438c-py3-none-any.whl", hash = "sha256:8522c1f3bbcb0f277c6c968d43ab7987bcae75b4661f8f6c00ced84d5bc189a3", size = 46861 },
 ]
 
 [[package]]
@@ -1081,7 +1081,7 @@ requires-dist = [
     { name = "dulwich", specifier = ">=1.2.1,<2.0.0" },
     { name = "httpx", specifier = ">=0.28.1,<1.0.0" },
     { name = "hypercorn", specifier = ">=0.17.3,<1.0.0" },
-    { name = "manifest-builder", specifier = ">=0.4.1.dev32,<1.0.0" },
+    { name = "manifest-builder", specifier = ">=0.4.1.dev35,<1.0.0" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9.0,<3.0.0" },
     { name = "starlette", specifier = ">=0.48.0,<1.0.0" },
     { name = "surrealdb", specifier = ">=2.0.0,<3.0.0" },
