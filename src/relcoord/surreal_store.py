@@ -274,7 +274,7 @@ def jwt_claims(token: str) -> dict[str, Any] | None:
     try:
         decoded = urlsafe_b64decode(claims + padding)
         parsed = json.loads(decoded)
-    except (ValueError, json.JSONDecodeError):
+    except ValueError, json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
 
