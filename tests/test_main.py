@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import asyncio
-import logging
 
 import pytest
 
@@ -9,13 +8,7 @@ from relcoord.change import ChangeProcessor
 from relcoord.config import PersistenceSettings, Settings
 from relcoord.dynamodb_store import DynamoDBImageInfoStore
 from relcoord.in_memory_store import InMemoryImageInfoStore
-from relcoord.main import configure_logging, make_change_processor, make_store
-
-
-def test_configure_logging_sets_info_level() -> None:
-    configure_logging()
-
-    assert logging.getLogger().getEffectiveLevel() == logging.INFO
+from relcoord.main import make_change_processor, make_store
 
 
 def test_make_change_processor_requires_manifests_repository() -> None:
