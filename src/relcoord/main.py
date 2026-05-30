@@ -110,7 +110,7 @@ def configure_logging() -> None:
     root_logger.setLevel(logging.DEBUG)
     if not root_logger.handlers:
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG,
             format=LOG_FORMAT,
             datefmt="%Y-%m-%d %H:%M:%S %z",
         )
