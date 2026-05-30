@@ -107,7 +107,7 @@ def main(config_path: str, disable_auth: bool) -> None:
 
 def configure_logging() -> None:
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG)
     if not root_logger.handlers:
         logging.basicConfig(
             level=logging.INFO,
