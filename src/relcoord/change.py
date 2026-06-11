@@ -6,7 +6,7 @@ import logging
 import shutil
 import tempfile
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -16,7 +16,7 @@ from dulwich import porcelain
 from dulwich.repo import Repo
 from manifest_builder import generate
 
-from relcoord.config import IdcatSettings
+from relcoord.config import IdcatSettings, OutputSettings, TemplateValue
 from relcoord.git import github_https_credentials
 from relcoord.kubernetes import KubernetesDeploymentDetector
 
@@ -53,11 +53,23 @@ class ChangeResult:
     manifests_checkout: Path
     generated_count: int
     deploy_id: str | None = None
+    outputs: tuple["OutputResult", ...] = ()
+
+
+@dataclass(frozen=True)
+class OutputResult:
+    name: str
+    repository: str
+    directory: Path
+    manifests_checkout: Path
+    generated_count: int
+    deploy_id: str | None = None
 
 
 @dataclass(frozen=True)
 class ChangeProcessor:
-    manifests_repository: str
+    manifests_repository: str | None = None
+    outputs: Sequence[OutputSettings] = ()
     idcat: IdcatSettings | None = None
     detect_deployment: bool = False
     deployment_detector: DeploymentDetector | None = None
@@ -66,7 +78,10 @@ class ChangeProcessor:
         workdir = Path(tempfile.mkdtemp(prefix="relcoord-change-"))
         try:
             source_checkout = workdir / "source"
-            manifests_checkout = workdir / "manifests"
+            output_settings = self._configured_outputs()
+            checkout_by_repository = _checkout_paths_by_repository(
+                workdir, output_settings
+            )
             logger.info(
                 "change step 1/7: created temporary workspace %s for repo %s at commit %s",
                 workdir,
@@ -89,88 +104,120 @@ class ChangeProcessor:
                 deploy_config,
             )
 
-            logger.info(
-                "change step 4/7: checking out manifests repo %s into %s",
-                self.manifests_repository,
-                manifests_checkout,
-            )
-            _clone_repository(
-                self.manifests_repository,
-                manifests_checkout,
-                self.idcat,
-                depth="1",
-            )
             repo_root = Path("/")
             create_commit = True
             namespace = _namespace_from_repo(repo)
-            logger.info(
-                "change step 5/7: invoking manifest-builder generate("
-                "deploy_config=%s, manifests_checkout=%s, repo_root=%s, "
-                "create_commit=%s, image=%s, namespace=%s)",
-                deploy_config,
-                manifests_checkout,
-                repo_root,
-                create_commit,
-                image,
-                namespace,
-            )
-            generation_result = generate(
-                deploy_config,
-                manifests_checkout,
-                repo_root=repo_root,
-                create_commit=create_commit,
-                image=image,
-                namespace=namespace,
-            )
-            generated = _written_paths(generation_result)
-            generated_paths = ", ".join(
-                str(path.relative_to(manifests_checkout)) for path in sorted(generated)
-            )
-            logger.info(
-                "change step 5/7: manifest-builder generated %d file(s)%s",
-                len(generated),
-                f": {generated_paths}" if generated_paths else "",
-            )
-            deploy_id = _deploy_id(generation_result)
-            if self.detect_deployment and deploy_id is None:
-                raise DeploymentDetectionError(
-                    "manifest-builder did not return a deploy_id; "
-                    "deployment detection requires git-backed generation"
+            output_results: list[OutputResult] = []
+            total_generated = 0
+
+            for repository, manifests_checkout in checkout_by_repository.items():
+                detection_results: list[tuple[object, str | None]] = []
+                logger.info(
+                    "change step 4/7: checking out manifests repo %s into %s",
+                    repository,
+                    manifests_checkout,
                 )
-            manifest_commit = _head_commit(manifests_checkout)
-            logger.info(
-                "change step 6/7: manifest-builder created manifests commit %s",
-                manifest_commit,
-            )
-            logger.info(
-                "change step 7/7: pushing manifests commit %s to %s",
-                manifest_commit,
-                self.manifests_repository,
-            )
-            _push_repository(
-                manifests_checkout,
-                self.manifests_repository,
-                self.idcat,
-            )
-            logger.info(
-                "change complete: pushed manifests commit %s for source repo %s at commit %s",
-                manifest_commit,
-                repo,
-                commit,
-            )
-            if self.detect_deployment:
-                _start_deployment_detection(
-                    generation_result,
-                    deploy_id,
-                    self.deployment_detector,
+                _clone_repository(
+                    repository,
+                    manifests_checkout,
+                    self.idcat,
+                    depth="1",
                 )
+
+                for output in _outputs_for_repository(output_settings, repository):
+                    output_path = manifests_checkout / output.directory
+                    output_path.mkdir(parents=True, exist_ok=True)
+                    logger.info(
+                        "change step 5/7: invoking manifest-builder generate("
+                        "output=%s, deploy_config=%s, manifests_checkout=%s, "
+                        "repo_root=%s, create_commit=%s, image=%s, namespace=%s, "
+                        "vars=%s)",
+                        output.name,
+                        deploy_config,
+                        output_path,
+                        repo_root,
+                        create_commit,
+                        image,
+                        namespace,
+                        _vars_log_summary(output.vars),
+                    )
+                    generation_result = generate(
+                        deploy_config,
+                        output_path,
+                        repo_root=repo_root,
+                        create_commit=create_commit,
+                        image=image,
+                        namespace=namespace,
+                        vars=output.vars,
+                    )
+                    generated = _written_paths(generation_result)
+                    generated_paths = ", ".join(
+                        str(path.relative_to(output_path)) for path in sorted(generated)
+                    )
+                    logger.info(
+                        "change step 5/7: manifest-builder generated %d file(s) "
+                        "for output %s%s",
+                        len(generated),
+                        output.name,
+                        f": {generated_paths}" if generated_paths else "",
+                    )
+                    deploy_id = _deploy_id(generation_result)
+                    if self.detect_deployment and deploy_id is None:
+                        raise DeploymentDetectionError(
+                            "manifest-builder did not return a deploy_id; "
+                            "deployment detection requires git-backed generation"
+                        )
+                    output_results.append(
+                        OutputResult(
+                            name=output.name,
+                            repository=output.repository,
+                            directory=output.directory,
+                            manifests_checkout=manifests_checkout,
+                            generated_count=len(generated),
+                            deploy_id=deploy_id,
+                        )
+                    )
+                    detection_results.append((generation_result, deploy_id))
+                    total_generated += len(generated)
+
+                manifest_commit = _head_commit(manifests_checkout)
+                logger.info(
+                    "change step 6/7: manifest-builder created manifests commit %s",
+                    manifest_commit,
+                )
+                logger.info(
+                    "change step 7/7: pushing manifests commit %s to %s",
+                    manifest_commit,
+                    repository,
+                )
+                _push_repository(
+                    manifests_checkout,
+                    repository,
+                    self.idcat,
+                )
+                logger.info(
+                    "change complete: pushed manifests commit %s for source repo %s "
+                    "at commit %s",
+                    manifest_commit,
+                    repo,
+                    commit,
+                )
+
+                if self.detect_deployment:
+                    for generation_result, deploy_id in detection_results:
+                        _start_deployment_detection(
+                            generation_result,
+                            deploy_id,
+                            self.deployment_detector,
+                        )
             return ChangeResult(
                 repo=repo,
                 commit=commit,
                 deploy_config=deploy_config,
-                manifests_checkout=manifests_checkout,
-                generated_count=len(generated),
-                deploy_id=deploy_id,
+                manifests_checkout=output_results[0].manifests_checkout,
+                generated_count=total_generated,
+                deploy_id=output_results[0].deploy_id,
+                outputs=tuple(output_results),
             )
         except ChangeProcessingError:
             raise
@@ -178,6 +225,19 @@ class ChangeProcessor:
             raise ChangeProcessingError(str(exc)) from exc
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def _configured_outputs(self) -> tuple[OutputSettings, ...]:
+        if self.outputs:
+            return tuple(self.outputs)
+        if self.manifests_repository is None:
+            raise ChangeProcessingError("at least one output must be configured")
+        return (
+            OutputSettings(
+                name="manifests",
+                repository=self.manifests_repository,
+                directory=Path("."),
+            ),
+        )
 
 
 def _written_paths(generation_result: object) -> set[Path]:
@@ -190,6 +250,30 @@ def _written_paths(generation_result: object) -> set[Path]:
 def _deploy_id(generation_result: object) -> str | None:
     deploy_id = getattr(generation_result, "deploy_id", None)
     return deploy_id if isinstance(deploy_id, str) else None
+
+
+def _checkout_paths_by_repository(
+    workdir: Path, outputs: Sequence[OutputSettings]
+) -> dict[str, Path]:
+    repositories = list(dict.fromkeys(output.repository for output in outputs))
+    if len(repositories) == 1:
+        return {repositories[0]: workdir / "manifests"}
+    return {
+        repository: workdir / f"manifests-{index}"
+        for index, repository in enumerate(repositories, start=1)
+    }
+
+
+def _outputs_for_repository(
+    outputs: Sequence[OutputSettings], repository: str
+) -> tuple[OutputSettings, ...]:
+    return tuple(output for output in outputs if output.repository == repository)
+
+
+def _vars_log_summary(vars: dict[str, TemplateValue]) -> str:
+    if not vars:
+        return "none"
+    return ", ".join(sorted(vars))
 
 
 def _start_deployment_detection(

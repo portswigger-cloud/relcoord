@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import asyncio
 import logging
+from pathlib import Path
 
 import pytest
 
 from relcoord.change import ChangeProcessor
-from relcoord.config import PersistenceSettings, Settings
+from relcoord.config import OutputSettings, PersistenceSettings, Settings
 from relcoord.dynamodb_store import DynamoDBImageInfoStore
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.main import configure_logging, make_change_processor, make_store
@@ -15,7 +16,7 @@ from relcoord.main import configure_logging, make_change_processor, make_store
 def test_make_change_processor_requires_manifests_repository() -> None:
     with pytest.raises(
         RuntimeError,
-        match="manifests-repository must be configured at the top level",
+        match=r"manifests-repository or at least one \[\[output\]\]",
     ):
         make_change_processor(Settings())
 
@@ -31,6 +32,25 @@ def test_make_change_processor_uses_manifests_repository() -> None:
     assert isinstance(processor, ChangeProcessor)
     assert processor.manifests_repository == "https://github.com/acme/manifests.git"
     assert processor.detect_deployment is True
+
+
+def test_make_change_processor_uses_outputs() -> None:
+    processor = make_change_processor(
+        Settings(
+            outputs=[
+                OutputSettings(
+                    name="example-dev",
+                    repository="https://github.com/acme/manifests.git",
+                    directory=Path("example-dev"),
+                    vars={"cluster_name": "example-dev"},
+                )
+            ]
+        )
+    )
+
+    assert isinstance(processor, ChangeProcessor)
+    assert processor.manifests_repository is None
+    assert processor.outputs[0].name == "example-dev"
 
 
 def test_make_store_uses_in_memory_backend() -> None:

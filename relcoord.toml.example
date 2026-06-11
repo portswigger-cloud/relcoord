@@ -3,8 +3,27 @@
 host = "0.0.0.0"
 port = 8080
 log-level = "INFO"
-manifests-repository = "https://github.com/example/manifests.git"
 detect-deployment = false
+
+[[output]]
+name = "example-dev"
+repository = "https://github.com/example/manifests"
+directory = "example-dev"
+
+[output.vars]
+cluster_name = "example-dev"
+account_id = 111122223333
+issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEDEVCLUSTERID"
+
+[[output]]
+name = "example-prod"
+repository = "https://github.com/example/manifests"
+directory = "example-prod"
+
+[output.vars]
+cluster_name = "example-prod"
+account_id = 444455556666
+issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEPRODCLUSTERID"
 
 [persistence]
 backend = "surrealdb"

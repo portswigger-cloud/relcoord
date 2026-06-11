@@ -9,6 +9,8 @@ from typing import Any, Literal, cast
 
 from relcoord.auth import RoleConfig
 
+TemplateValue = str | int | float | bool
+
 
 def _read_secret_file(path: Path) -> str:
     return path.read_text().rstrip("\r\n")
@@ -128,11 +130,35 @@ class IdcatSettings:
 
 
 @dataclass(frozen=True)
+class OutputSettings:
+    name: str
+    repository: str
+    directory: Path
+    vars: dict[str, TemplateValue] = field(default_factory=dict)
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> "OutputSettings":
+        name = _required_output_string(data, "name")
+        repository = _required_output_string(data, "repository")
+        directory = _required_output_directory(data)
+        raw_vars = data.get("vars", {})
+        if not isinstance(raw_vars, dict):
+            raise ValueError("output.vars must be a table")
+        return cls(
+            name=name,
+            repository=repository,
+            directory=directory,
+            vars=_output_vars(raw_vars),
+        )
+
+
+@dataclass(frozen=True)
 class Settings:
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "INFO"
     manifests_repository: str | None = None
+    outputs: list[OutputSettings] = field(default_factory=list)
     detect_deployment: bool = False
     persistence: PersistenceSettings | None = None
     idcat: IdcatSettings | None = None
@@ -159,6 +185,15 @@ class Settings:
         raw_roles = data.get("role", [])
         if not isinstance(raw_roles, list):
             raise ValueError("role must be an array of tables")
+        raw_outputs = data.get("output", [])
+        if not isinstance(raw_outputs, list):
+            raise ValueError("output must be an array of tables")
+        outputs = _outputs_from_entries(raw_outputs)
+        manifests_repository = _optional_string(data, "manifests-repository")
+        if manifests_repository is not None and outputs:
+            raise ValueError(
+                "configure either manifests-repository or [[output]], not both"
+            )
         roles: list[RoleConfig] = []
         seen: set[str] = set()
         for entry in raw_roles:
@@ -173,7 +208,8 @@ class Settings:
             host=data.get("host", cls.host),
             port=data.get("port", cls.port),
             log_level=_log_level_or_default(data, "log-level", cls.log_level),
-            manifests_repository=_optional_string(data, "manifests-repository"),
+            manifests_repository=manifests_repository,
+            outputs=outputs,
             detect_deployment=_bool_or_default(
                 data,
                 "detect-deployment",
@@ -229,3 +265,42 @@ def _optional_persistence_string(data: dict[str, Any], key: str) -> str | None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"persistence.{key} must be a non-empty string")
     return value
+
+
+def _outputs_from_entries(entries: list[Any]) -> list[OutputSettings]:
+    outputs: list[OutputSettings] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("each output entry must be a table")
+        output = OutputSettings.from_mapping(entry)
+        if output.name in seen:
+            raise ValueError(f"duplicate output '{output.name}'")
+        seen.add(output.name)
+        outputs.append(output)
+    return outputs
+
+
+def _required_output_string(data: dict[str, Any], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"output.{key} must be a non-empty string")
+    return value
+
+
+def _required_output_directory(data: dict[str, Any]) -> Path:
+    directory = Path(_required_output_string(data, "directory"))
+    if directory.is_absolute() or ".." in directory.parts:
+        raise ValueError("output.directory must be a relative path without '..'")
+    return directory
+
+
+def _output_vars(data: dict[str, Any]) -> dict[str, TemplateValue]:
+    vars: dict[str, TemplateValue] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("output.vars keys must be non-empty strings")
+        if not isinstance(value, str | int | float | bool):
+            raise ValueError(f"output.vars.{key} must be a string, number, or boolean")
+        vars[key] = value
+    return vars
