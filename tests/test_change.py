@@ -10,6 +10,7 @@ import pytest
 
 from relcoord import change
 from relcoord.change import ChangeProcessor, DeployConfigError, DeploymentDetectionError
+from relcoord.config import OutputSettings
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         create_commit: bool,
         image: str | None,
         namespace: str,
+        vars: dict[str, object],
     ) -> set[Path]:
         calls.append(
             (
@@ -58,6 +60,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
                 create_commit,
                 image,
                 namespace,
+                vars,
             )
         )
         return {manifests_checkout / "api.yaml", manifests_checkout / "worker.yaml"}
@@ -113,6 +116,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
             True,
             "registry.example.com/team/api:1.2.3",
             "config",
+            {},
         ),
         ("head", "manifests"),
         ("push", "manifests", "https://github.com/acme/manifests.git", None),
@@ -130,6 +134,135 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         "change step 7/7: pushing manifests commit feedface to "
         "https://github.com/acme/manifests.git"
     ) in caplog.text
+
+
+def test_change_processor_generates_configured_outputs_with_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    outputs = [
+        OutputSettings(
+            name="example-dev",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-dev"),
+            vars={
+                "cluster_name": "example-dev",
+                "account_id": 111122223333,
+            },
+        ),
+        OutputSettings(
+            name="example-prod",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-prod"),
+            vars={
+                "cluster_name": "example-prod",
+                "account_id": 444455556666,
+            },
+        ),
+    ]
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        calls.append(("checkout", repo, commit, target.name, idcat))
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        calls.append(("clone", repo, target.name, idcat, kwargs))
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path,
+        output_path: Path,
+        *,
+        repo_root: Path,
+        create_commit: bool,
+        image: str | None,
+        namespace: str,
+        vars: dict[str, object],
+    ) -> GenerationResult:
+        calls.append(
+            (
+                "generate",
+                deploy_config.name,
+                output_path.relative_to(tmp_path / "manifests"),
+                repo_root,
+                create_commit,
+                image,
+                namespace,
+                vars,
+            )
+        )
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified=set(),
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    def fake_head_commit(repo_path: Path) -> str:
+        calls.append(("head", repo_path.name))
+        return "feedface"
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        calls.append(("push", repo_path.name, remote, idcat))
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", fake_head_commit)
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
+
+    result = ChangeProcessor(outputs=outputs).process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        None,
+    )
+
+    assert result.generated_count == 2
+    assert [output.name for output in result.outputs] == [
+        "example-dev",
+        "example-prod",
+    ]
+    assert calls == [
+        (
+            "checkout",
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            "source",
+            None,
+        ),
+        (
+            "clone",
+            "https://github.com/acme/manifests.git",
+            "manifests",
+            None,
+            {"depth": "1"},
+        ),
+        (
+            "generate",
+            ".deploy",
+            Path("example-dev"),
+            Path("/"),
+            True,
+            None,
+            "config",
+            {"cluster_name": "example-dev", "account_id": 111122223333},
+        ),
+        (
+            "generate",
+            ".deploy",
+            Path("example-prod"),
+            Path("/"),
+            True,
+            None,
+            "config",
+            {"cluster_name": "example-prod", "account_id": 444455556666},
+        ),
+        ("head", "manifests"),
+        ("push", "manifests", "https://github.com/acme/manifests.git", None),
+    ]
 
 
 def test_change_processor_detects_deployment_when_enabled(

@@ -74,10 +74,13 @@ async def make_store(settings: Settings) -> ImageInfoStore:
 def make_change_processor(
     settings: Settings,
 ) -> ManifestChangeProcessor:
-    if settings.manifests_repository is None:
-        raise RuntimeError("manifests-repository must be configured at the top level")
+    if settings.manifests_repository is None and not settings.outputs:
+        raise RuntimeError(
+            "manifests-repository or at least one [[output]] entry must be configured"
+        )
     return ManifestChangeProcessor(
         manifests_repository=settings.manifests_repository,
+        outputs=settings.outputs,
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
     )

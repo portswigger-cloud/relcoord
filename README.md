@@ -50,3 +50,19 @@ region-name = "eu-west-2"
 The DynamoDB table must already exist with string partition key `pk` and string
 sort key `sk`. AWS credentials are resolved using the standard boto3 provider
 chain. For local development against DynamoDB Local, set `endpoint-url`.
+
+Manifest generation outputs are configured with `[[output]]` entries. Each
+output names a manifests repository, a directory inside that repository, and
+optional variables passed to `manifest-builder`:
+
+```toml
+[[output]]
+name = "example-dev"
+repository = "https://github.com/example/manifests"
+directory = "example-dev"
+
+[output.vars]
+cluster_name = "example-dev"
+account_id = 111122223333
+issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEDEVCLUSTERID"
+```

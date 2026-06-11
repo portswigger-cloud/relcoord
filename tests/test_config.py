@@ -128,6 +128,104 @@ def test_settings_parses_manifests_repository(tmp_path: Path) -> None:
     assert settings.manifests_repository == "https://github.com/acme/manifests.git"
 
 
+def test_settings_parses_output_entries(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/example/manifests"
+        directory = "example-dev"
+
+        [output.vars]
+        cluster_name = "example-dev"
+        account_id = 111122223333
+        issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEDEVCLUSTERID"
+
+        [[output]]
+        name = "example-prod"
+        repository = "https://github.com/example/manifests"
+        directory = "example-prod"
+
+        [output.vars]
+        cluster_name = "example-prod"
+        account_id = 444455556666
+        issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEPRODCLUSTERID"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.outputs[0].name == "example-dev"
+    assert settings.outputs[0].repository == "https://github.com/example/manifests"
+    assert settings.outputs[0].directory == Path("example-dev")
+    assert settings.outputs[0].vars == {
+        "cluster_name": "example-dev",
+        "account_id": 111122223333,
+        "issuer": "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEDEVCLUSTERID",
+    }
+    assert settings.outputs[1].name == "example-prod"
+    assert settings.outputs[1].directory == Path("example-prod")
+    assert settings.outputs[1].vars["cluster_name"] == "example-prod"
+
+
+def test_settings_rejects_output_with_non_scalar_vars(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        directory = "example-dev"
+
+        [output.vars]
+        cluster_names = ["example-dev"]
+        """
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="output.vars.cluster_names must be a string, number, or boolean",
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_output_with_parent_directory(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        directory = "../example-dev"
+        """
+    )
+
+    with pytest.raises(
+        ValueError, match="output.directory must be a relative path without '..'"
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_manifests_repository_and_outputs(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        manifests-repository = "https://github.com/acme/manifests.git"
+
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        directory = "example-dev"
+        """
+    )
+
+    with pytest.raises(
+        ValueError, match=r"configure either manifests-repository or \[\[output\]\]"
+    ):
+        Settings.from_toml(config)
+
+
 def test_settings_parses_detect_deployment(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text("detect-deployment = true\n")
