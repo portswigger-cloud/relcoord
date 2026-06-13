@@ -11,6 +11,7 @@ from relcoord.config import OutputSettings, PersistenceSettings, Settings
 from relcoord.dynamodb_store import DynamoDBImageInfoStore
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.main import configure_logging, make_change_processor, make_store
+from relcoord.retrying_store import RetryingImageInfoStore
 
 
 def test_make_change_processor_requires_manifests_repository() -> None:
@@ -58,7 +59,8 @@ def test_make_store_uses_in_memory_backend() -> None:
         make_store(Settings(persistence=PersistenceSettings(backend="in-memory")))
     )
 
-    assert isinstance(store, InMemoryImageInfoStore)
+    assert isinstance(store, RetryingImageInfoStore)
+    assert isinstance(store.wrapped_store, InMemoryImageInfoStore)
 
 
 def test_make_store_uses_dynamodb_backend(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -81,7 +83,8 @@ def test_make_store_uses_dynamodb_backend(monkeypatch: pytest.MonkeyPatch) -> No
         )
     )
 
-    assert store is expected
+    assert isinstance(store, RetryingImageInfoStore)
+    assert store.wrapped_store is expected
 
 
 def test_configure_logging_uses_configured_log_level() -> None:
