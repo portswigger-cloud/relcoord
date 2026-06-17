@@ -34,12 +34,12 @@ jobs:
         id: image-version
         run: |
           image_version="$(uv run --locked --group dev bktools-image-version-hash)"
-          echo "tag=public.ecr.aws/w5l8e4i9/relcoord:${image_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=public.ecr.aws/q3z6g1h3/relcoord:${image_version}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: arn:aws:iam::658786808637:role/relcoord-ecr-publish
+          role-to-assume: arn:aws:iam::436027055282:role/product-roles/relcoord-ecr-publish
           aws-region: us-east-1
 
       - name: Log in to Amazon ECR Public
