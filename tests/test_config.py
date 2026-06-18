@@ -30,7 +30,7 @@ def test_settings_parse_surrealdb_idmouse_config(tmp_path: Path) -> None:
 
     settings = Settings.from_toml(config)
 
-    assert settings.host == "127.0.0.1"
+    assert settings.listen == "127.0.0.1"
     assert settings.port == 9000
     assert settings.persistence is not None
     assert settings.persistence.backend == "surrealdb"
@@ -40,6 +40,50 @@ def test_settings_parse_surrealdb_idmouse_config(tmp_path: Path) -> None:
     assert settings.persistence.idmouse is not None
     assert settings.persistence.idmouse.url == "http://idmouse:9000/token"
     assert settings.persistence.idmouse.bearer_token() == "local-bearer-token"
+
+
+def test_settings_listen_option(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        listen = "127.0.0.1"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.listen == "127.0.0.1"
+
+
+def test_settings_host_option_is_deprecated(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        host = "127.0.0.1"
+        """
+    )
+
+    with caplog.at_level("WARNING"):
+        settings = Settings.from_toml(config)
+
+    assert settings.listen == "127.0.0.1"
+    assert any("deprecated" in record.message for record in caplog.records)
+
+
+def test_settings_listen_takes_precedence_over_host(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        host = "10.0.0.1"
+        listen = "127.0.0.1"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.listen == "127.0.0.1"
 
 
 def test_settings_parse_in_memory_persistence_without_surrealdb_config(

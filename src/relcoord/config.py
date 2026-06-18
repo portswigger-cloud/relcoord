@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
+import logging
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from relcoord.auth import RoleConfig
+
+logger = logging.getLogger(__name__)
 
 TemplateValue = str | int | float | bool
 
@@ -154,7 +157,7 @@ class OutputSettings:
 
 @dataclass(frozen=True)
 class Settings:
-    host: str = "0.0.0.0"
+    listen: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "INFO"
     manifests_repository: str | None = None
@@ -204,8 +207,13 @@ class Settings:
                 raise ValueError(f"duplicate role '{role.name}'")
             seen.add(role.name)
             roles.append(role)
+        if "host" in data:
+            logger.warning(
+                "The 'host' config option is deprecated; use 'listen' instead"
+            )
+        listen = data.get("listen", data.get("host", cls.listen))
         return cls(
-            host=data.get("host", cls.host),
+            listen=listen,
             port=data.get("port", cls.port),
             log_level=_log_level_or_default(data, "log-level", cls.log_level),
             manifests_repository=manifests_repository,
