@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 async def run(settings: Settings, disable_auth: bool) -> None:
     config = HypercornConfig()
-    config.bind = [f"{settings.host}:{settings.port}"]
+    config.bind = [f"{settings.listen}:{settings.port}"]
     token_validator = _build_token_validator(settings, disable_auth)
     change_processor = make_change_processor(settings)
     store = await make_store(settings)
