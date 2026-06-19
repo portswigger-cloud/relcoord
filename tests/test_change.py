@@ -9,8 +9,14 @@ from dulwich import porcelain
 import pytest
 
 from relcoord import change
-from relcoord.change import ChangeProcessor, DeployConfigError, DeploymentDetectionError
+from relcoord.change import (
+    ChangeProcessor,
+    CredentialError,
+    DeployConfigError,
+    DeploymentDetectionError,
+)
 from relcoord.config import OutputSettings
+from relcoord.git import GitCredentialError
 
 
 @dataclass(frozen=True)
@@ -106,7 +112,12 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
             "https://github.com/acme/manifests.git",
             "manifests",
             None,
-            {"depth": "1"},
+            {
+                "purpose": (
+                    "cloning manifests repo https://github.com/acme/manifests.git"
+                ),
+                "depth": "1",
+            },
         ),
         (
             "generate",
@@ -238,7 +249,12 @@ def test_change_processor_generates_configured_outputs_with_vars(
             "https://github.com/acme/manifests.git",
             "manifests",
             None,
-            {"depth": "1"},
+            {
+                "purpose": (
+                    "cloning manifests repo https://github.com/acme/manifests.git"
+                ),
+                "depth": "1",
+            },
         ),
         (
             "generate",
@@ -443,3 +459,26 @@ def test_checkout_commit_materializes_requested_commit(tmp_path: Path) -> None:
 
     assert (checkout / "README.md").read_text() == "first\n"
     assert not (checkout / ".deploy").exists()
+
+
+def test_credentials_for_wraps_git_credential_error_with_operation_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_github_https_credentials(source: str, idcat) -> None:
+        raise GitCredentialError("idcat returned HTTP 401: not allowed")
+
+    monkeypatch.setattr(
+        change, "github_https_credentials", fake_github_https_credentials
+    )
+
+    with pytest.raises(CredentialError) as excinfo:
+        change._credentials_for(
+            "https://github.com/acme/system.git",
+            None,
+            "checking out source repo https://github.com/acme/system.git",
+        )
+
+    message = str(excinfo.value)
+    assert "checking out source repo https://github.com/acme/system.git" in message
+    assert "idcat returned HTTP 401: not allowed" in message
+    assert isinstance(excinfo.value.__cause__, GitCredentialError)

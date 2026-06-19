@@ -7,7 +7,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from relcoord.app import NoopChangeProcessor, NoopTokenValidator, create_app
-from relcoord.change import DeployConfigError
+from relcoord.change import CredentialError, DeployConfigError
 from relcoord.errors import PersistenceUnavailableError
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.models import RegisterResult
@@ -519,6 +519,49 @@ def test_change_reports_missing_deploy_config(
         "Bad request POST /v1/change: invalid_deploy_config: missing .deploy"
         in caplog.text
     )
+
+
+def test_change_reports_credential_error_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Processor:
+        def process(self, repo: str, commit: str, image: str | None) -> object:
+            raise CredentialError(
+                "failed to obtain git credentials while checking out source repo "
+                "https://github.com/acme/config.git: idcat returned HTTP 401"
+            )
+
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=Processor(),
+        )
+    )
+    caplog.set_level(logging.WARNING, logger="relcoord.app")
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "https://github.com/acme/config.git",
+            "commit": "deadbeef",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": "git_credentials_unavailable",
+        "message": (
+            "failed to obtain git credentials while checking out source repo "
+            "https://github.com/acme/config.git: idcat returned HTTP 401"
+        ),
+    }
+    assert (
+        "Insufficient git credentials to process change for repo "
+        "https://github.com/acme/config.git at commit deadbeef" in caplog.text
+    )
+    # The expected condition must not be logged with a stack trace.
+    assert "Traceback (most recent call last)" not in caplog.text
 
 
 def test_git_clone_endpoint_is_not_registered(client: TestClient) -> None:

@@ -17,7 +17,7 @@ from dulwich.repo import Repo
 from manifest_builder import generate
 
 from relcoord.config import IdcatSettings, OutputSettings, TemplateValue
-from relcoord.git import github_https_credentials
+from relcoord.git import GitCredentialError, GitCredentials, github_https_credentials
 from relcoord.kubernetes import KubernetesDeploymentDetector
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,15 @@ class ChangeProcessingError(Exception):
 
 class DeployConfigError(ChangeProcessingError):
     pass
+
+
+class CredentialError(ChangeProcessingError):
+    """Raised when git credentials for a repository cannot be obtained.
+
+    This commonly happens when idcat does not grant the configured GitHub app
+    access to the requested repository, which is an expected condition rather
+    than a bug, so callers should report it without a stack trace.
+    """
 
 
 class DeploymentDetectionError(ChangeProcessingError):
@@ -121,6 +130,7 @@ class ChangeProcessor:
                     repository,
                     manifests_checkout,
                     self.idcat,
+                    purpose=f"cloning manifests repo {repository}",
                     depth="1",
                 )
 
@@ -346,7 +356,13 @@ def _run_deployment_detection(
 def _checkout_commit(
     source: str, commit: str, target: Path, idcat: IdcatSettings | None
 ) -> None:
-    _clone_repository(source, target, idcat, no_checkout=True)
+    _clone_repository(
+        source,
+        target,
+        idcat,
+        purpose=f"checking out source repo {source}",
+        no_checkout=True,
+    )
     _dulwich_checkout(target, commit)
 
 
@@ -355,15 +371,27 @@ def _namespace_from_repo(repo: str) -> str:
     return namespace.removesuffix(".git")
 
 
+def _credentials_for(
+    source: str, idcat: IdcatSettings | None, purpose: str
+) -> GitCredentials:
+    try:
+        return github_https_credentials(source, idcat)
+    except GitCredentialError as exc:
+        raise CredentialError(
+            f"failed to obtain git credentials while {purpose}: {exc}"
+        ) from exc
+
+
 def _clone_repository(
     source: str,
     target: Path,
     idcat: IdcatSettings | None,
     *,
+    purpose: str,
     depth: str | None = None,
     no_checkout: bool = False,
 ) -> None:
-    credentials = github_https_credentials(source, idcat)
+    credentials = _credentials_for(source, idcat, purpose)
     clone_output = BytesIO()
     repo: Repo | None = None
     try:
@@ -417,7 +445,7 @@ def _push_repository(
     remote: str,
     idcat: IdcatSettings | None,
 ) -> None:
-    credentials = github_https_credentials(remote, idcat)
+    credentials = _credentials_for(remote, idcat, f"pushing to manifests repo {remote}")
     push_output = BytesIO()
     try:
         if credentials.username is None:
