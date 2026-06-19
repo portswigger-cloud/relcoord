@@ -243,9 +243,10 @@ class TokenValidator:
 def extract_bearer_token(authorization_header: str | None) -> str:
     if authorization_header is None:
         raise AuthError("missing Authorization header")
-    if not authorization_header.startswith("Bearer "):
+    scheme, separator, remainder = authorization_header.partition(" ")
+    if not separator or scheme.lower() != "bearer":
         raise AuthError("expected a Bearer token")
-    token = authorization_header[len("Bearer ") :].strip()
+    token = remainder.strip()
     if not token:
         raise AuthError("empty bearer token")
     return token

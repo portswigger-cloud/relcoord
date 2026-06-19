@@ -120,6 +120,12 @@ def test_extract_bearer_token_rejects_empty() -> None:
         extract_bearer_token("Bearer    ")
 
 
+def test_extract_bearer_token_scheme_is_case_insensitive() -> None:
+    assert extract_bearer_token("bearer abc") == "abc"
+    assert extract_bearer_token("BEARER abc") == "abc"
+    assert extract_bearer_token("BeArEr abc") == "abc"
+
+
 def test_validator_accepts_token(private_pem: str, signing_key: PyJWK) -> None:
     validator = _make_validator([_role()], signing_key)
     token = _make_token(private_pem)
