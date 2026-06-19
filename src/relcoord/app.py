@@ -16,7 +16,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from relcoord.auth import AuthError, TokenValidator, extract_bearer_token
-from relcoord.change import ChangeProcessingError, DeployConfigError
+from relcoord.change import ChangeProcessingError, CredentialError, DeployConfigError
 from relcoord.errors import (
     PersistenceUnavailableError,
     TimestampConflictError,
@@ -218,6 +218,19 @@ def create_app(
             return _bad_request(
                 request,
                 error="invalid_deploy_config",
+                message=str(exc),
+            )
+        except CredentialError as exc:
+            logger.warning(
+                "Insufficient git credentials to process change for repo %s "
+                "at commit %s: %s",
+                repo,
+                commit,
+                exc,
+            )
+            return _json_error(
+                status_code=502,
+                error="git_credentials_unavailable",
                 message=str(exc),
             )
         except PersistenceUnavailableError as exc:
