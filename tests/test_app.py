@@ -7,7 +7,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from relcoord.app import NoopChangeProcessor, NoopTokenValidator, create_app
-from relcoord.change import CredentialError, DeployConfigError
+from relcoord.change import CredentialError, DeployConfigError, GitTransportError
 from relcoord.errors import PersistenceUnavailableError
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.models import RegisterResult
@@ -597,6 +597,51 @@ def test_change_reports_credential_error_without_traceback(
         "https://github.com/acme/config.git at commit deadbeef" in caplog.text
     )
     # The expected condition must not be logged with a stack trace.
+    assert "Traceback (most recent call last)" not in caplog.text
+
+
+def test_change_reports_git_transport_error_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Processor:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+        ) -> object:
+            raise GitTransportError(
+                "dulwich clone failed: dulwich.errors.NotGitRepository"
+            )
+
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=Processor(),
+        )
+    )
+    caplog.set_level(logging.WARNING, logger="relcoord.app")
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "https://github.com/acme/config.git",
+            "commit": "deadbeef",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": "git_transport_failed",
+        "message": "dulwich clone failed: dulwich.errors.NotGitRepository",
+    }
+    assert (
+        "Git transport failure while processing change for repo "
+        "https://github.com/acme/config.git at commit deadbeef" in caplog.text
+    )
+    # The error must be reported without dumping a stack trace.
     assert "Traceback (most recent call last)" not in caplog.text
 
 

@@ -17,7 +17,12 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from relcoord.auth import AuthError, TokenValidator, extract_bearer_token
-from relcoord.change import ChangeProcessingError, CredentialError, DeployConfigError
+from relcoord.change import (
+    ChangeProcessingError,
+    CredentialError,
+    DeployConfigError,
+    GitTransportError,
+)
 from relcoord.errors import (
     PersistenceUnavailableError,
     TimestampConflictError,
@@ -245,6 +250,19 @@ def create_app(
             return _json_error(
                 status_code=502,
                 error="git_credentials_unavailable",
+                message=str(exc),
+            )
+        except GitTransportError as exc:
+            logger.warning(
+                "Git transport failure while processing change for repo %s "
+                "at commit %s: %s",
+                repo,
+                commit,
+                exc,
+            )
+            return _json_error(
+                status_code=502,
+                error="git_transport_failed",
                 message=str(exc),
             )
         except PersistenceUnavailableError as exc:
