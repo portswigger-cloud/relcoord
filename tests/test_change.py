@@ -3,9 +3,11 @@
 import logging
 import threading
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 from dulwich import porcelain
+from dulwich.errors import NotGitRepository
 import pytest
 
 from relcoord import change
@@ -458,6 +460,22 @@ def test_change_processor_uses_custom_config_path(
     )
 
     assert deploy_configs == [tmp_path / "source" / "deploy" / "system"]
+
+
+def test_dulwich_error_message_falls_back_to_exception_type_when_blank() -> None:
+    # NotGitRepository (raised for missing/private/inaccessible repos) has an
+    # empty string representation, so the message must surface its type instead.
+    message = change._dulwich_error_message("clone", NotGitRepository(), BytesIO())
+
+    assert message == "dulwich clone failed: dulwich.errors.NotGitRepository"
+
+
+def test_dulwich_error_message_prefers_stderr() -> None:
+    errstream = BytesIO(b"fatal: repository not found\n")
+
+    message = change._dulwich_error_message("clone", NotGitRepository(), errstream)
+
+    assert message == "dulwich clone failed: fatal: repository not found"
 
 
 @pytest.mark.parametrize(

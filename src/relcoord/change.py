@@ -40,6 +40,16 @@ class CredentialError(ChangeProcessingError):
     """
 
 
+class GitTransportError(ChangeProcessingError):
+    """Raised when a git clone or push fails at the transport level.
+
+    dulwich does not always surface a descriptive message (for example a
+    NotGitRepository error when a repository is missing, private, or otherwise
+    inaccessible), so this carries whatever detail is available and is reported
+    without a stack trace.
+    """
+
+
 class DeploymentDetectionError(ChangeProcessingError):
     pass
 
@@ -422,7 +432,7 @@ def _clone_repository(
             )
     except Exception as exc:
         _log_dulwich_output("clone", clone_output)
-        raise ChangeProcessingError(
+        raise GitTransportError(
             _dulwich_error_message("clone", exc, clone_output)
         ) from exc
     else:
@@ -471,7 +481,7 @@ def _push_repository(
             )
     except Exception as exc:
         _log_dulwich_output("push", push_output)
-        raise ChangeProcessingError(
+        raise GitTransportError(
             _dulwich_error_message("push", exc, push_output)
         ) from exc
     else:
@@ -479,8 +489,23 @@ def _push_repository(
 
 
 def _dulwich_error_message(operation: str, exc: Exception, errstream: BytesIO) -> str:
-    message = errstream.getvalue().decode(errors="replace").strip() or str(exc)
-    return f"dulwich {operation} failed: {message}"
+    stderr = errstream.getvalue().decode(errors="replace").strip()
+    detail = stderr or str(exc).strip() or _exception_label(exc)
+    return f"dulwich {operation} failed: {detail}"
+
+
+def _exception_label(exc: Exception) -> str:
+    """Return a readable name for an exception that carries no message.
+
+    Some dulwich errors (for example NotGitRepository, raised when a repository
+    is missing, private, or otherwise inaccessible) have an empty string
+    representation, which would otherwise produce a blank error detail.
+    """
+    module = type(exc).__module__
+    qualname = type(exc).__qualname__
+    if module and module != "builtins":
+        return f"{module}.{qualname}"
+    return qualname
 
 
 def _log_dulwich_output(operation: str, errstream: BytesIO) -> None:
