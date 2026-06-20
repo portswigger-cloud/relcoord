@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from time import perf_counter
 from typing import Any, Protocol
 
@@ -30,7 +31,13 @@ logger = logging.getLogger(__name__)
 
 
 class ChangeProcessor(Protocol):
-    def process(self, repo: str, commit: str, image: str | None) -> object: ...
+    def process(
+        self,
+        repo: str,
+        commit: str,
+        image: str | None,
+        config_path: str = ...,
+    ) -> object: ...
 
 
 class RequestTokenValidator(Protocol):
@@ -56,7 +63,13 @@ class NoopChangeResult:
 
 
 class NoopChangeProcessor:
-    def process(self, repo: str, commit: str, image: str | None) -> object:
+    def process(
+        self,
+        repo: str,
+        commit: str,
+        image: str | None,
+        config_path: str = ".deploy",
+    ) -> object:
         logger.warning(
             "change processing disabled: no manifests_repository configured; "
             "skipping source checkout, manifest-builder invocation, manifests commit, "
@@ -162,6 +175,7 @@ def create_app(
             )
             repo = _normalize_change_repo(repo)
             commit = ensure_string(payload, "commit")
+            config_path = _change_config_path(payload)
             image = (
                 ensure_string(
                     payload,
@@ -197,7 +211,7 @@ def create_app(
                 manifest_image,
             )
             result = await asyncio.to_thread(
-                change_processor.process, repo, commit, manifest_image
+                change_processor.process, repo, commit, manifest_image, config_path
             )
             processed = _change_result_payload(result)
             logger.info(
@@ -406,6 +420,24 @@ def _normalize_change_repo(repo: str) -> str:
         error="unsupported_ssh_git_uri",
         message="ssh style git URIs are only supported for github.com repositories",
     )
+
+
+def _change_config_path(payload: dict[str, Any]) -> str:
+    if "config_path" not in payload:
+        return ".deploy"
+    value = ensure_string(
+        payload,
+        "config_path",
+        error="invalid_config_path",
+        message="config_path must be a non-empty string",
+    )
+    candidate = PurePosixPath(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValidationError(
+            error="invalid_config_path",
+            message="config_path must be a relative path within the repository",
+        )
+    return value
 
 
 def _change_result_payload(result: object) -> dict[str, Any]:

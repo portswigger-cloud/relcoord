@@ -280,7 +280,13 @@ def test_change_passes_image_reference_to_processor() -> None:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str, str | None]] = []
 
-        def process(self, repo: str, commit: str, image: str | None) -> object:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+        ) -> object:
             self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 1})()
 
@@ -344,7 +350,13 @@ def test_change_processes_deploy_config_when_processor_is_configured(
         def __init__(self) -> None:
             self.calls: list[tuple[str, str, str | None]] = []
 
-        def process(self, repo: str, commit: str, image: str | None) -> object:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+        ) -> object:
             self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 3})()
 
@@ -388,7 +400,13 @@ def test_change_processor_logs_from_worker_thread(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class Processor:
-        def process(self, repo: str, commit: str, image: str | None) -> object:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+        ) -> object:
             logging.getLogger("relcoord.change").info(
                 "processor logged for %s at %s with image %s", repo, commit, image
             )
@@ -423,7 +441,13 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str, str | None]] = []
 
-        def process(self, repo: str, commit: str, image: str | None) -> object:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+        ) -> object:
             self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 0})()
 
@@ -490,7 +514,13 @@ def test_change_reports_missing_deploy_config(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class Processor:
-        def process(self, repo: str, commit: str, image: str | None) -> object:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+        ) -> object:
             raise DeployConfigError("missing .deploy")
 
     client = TestClient(
@@ -525,7 +555,13 @@ def test_change_reports_credential_error_without_traceback(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class Processor:
-        def process(self, repo: str, commit: str, image: str | None) -> object:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+        ) -> object:
             raise CredentialError(
                 "failed to obtain git credentials while checking out source repo "
                 "https://github.com/acme/config.git: idcat returned HTTP 401"
@@ -562,6 +598,79 @@ def test_change_reports_credential_error_without_traceback(
     )
     # The expected condition must not be logged with a stack trace.
     assert "Traceback (most recent call last)" not in caplog.text
+
+
+def _config_path_recording_client() -> tuple[TestClient, list[str]]:
+    config_paths: list[str] = []
+
+    class Processor:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+        ) -> object:
+            config_paths.append(config_path)
+            return type("Result", (), {"generated_count": 0})()
+
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=Processor(),
+        )
+    )
+    return client, config_paths
+
+
+def test_change_defaults_config_path_to_deploy() -> None:
+    client, config_paths = _config_path_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/config", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 202
+    assert config_paths == [".deploy"]
+
+
+def test_change_passes_custom_config_path_to_processor() -> None:
+    client, config_paths = _config_path_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "acme/config",
+            "commit": "deadbeef",
+            "config_path": "deploy/system",
+        },
+    )
+
+    assert response.status_code == 202
+    assert config_paths == ["deploy/system"]
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    ["", "   ", "/etc/passwd", "../escape", "deploy/../../etc"],
+)
+def test_change_rejects_invalid_config_path(config_path: str) -> None:
+    client, config_paths = _config_path_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "acme/config",
+            "commit": "deadbeef",
+            "config_path": config_path,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_config_path"
+    assert config_paths == []
 
 
 def test_git_clone_endpoint_is_not_registered(client: TestClient) -> None:

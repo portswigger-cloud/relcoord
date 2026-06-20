@@ -83,7 +83,13 @@ class ChangeProcessor:
     detect_deployment: bool = False
     deployment_detector: DeploymentDetector | None = None
 
-    def process(self, repo: str, commit: str, image: str | None) -> ChangeResult:
+    def process(
+        self,
+        repo: str,
+        commit: str,
+        image: str | None,
+        config_path: str = ".deploy",
+    ) -> ChangeResult:
         workdir = Path(tempfile.mkdtemp(prefix="relcoord-change-"))
         try:
             source_checkout = workdir / "source"
@@ -103,10 +109,11 @@ class ChangeProcessor:
                 commit,
             )
             _checkout_commit(repo, commit, source_checkout, self.idcat)
-            deploy_config = source_checkout / ".deploy"
+            deploy_config = source_checkout / config_path
             if not deploy_config.is_dir():
                 raise DeployConfigError(
-                    f"commit {commit} in {repo} does not contain a top-level .deploy directory"
+                    f"commit {commit} in {repo} does not contain "
+                    f"a {config_path} directory"
                 )
             logger.info(
                 "change step 3/7: found deploy config at %s",
