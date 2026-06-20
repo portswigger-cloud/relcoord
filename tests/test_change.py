@@ -410,9 +410,54 @@ def test_change_processor_requires_top_level_deploy_directory(
     try:
         processor.process("https://github.com/acme/config.git", "deadbeef", None)
     except DeployConfigError as exc:
-        assert "does not contain a top-level .deploy directory" in str(exc)
+        assert "does not contain a .deploy directory" in str(exc)
     else:
         raise AssertionError("expected DeployConfigError")
+
+
+def test_change_processor_uses_custom_config_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deploy_configs: list[Path] = []
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / "deploy" / "system").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path,
+        manifests_checkout: Path,
+        **kwargs,
+    ) -> set[Path]:
+        deploy_configs.append(deploy_config)
+        return set()
+
+    def fake_head_commit(repo_path: Path) -> str:
+        return "feedface"
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        pass
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", fake_head_commit)
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
+
+    processor = ChangeProcessor("https://github.com/acme/manifests.git")
+    processor.process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        None,
+        config_path="deploy/system",
+    )
+
+    assert deploy_configs == [tmp_path / "source" / "deploy" / "system"]
 
 
 @pytest.mark.parametrize(
