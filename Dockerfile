@@ -1,3 +1,5 @@
+FROM cleanstart/helm:4.2.2 AS helm
+
 FROM astral/uv:trixie-slim AS builder
 
 WORKDIR /build
@@ -22,6 +24,7 @@ COPY --from=builder /python /python
 # ends up in a separate layer, only updating it when needed.
 COPY --from=builder /deps-venv /venv
 COPY --from=builder /venv /venv
+COPY --from=helm /usr/bin/helm /usr/local/bin/helm
 
 EXPOSE 8080
 USER nonroot
