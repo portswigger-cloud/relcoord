@@ -99,6 +99,7 @@ class ChangeProcessor:
         commit: str,
         image: str | None,
         config_path: str = ".deploy",
+        system: bool = False,
     ) -> ChangeResult:
         workdir = Path(tempfile.mkdtemp(prefix="relcoord-change-"))
         try:
@@ -119,20 +120,29 @@ class ChangeProcessor:
                 commit,
             )
             _checkout_commit(repo, commit, source_checkout, self.idcat)
-            deploy_config = source_checkout / config_path
-            if not deploy_config.is_dir():
-                raise DeployConfigError(
-                    f"commit {commit} in {repo} does not contain "
-                    f"a {config_path} directory"
-                )
+            if system:
+                # System mode: config lives at the repository root and
+                # manifest-builder runs as the 'system' owner (namespace=None),
+                # generating into every namespace not claimed by another owner
+                # as well as cluster-scoped directories.
+                deploy_config = source_checkout
+                namespace = None
+            else:
+                deploy_config = source_checkout / config_path
+                namespace = _namespace_from_repo(repo)
+                if not deploy_config.is_dir():
+                    raise DeployConfigError(
+                        f"commit {commit} in {repo} does not contain "
+                        f"a {config_path} directory"
+                    )
             logger.info(
-                "change step 3/7: found deploy config at %s",
+                "change step 3/7: found deploy config at %s (system mode: %s)",
                 deploy_config,
+                system,
             )
 
             repo_root = Path("/")
             create_commit = True
-            namespace = _namespace_from_repo(repo)
             output_results: list[OutputResult] = []
             total_generated = 0
 
@@ -433,7 +443,12 @@ def _clone_repository(
     except Exception as exc:
         _log_dulwich_output("clone", clone_output)
         raise GitTransportError(
-            _dulwich_error_message("clone", exc, clone_output)
+            _dulwich_error_message(
+                "clone",
+                {"remote": source, "target": str(target)},
+                exc,
+                clone_output,
+            )
         ) from exc
     else:
         _log_dulwich_output("clone", clone_output)
@@ -446,7 +461,13 @@ def _dulwich_checkout(target: Path, commit: str) -> None:
     try:
         porcelain.reset(target, "hard", commit)
     except Exception as exc:
-        raise ChangeProcessingError(f"dulwich checkout {commit} failed: {exc}") from exc
+        raise GitTransportError(
+            _dulwich_error_message(
+                "checkout",
+                {"target": str(target), "commit": commit},
+                exc,
+            )
+        ) from exc
 
 
 def _head_commit(repo_path: Path) -> str:
@@ -482,16 +503,29 @@ def _push_repository(
     except Exception as exc:
         _log_dulwich_output("push", push_output)
         raise GitTransportError(
-            _dulwich_error_message("push", exc, push_output)
+            _dulwich_error_message(
+                "push",
+                {"source": str(repo_path), "remote": remote},
+                exc,
+                push_output,
+            )
         ) from exc
     else:
         _log_dulwich_output("push", push_output)
 
 
-def _dulwich_error_message(operation: str, exc: Exception, errstream: BytesIO) -> str:
-    stderr = errstream.getvalue().decode(errors="replace").strip()
+def _dulwich_error_message(
+    action: str,
+    params: dict[str, str],
+    exc: Exception,
+    errstream: BytesIO | None = None,
+) -> str:
+    stderr = ""
+    if errstream is not None:
+        stderr = errstream.getvalue().decode(errors="replace").strip()
     detail = stderr or str(exc).strip() or _exception_label(exc)
-    return f"dulwich {operation} failed: {detail}"
+    described = ", ".join(f"{key}={value}" for key, value in params.items())
+    return f"dulwich {action} failed ({described}): {detail}"
 
 
 def _exception_label(exc: Exception) -> str:

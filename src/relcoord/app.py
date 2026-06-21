@@ -42,6 +42,7 @@ class ChangeProcessor(Protocol):
         commit: str,
         image: str | None,
         config_path: str = ...,
+        system: bool = ...,
     ) -> object: ...
 
 
@@ -74,6 +75,7 @@ class NoopChangeProcessor:
         commit: str,
         image: str | None,
         config_path: str = ".deploy",
+        system: bool = False,
     ) -> object:
         logger.warning(
             "change processing disabled: no manifests_repository configured; "
@@ -92,10 +94,10 @@ def create_app(
 ) -> Starlette:
     service = ImageVersionService(store=store)
 
-    def _require_auth(request: Request) -> Response | None:
+    def _require_auth(request: Request) -> tuple[Response | None, object | None]:
         try:
             header = request.headers.get("authorization")
-            token_validator.validate(header)
+            principal = token_validator.validate(header)
         except AuthError as exc:
             logger.warning(
                 "Unauthorized request %s %s: %s",
@@ -103,8 +105,11 @@ def create_app(
                 request.url.path,
                 exc,
             )
-            return _json_error(status_code=401, error="unauthorized", message=str(exc))
-        return None
+            return (
+                _json_error(status_code=401, error="unauthorized", message=str(exc)),
+                None,
+            )
+        return None, principal
 
     async def health(request: Request) -> Response:
         try:
@@ -128,7 +133,7 @@ def create_app(
         return JSONResponse({"status": "ok", "checks": {"database": "ok"}})
 
     async def register_image_version(request: Request) -> Response:
-        unauthorized = _require_auth(request)
+        unauthorized, _principal = _require_auth(request)
         if unauthorized is not None:
             return unauthorized
         try:
@@ -167,7 +172,7 @@ def create_app(
         )
 
     async def change(request: Request) -> Response:
-        unauthorized = _require_auth(request)
+        unauthorized, principal = _require_auth(request)
         if unauthorized is not None:
             return unauthorized
         try:
@@ -180,6 +185,23 @@ def create_app(
             )
             repo = _normalize_change_repo(repo)
             commit = ensure_string(payload, "commit")
+            system = _change_system_flag(payload)
+            if system and not _principal_allows_system(principal):
+                logger.warning(
+                    "Rejected system-mode change for repo %s: role not permitted",
+                    repo,
+                )
+                return _json_error(
+                    status_code=403,
+                    error="system_not_allowed",
+                    message="the authenticated role is not permitted to "
+                    "request system-mode changes",
+                )
+            if system and "config_path" in payload:
+                raise ValidationError(
+                    error="invalid_system_config_path",
+                    message="config_path cannot be combined with system mode",
+                )
             config_path = _change_config_path(payload)
             image = (
                 ensure_string(
@@ -196,6 +218,11 @@ def create_app(
                 raise ValidationError(
                     error="invalid_image_repo_tag_pairing",
                     message="image_repo and tag must be provided together",
+                )
+            if system and image is not None:
+                raise ValidationError(
+                    error="invalid_system_image",
+                    message="image_repo and tag cannot be combined with system mode",
                 )
 
             registered: dict[str, Any] | None = None
@@ -216,7 +243,12 @@ def create_app(
                 manifest_image,
             )
             result = await asyncio.to_thread(
-                change_processor.process, repo, commit, manifest_image, config_path
+                change_processor.process,
+                repo,
+                commit,
+                manifest_image,
+                config_path,
+                system,
             )
             processed = _change_result_payload(result)
             logger.info(
@@ -454,6 +486,26 @@ def _change_config_path(payload: dict[str, Any]) -> str:
         raise ValidationError(
             error="invalid_config_path",
             message="config_path must be a relative path within the repository",
+        )
+    return value
+
+
+def _principal_allows_system(principal: object) -> bool:
+    # A None principal means authentication is disabled (NoopTokenValidator), in
+    # which case there is no access control to enforce and system mode is allowed.
+    if principal is None:
+        return True
+    return bool(getattr(principal, "allow_system", False))
+
+
+def _change_system_flag(payload: dict[str, Any]) -> bool:
+    if "system" not in payload:
+        return False
+    value = payload["system"]
+    if not isinstance(value, bool):
+        raise ValidationError(
+            error="invalid_system",
+            message="system must be a boolean",
         )
     return value
 

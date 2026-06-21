@@ -6,7 +6,12 @@ from datetime import datetime
 import pytest
 from starlette.testclient import TestClient
 
-from relcoord.app import NoopChangeProcessor, NoopTokenValidator, create_app
+from relcoord.app import (
+    NoopChangeProcessor,
+    NoopTokenValidator,
+    RequestTokenValidator,
+    create_app,
+)
 from relcoord.change import CredentialError, DeployConfigError, GitTransportError
 from relcoord.errors import PersistenceUnavailableError
 from relcoord.in_memory_store import InMemoryImageInfoStore
@@ -286,6 +291,7 @@ def test_change_passes_image_reference_to_processor() -> None:
             commit: str,
             image: str | None,
             config_path: str = ".deploy",
+            system: bool = False,
         ) -> object:
             self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 1})()
@@ -356,6 +362,7 @@ def test_change_processes_deploy_config_when_processor_is_configured(
             commit: str,
             image: str | None,
             config_path: str = ".deploy",
+            system: bool = False,
         ) -> object:
             self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 3})()
@@ -406,6 +413,7 @@ def test_change_processor_logs_from_worker_thread(
             commit: str,
             image: str | None,
             config_path: str = ".deploy",
+            system: bool = False,
         ) -> object:
             logging.getLogger("relcoord.change").info(
                 "processor logged for %s at %s with image %s", repo, commit, image
@@ -447,6 +455,7 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
             commit: str,
             image: str | None,
             config_path: str = ".deploy",
+            system: bool = False,
         ) -> object:
             self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 0})()
@@ -520,6 +529,7 @@ def test_change_reports_missing_deploy_config(
             commit: str,
             image: str | None,
             config_path: str = ".deploy",
+            system: bool = False,
         ) -> object:
             raise DeployConfigError("missing .deploy")
 
@@ -561,6 +571,7 @@ def test_change_reports_credential_error_without_traceback(
             commit: str,
             image: str | None,
             config_path: str = ".deploy",
+            system: bool = False,
         ) -> object:
             raise CredentialError(
                 "failed to obtain git credentials while checking out source repo "
@@ -610,6 +621,7 @@ def test_change_reports_git_transport_error_without_traceback(
             commit: str,
             image: str | None,
             config_path: str = ".deploy",
+            system: bool = False,
         ) -> object:
             raise GitTransportError(
                 "dulwich clone failed: dulwich.errors.NotGitRepository"
@@ -655,6 +667,7 @@ def _config_path_recording_client() -> tuple[TestClient, list[str]]:
             commit: str,
             image: str | None,
             config_path: str = ".deploy",
+            system: bool = False,
         ) -> object:
             config_paths.append(config_path)
             return type("Result", (), {"generated_count": 0})()
@@ -716,6 +729,161 @@ def test_change_rejects_invalid_config_path(config_path: str) -> None:
     assert response.status_code == 400
     assert response.json()["error"] == "invalid_config_path"
     assert config_paths == []
+
+
+class _StubPrincipal:
+    def __init__(self, allow_system: bool) -> None:
+        self.allow_system = allow_system
+
+
+class _StubValidator:
+    def __init__(self, allow_system: bool) -> None:
+        self._allow_system = allow_system
+
+    def validate(self, authorization_header: str | None) -> object:
+        return _StubPrincipal(self._allow_system)
+
+
+def _system_recording_client(
+    token_validator: RequestTokenValidator | None = None,
+) -> tuple[TestClient, list[bool]]:
+    systems: list[bool] = []
+
+    class Processor:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+            system: bool = False,
+        ) -> object:
+            systems.append(system)
+            return type("Result", (), {"generated_count": 0})()
+
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=(
+                token_validator if token_validator is not None else NoopTokenValidator()
+            ),
+            change_processor=Processor(),
+        )
+    )
+    return client, systems
+
+
+def test_change_defaults_system_to_false() -> None:
+    client, systems = _system_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/config", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 202
+    assert systems == [False]
+
+
+def test_change_system_mode_passes_through_to_processor() -> None:
+    client, systems = _system_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/system", "commit": "deadbeef", "system": True},
+    )
+
+    assert response.status_code == 202
+    assert systems == [True]
+
+
+@pytest.mark.parametrize("value", ["true", 1, "yes", 0])
+def test_change_rejects_non_boolean_system(value: object) -> None:
+    client, systems = _system_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/config", "commit": "deadbeef", "system": value},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_system"
+    assert systems == []
+
+
+def test_change_rejects_system_with_config_path() -> None:
+    client, systems = _system_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "acme/system",
+            "commit": "deadbeef",
+            "system": True,
+            "config_path": "deploy",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_system_config_path"
+    assert systems == []
+
+
+def test_change_rejects_system_with_image() -> None:
+    client, systems = _system_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "acme/system",
+            "commit": "deadbeef",
+            "system": True,
+            "image_repo": "registry.example.com/team/api",
+            "tag": "1.2.3",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_system_image"
+    assert systems == []
+
+
+def test_change_system_mode_rejected_when_role_disallows() -> None:
+    client, systems = _system_recording_client(_StubValidator(allow_system=False))
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/system", "commit": "deadbeef", "system": True},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "system_not_allowed"
+    assert systems == []
+
+
+def test_change_system_mode_allowed_when_role_permits() -> None:
+    client, systems = _system_recording_client(_StubValidator(allow_system=True))
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/system", "commit": "deadbeef", "system": True},
+    )
+
+    assert response.status_code == 202
+    assert systems == [True]
+
+
+def test_change_non_system_allowed_when_role_disallows_system() -> None:
+    # A role without allow_system can still make ordinary (non-system) changes.
+    client, systems = _system_recording_client(_StubValidator(allow_system=False))
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/config", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 202
+    assert systems == [False]
 
 
 def test_git_clone_endpoint_is_not_registered(client: TestClient) -> None:

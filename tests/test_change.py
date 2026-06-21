@@ -16,6 +16,7 @@ from relcoord.change import (
     CredentialError,
     DeployConfigError,
     DeploymentDetectionError,
+    GitTransportError,
 )
 from relcoord.config import OutputSettings
 from relcoord.git import GitCredentialError
@@ -462,20 +463,146 @@ def test_change_processor_uses_custom_config_path(
     assert deploy_configs == [tmp_path / "source" / "deploy" / "system"]
 
 
-def test_dulwich_error_message_falls_back_to_exception_type_when_blank() -> None:
+def test_change_processor_system_mode_uses_root_and_no_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        # System config lives at the repository root; no .deploy directory.
+        target.mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path,
+        output_path: Path,
+        *,
+        repo_root: Path,
+        create_commit: bool,
+        image: str | None,
+        namespace: str | None,
+        vars: dict[str, object],
+    ) -> set[Path]:
+        captured["deploy_config"] = deploy_config
+        captured["namespace"] = namespace
+        captured["image"] = image
+        return set()
+
+    def fake_head_commit(repo_path: Path) -> str:
+        return "feedface"
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        pass
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", fake_head_commit)
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
+
+    ChangeProcessor("https://github.com/acme/manifests.git").process(
+        "https://github.com/acme/system.git",
+        "deadbeef",
+        None,
+        system=True,
+    )
+
+    assert captured["deploy_config"] == tmp_path / "source"
+    assert captured["namespace"] is None
+    assert captured["image"] is None
+
+
+def test_dulwich_error_message_includes_action_and_parameters() -> None:
     # NotGitRepository (raised for missing/private/inaccessible repos) has an
     # empty string representation, so the message must surface its type instead.
-    message = change._dulwich_error_message("clone", NotGitRepository(), BytesIO())
+    message = change._dulwich_error_message(
+        "clone",
+        {"remote": "https://github.com/acme/system", "target": "/tmp/source"},
+        NotGitRepository(),
+        BytesIO(),
+    )
 
-    assert message == "dulwich clone failed: dulwich.errors.NotGitRepository"
+    assert message == (
+        "dulwich clone failed "
+        "(remote=https://github.com/acme/system, target=/tmp/source): "
+        "dulwich.errors.NotGitRepository"
+    )
 
 
 def test_dulwich_error_message_prefers_stderr() -> None:
     errstream = BytesIO(b"fatal: repository not found\n")
 
-    message = change._dulwich_error_message("clone", NotGitRepository(), errstream)
+    message = change._dulwich_error_message(
+        "clone",
+        {"remote": "https://github.com/acme/system"},
+        NotGitRepository(),
+        errstream,
+    )
 
-    assert message == "dulwich clone failed: fatal: repository not found"
+    assert message == (
+        "dulwich clone failed (remote=https://github.com/acme/system): "
+        "fatal: repository not found"
+    )
+
+
+def test_dulwich_error_message_without_errstream_uses_exception() -> None:
+    message = change._dulwich_error_message(
+        "checkout",
+        {"target": "/tmp/source", "commit": "main"},
+        ValueError("ref main not found"),
+    )
+
+    assert message == (
+        "dulwich checkout failed (target=/tmp/source, commit=main): ref main not found"
+    )
+
+
+def test_clone_repository_failure_reports_remote_and_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_clone(*args: object, **kwargs: object) -> None:
+        raise NotGitRepository()
+
+    monkeypatch.setattr(change.porcelain, "clone", fake_clone)
+    target = tmp_path / "source"
+
+    with pytest.raises(GitTransportError) as excinfo:
+        change._clone_repository(
+            "https://github.com/acme/system",
+            target,
+            None,
+            purpose="checking out source repo",
+        )
+
+    message = str(excinfo.value)
+    assert message == (
+        "dulwich clone failed "
+        f"(remote=https://github.com/acme/system, target={target}): "
+        "dulwich.errors.NotGitRepository"
+    )
+
+
+def test_dulwich_checkout_failure_raises_git_transport_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_reset(*args: object, **kwargs: object) -> None:
+        raise ValueError("ref main not found")
+
+    monkeypatch.setattr(change.porcelain, "reset", fake_reset)
+    target = tmp_path / "source"
+
+    with pytest.raises(GitTransportError) as excinfo:
+        change._dulwich_checkout(target, "main")
+
+    message = str(excinfo.value)
+    assert message == (
+        f"dulwich checkout failed (target={target}, commit=main): ref main not found"
+    )
 
 
 @pytest.mark.parametrize(
