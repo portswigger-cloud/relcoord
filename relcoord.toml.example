@@ -59,5 +59,11 @@ audience = "relcoord"
 issuer = "https://kubernetes.default.svc"
 jwks-uri = "https://kubernetes.default.svc/openid/v1/jwks"
 
+# Set allow_system = true to permit this role to make system-mode change
+# requests (payloads with "system": true), which read config from the
+# repository root and generate manifests as the 'system' owner across all
+# namespaces and cluster-scoped directories. Defaults to false.
+allow_system = false
+
 [role.claims]
 sub = "system:serviceaccount:default:default"

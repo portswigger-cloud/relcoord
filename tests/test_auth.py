@@ -86,6 +86,7 @@ def _role(
     audience: str = "relcoord",
     issuer: str = "https://issuer.example.com",
     claims: dict[str, str] | None = None,
+    allow_system: bool = False,
 ) -> RoleConfig:
     return RoleConfig(
         name=name,
@@ -93,6 +94,7 @@ def _role(
         issuer=issuer,
         jwks_uri="https://issuer.example.com/.well-known/jwks.json",
         claims=claims or {"sub": "system:serviceaccount:default:default"},
+        allow_system=allow_system,
     )
 
 
@@ -134,6 +136,55 @@ def test_validator_accepts_token(private_pem: str, signing_key: PyJWK) -> None:
 
     assert claims.role == "default"
     assert claims.subject == "system:serviceaccount:default:default"
+    assert claims.allow_system is False
+
+
+def test_validator_exposes_allow_system_from_role(
+    private_pem: str, signing_key: PyJWK
+) -> None:
+    validator = _make_validator([_role(allow_system=True)], signing_key)
+    token = _make_token(private_pem)
+
+    claims = validator.validate(token)
+
+    assert claims.allow_system is True
+
+
+def test_role_config_from_mapping_parses_allow_system() -> None:
+    role = RoleConfig.from_mapping(
+        {
+            "name": "system",
+            "audience": "relcoord",
+            "issuer": "https://issuer.example.com",
+            "allow_system": True,
+        }
+    )
+
+    assert role.allow_system is True
+
+
+def test_role_config_from_mapping_defaults_allow_system_to_false() -> None:
+    role = RoleConfig.from_mapping(
+        {
+            "name": "default",
+            "audience": "relcoord",
+            "issuer": "https://issuer.example.com",
+        }
+    )
+
+    assert role.allow_system is False
+
+
+def test_role_config_from_mapping_rejects_non_boolean_allow_system() -> None:
+    with pytest.raises(ValueError, match="allow_system must be a boolean"):
+        RoleConfig.from_mapping(
+            {
+                "name": "default",
+                "audience": "relcoord",
+                "issuer": "https://issuer.example.com",
+                "allow_system": "true",
+            }
+        )
 
 
 def test_validator_ignores_configured_algorithms() -> None:

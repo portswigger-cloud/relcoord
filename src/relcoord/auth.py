@@ -54,6 +54,7 @@ class RoleConfig:
     issuer: str
     jwks_uri: str | None = None
     claims: dict[str, str] = field(default_factory=dict)
+    allow_system: bool = False
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "RoleConfig":
@@ -62,6 +63,9 @@ class RoleConfig:
         issuer = _required_string(data, "issuer", context=f"role '{name}'")
         jwks_uri = _optional_string(
             data, "jwks-uri", context=f"role '{name}'", alias="jwks_uri"
+        )
+        allow_system = _optional_bool(
+            data, "allow_system", context=f"role '{name}'", alias="allow-system"
         )
 
         raw_claims = data.get("claims", {})
@@ -82,6 +86,7 @@ class RoleConfig:
             issuer=issuer,
             jwks_uri=jwks_uri,
             claims=claims,
+            allow_system=allow_system,
         )
 
 
@@ -89,6 +94,7 @@ class RoleConfig:
 class ValidatedClaims:
     role: str
     claims: dict[str, Any]
+    allow_system: bool = False
 
     @property
     def subject(self) -> str:
@@ -220,7 +226,9 @@ class TokenValidator:
             logger.info(
                 "Bearer token accepted for role '%s' (%s)", role.name, token_summary
             )
-            return ValidatedClaims(role=role.name, claims=claims)
+            return ValidatedClaims(
+                role=role.name, claims=claims, allow_system=role.allow_system
+            )
         raise AuthError(
             f"token did not validate against any configured role: {last_error}"
         )
@@ -434,4 +442,17 @@ def _optional_string(
         return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{context} {key} must be a non-empty string")
+    return value
+
+
+def _optional_bool(
+    data: dict[str, Any], key: str, *, context: str, alias: str | None = None
+) -> bool:
+    value = data.get(key)
+    if value is None and alias is not None:
+        value = data.get(alias)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"{context} {key} must be a boolean")
     return value
