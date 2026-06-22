@@ -59,7 +59,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         image: str | None,
         namespace: str,
         vars: dict[str, object],
-    ) -> set[Path]:
+    ) -> GenerationResult:
         calls.append(
             (
                 "generate",
@@ -72,7 +72,17 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
                 vars,
             )
         )
-        return {manifests_checkout / "api.yaml", manifests_checkout / "worker.yaml"}
+        return GenerationResult(
+            written_paths={
+                manifests_checkout / "api.yaml",
+                manifests_checkout / "worker.yaml",
+            },
+            created_or_modified={
+                Ref(kind="Deployment", namespace="config", name="api")
+            },
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
 
     def fake_head_commit(repo_path: Path) -> str:
         calls.append(("head", repo_path.name))
@@ -207,7 +217,9 @@ def test_change_processor_generates_configured_outputs_with_vars(
         )
         return GenerationResult(
             written_paths={output_path / "api.yaml"},
-            created_or_modified=set(),
+            created_or_modified={
+                Ref(kind="Deployment", namespace="config", name="api")
+            },
             removed=set(),
             deploy_id="0123456789abcdef",
         )
@@ -282,6 +294,100 @@ def test_change_processor_generates_configured_outputs_with_vars(
         ("head", "manifests"),
         ("push", "manifests", "https://github.com/acme/manifests.git", None),
     ]
+
+
+def test_change_processor_skips_commit_and_push_when_no_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    calls: list[str] = []
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(*args, **kwargs) -> GenerationResult:
+        manifests_checkout = args[1]
+        # manifest-builder regenerated identical output: files are written but
+        # there is nothing to commit, so the change sets are empty.
+        return GenerationResult(
+            written_paths={manifests_checkout / "api.yaml"},
+            created_or_modified=set(),
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    def fake_head_commit(repo_path: Path) -> str:
+        calls.append("head")
+        return "feedface"
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        calls.append("push")
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", fake_head_commit)
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
+
+    with caplog.at_level(logging.INFO, logger="relcoord.change"):
+        result = ChangeProcessor("https://github.com/acme/manifests.git").process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            None,
+        )
+
+    assert calls == []
+    assert result.generated_count == 1
+    assert "nothing to commit or push" in caplog.text
+
+
+def test_change_processor_skips_detection_when_no_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Detector:
+        def __init__(self) -> None:
+            self.called = threading.Event()
+
+        def wait_for_success(self, **kwargs) -> None:
+            self.called.set()
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(*args, **kwargs) -> GenerationResult:
+        manifests_checkout = args[1]
+        return GenerationResult(
+            written_paths={manifests_checkout / "api.yaml"},
+            created_or_modified=set(),
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *a, **k: None)
+
+    detector = Detector()
+    ChangeProcessor(
+        "https://github.com/acme/manifests.git",
+        detect_deployment=True,
+        deployment_detector=detector,
+    ).process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert not detector.called.wait(timeout=0.2)
 
 
 def test_change_processor_detects_deployment_when_enabled(
@@ -433,9 +539,16 @@ def test_change_processor_uses_custom_config_path(
         deploy_config: Path,
         manifests_checkout: Path,
         **kwargs,
-    ) -> set[Path]:
+    ) -> GenerationResult:
         deploy_configs.append(deploy_config)
-        return set()
+        return GenerationResult(
+            written_paths={manifests_checkout / "api.yaml"},
+            created_or_modified={
+                Ref(kind="Deployment", namespace="system", name="api")
+            },
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
 
     def fake_head_commit(repo_path: Path) -> str:
         return "feedface"
@@ -484,11 +597,16 @@ def test_change_processor_system_mode_uses_root_and_no_namespace(
         image: str | None,
         namespace: str | None,
         vars: dict[str, object],
-    ) -> set[Path]:
+    ) -> GenerationResult:
         captured["deploy_config"] = deploy_config
         captured["namespace"] = namespace
         captured["image"] = image
-        return set()
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified={Ref(kind="Namespace", namespace=None, name="argo")},
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
 
     def fake_head_commit(repo_path: Path) -> str:
         return "feedface"
