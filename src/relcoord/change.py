@@ -14,7 +14,7 @@ from typing import Any, Protocol, cast
 
 from dulwich import porcelain
 from dulwich.repo import Repo
-from manifest_builder import generate
+from manifest_builder import GenerationResult, generate
 
 from relcoord.config import IdcatSettings, OutputSettings, TemplateValue
 from relcoord.git import GitCredentialError, GitCredentials, github_https_credentials
@@ -147,7 +147,7 @@ class ChangeProcessor:
             total_generated = 0
 
             for repository, manifests_checkout in checkout_by_repository.items():
-                detection_results: list[tuple[object, str | None]] = []
+                detection_results: list[tuple[GenerationResult, str | None]] = []
                 logger.info(
                     "change step 4/7: checking out manifests repo %s into %s",
                     repository,
@@ -216,6 +216,17 @@ class ChangeProcessor:
                     )
                     detection_results.append((generation_result, deploy_id))
                     total_generated += len(generated)
+
+                if not any(
+                    result.created_or_modified or result.removed
+                    for result, _ in detection_results
+                ):
+                    logger.info(
+                        "change step 6/7: manifest-builder produced no changes for "
+                        "repo %s; nothing to commit or push",
+                        repository,
+                    )
+                    continue
 
                 manifest_commit = _head_commit(manifests_checkout)
                 logger.info(
