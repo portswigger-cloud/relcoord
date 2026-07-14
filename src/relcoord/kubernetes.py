@@ -18,9 +18,12 @@ DEPLOY_ID_ANNOTATION = "noa.re/deploy-id"
 
 
 class KubernetesObjectRef(Protocol):
-    kind: str
-    namespace: str | None
-    name: str
+    @property
+    def kind(self) -> str: ...
+    @property
+    def namespace(self) -> str | None: ...
+    @property
+    def name(self) -> str: ...
 
 
 class DeploymentDetectionError(Exception):

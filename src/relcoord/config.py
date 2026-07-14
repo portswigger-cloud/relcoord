@@ -6,7 +6,7 @@ import logging
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from relcoord.auth import RoleConfig
 
@@ -58,7 +58,7 @@ class PersistenceSettings:
                 "persistence.backend must be one of "
                 "'in-memory', 'surrealdb', or 'dynamodb'"
             )
-        backend = cast(Literal["in-memory", "surrealdb", "dynamodb"], backend_value)
+        backend = backend_value
 
         if backend == "in-memory":
             return cls(
