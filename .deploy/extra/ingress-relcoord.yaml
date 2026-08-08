@@ -1,0 +1,18 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: idcat
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: relcoord.{{cluster_name}}.portswigger.io
+    http:
+      paths:
+      - backend:
+          service:
+            name: relcoord
+            port:
+              name: http
+        path: /
+        pathType: Prefix
+

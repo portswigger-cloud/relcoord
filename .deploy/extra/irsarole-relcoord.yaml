@@ -1,0 +1,6 @@
+apiVersion: platform.portswigger.io/v1alpha1
+kind: IrsaRole
+metadata:
+  name: relcoord
+spec:
+  serviceAccountName: relcoord

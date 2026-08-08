@@ -1,0 +1,57 @@
+listen = "0.0.0.0"
+port = 8080
+diff-output = "platform-dev"
+detect-deployment = true
+
+# The simple config block that .deploy/manifest-builder.toml uses lives in the
+# system repository, not here, so relcoord loads it from there when it processes
+# a change for a repository that carries its own .deploy directory.
+plugins-repository = "https://github.com/portswigger-cloud/system"
+
+[[output]]
+name = "platform-dev"
+repository = "https://github.com/portswigger-cloud/manifests"
+directory = "platform-dev"
+connection-type = "eks"
+# These things are needed to connect to the EKS cluster
+api-endpoint = "https://B88E7287E54DB073AC9CDC2FD1BE0969.gr7.eu-west-1.eks.amazonaws.com"
+ca-path = "/config/platform-dev-ca.pem"
+region = "eu-west-1"
+[output.vars]
+cluster_name = "platform-dev"
+vanity_domain = "portswigger.com"
+account_id = 431638009895
+issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/B88E7287E54DB073AC9CDC2FD1BE0969"
+
+[persistence]
+backend = "dynamodb"
+table-name = "platform-relcoord"
+
+[idcat]
+endpoint = "https://idcat.platform-prod.portswigger.io"
+github-app = "SwigApp"
+token-path = "/var/run/secrets/tokens/idcat.platform-prod.portswigger.io"
+
+[[role]]
+name = "system-main"
+audience = "relcoord.{{cluster_name}}.portswigger.io"
+issuer = "https://token.actions.githubusercontent.com"
+claims = { repository = "portswigger-cloud/system", ref = "refs/heads/main" }
+allow-system = true
+
+# This only works because system was created before the sub format switch over, for new
+# repositories, the sub format also contains some numeric ids
+[[role]]
+name = "system-pr"
+audience = "relcoord.{{cluster_name}}.portswigger.io"
+issuer = "https://token.actions.githubusercontent.com"
+claims = { repository = "portswigger-cloud/system", sub = "repo:portswigger-cloud/system:pull_request" }
+allow-system = true
+
+# relcoord deploying itself from its own .deploy directory. No allow-system:
+# this config is namespace-owned, so it may only write the relcoord namespace.
+[[role]]
+name = "relcoord-main"
+audience = "relcoord.{{cluster_name}}.portswigger.io"
+issuer = "https://token.actions.githubusercontent.com"
+claims = { repository = "portswigger-cloud/relcoord", ref = "refs/heads/main" }

@@ -1,0 +1,9 @@
+apiVersion: ecrpublic.aws.m.upbound.io/v1beta1
+kind: Repository
+metadata:
+  name: relcoord
+  annotations:
+    crossplane.io/external-name: relcoord
+spec:
+  forProvider:
+    region: us-east-1

@@ -1,0 +1,30 @@
+apiVersion: iam.aws.m.upbound.io/v1beta1
+kind: RolePolicy
+metadata:
+  name: relcoord-dynamodb
+  annotations:
+    crossplane.io/external-name: platform-relcoord-dynamodb
+spec:
+  forProvider:
+    role: relcoord-irsarole
+    policy: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:DeleteItem",
+              "dynamodb:UpdateItem",
+              "dynamodb:PutItem",
+              "dynamodb:Batch*",
+              "dynamodb:DescribeTable",
+              "dynamodb:PartiQL*",
+              "dynamodb:Query",
+              "dynamodb:Scan"
+            ],
+            "Resource": "arn:aws:dynamodb:eu-west-1:{{account_id}}:table/platform-relcoord"
+          }
+        ]
+      }
