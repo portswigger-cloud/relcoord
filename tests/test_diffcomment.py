@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 from dulwich import porcelain
+from manifest_builder import ExternalPlugins
 
 from relcoord import change
 from relcoord.change import (
-    ChangeProcessingError,
     ChangeProgress,
     CommentPostError,
     CredentialError,
@@ -24,6 +24,7 @@ from relcoord.manifest_diff import ManifestDiff
 
 CONFIG_REPO = "https://github.com/acme/config.git"
 MANIFESTS_REPO = "https://github.com/acme/manifests.git"
+PLUGINS_REPO = "https://github.com/acme/plugins.git"
 
 
 @dataclass(frozen=True)
@@ -70,19 +71,36 @@ def _fake_git(
     tmp_path: Path,
     *,
     calls: list[tuple[object, ...]] | None = None,
+    captured: dict[str, object] | None = None,
     diff: ManifestDiff | None = None,
+    diffs: dict[str, ManifestDiff] | None = None,
     written: int = 1,
+    targets: bool = False,
 ) -> None:
-    """Replace the git and manifest-builder work with recorded fakes."""
+    """Replace the git and manifest-builder work with recorded fakes.
+
+    ``targets`` writes a ``version = 2`` top-level config into the checked out
+    config directory, for which manifest-builder takes a target rather than
+    template variables. ``diff`` is what every manifests checkout diffs to, and
+    ``diffs`` says it per checkout directory name, for a change that reaches
+    some of the configured repositories and not others.
+    """
     recorded = calls if calls is not None else []
 
     def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
         recorded.append(("checkout", repo, commit, target.name, idcat))
-        (target / ".deploy").mkdir(parents=True)
+        deploy_config = target / ".deploy"
+        deploy_config.mkdir(parents=True)
+        if targets:
+            (deploy_config / "config.toml").write_text(
+                'version = 2\n\n[[target]]\nname = "dev"\n'
+            )
 
     def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
         recorded.append(("clone", repo, target.name, kwargs))
         target.mkdir(parents=True)
+        if repo == PLUGINS_REPO:
+            (target / "plugins").mkdir()
 
     def fake_generate(
         deploy_config: Path,
@@ -92,8 +110,12 @@ def _fake_git(
         create_commit: bool,
         image: str | None,
         namespace: str | None,
-        vars: dict[str, object],
+        vars: dict[str, object] | None = None,
+        target: str | None = None,
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
+        if captured is not None:
+            captured["plugins"] = plugins
         recorded.append(
             (
                 "generate",
@@ -102,7 +124,7 @@ def _fake_git(
                 create_commit,
                 image,
                 namespace,
-                vars,
+                vars if target is None else target,
             )
         )
         return GenerationResult(
@@ -115,6 +137,8 @@ def _fake_git(
 
     def fake_manifests_diff(manifests_checkout: Path, base_commit: str) -> ManifestDiff:
         recorded.append(("diff", manifests_checkout.name, base_commit))
+        if diffs is not None:
+            return diffs.get(manifests_checkout.name, ManifestDiff(stat="", diff=""))
         return diff if diff is not None else ManifestDiff(stat="", diff="")
 
     monkeypatch.setattr(
@@ -185,7 +209,6 @@ def test_diff_reports_progress_for_each_step(
     ).diff(CONFIG_REPO, "deadbeef", pull_request=7, progress=events.append)
 
     assert [event.phase for event in events] == [
-        "workspace",
         "source-checkout",
         "deploy-config",
         "manifests-checkout",
@@ -200,7 +223,10 @@ def test_diff_reports_progress_for_each_step(
         "repo": CONFIG_REPO,
         "commit": "deadbeef",
     }
+    assert by_phase["source-checkout"].message == "checking out acme/config at deadbee"
     assert by_phase["diff"].detail == {"repository": MANIFESTS_REPO, "changed": 1}
+    assert by_phase["diff"].message == "acme/manifests: 1 file changed"
+    assert by_phase["commented"].message == "commented on acme/config pull request #7"
     assert by_phase["commented"].detail["pull_request"] == 7
     assert by_phase["commented"].detail["url"] == (
         "https://github.com/acme/config/pull/7#c1"
@@ -305,29 +331,25 @@ def test_diff_generates_every_configured_output_before_diffing(
     ]
 
 
-def test_diff_reports_only_the_configured_output(
+def test_diff_generates_a_target_for_a_version_2_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[tuple[object, ...]] = []
-    _fake_git(monkeypatch, tmp_path, calls=calls)
+    _fake_git(monkeypatch, tmp_path, calls=calls, targets=True)
     outputs = [
         OutputSettings(
             name="example-dev",
             repository=MANIFESTS_REPO,
             directory=Path("example-dev"),
-        ),
-        OutputSettings(
-            name="example-prod",
-            repository=MANIFESTS_REPO,
-            directory=Path("example-prod"),
-        ),
+            vars={"cluster_name": "example-dev"},
+            target="dev",
+        )
     ]
 
-    result = DiffCommentProcessor(
-        outputs=outputs, diff_output="example-dev", commenter=Commenter()
-    ).diff(CONFIG_REPO, "deadbeef")
+    DiffCommentProcessor(outputs=outputs, commenter=Commenter()).diff(
+        CONFIG_REPO, "deadbeef"
+    )
 
-    assert [output.name for output in result.outputs] == ["example-dev"]
     assert [call for call in calls if call[0] == "generate"] == [
         (
             "generate",
@@ -336,16 +358,49 @@ def test_diff_reports_only_the_configured_output(
             True,
             None,
             "config",
-            {},
+            "dev",
         )
     ]
 
 
-def test_diff_only_clones_the_repository_of_the_configured_output(
+def test_diff_comments_only_on_the_repositories_the_change_affects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[object, ...]] = []
-    _fake_git(monkeypatch, tmp_path, calls=calls)
+    other_repo = "https://github.com/acme/other-manifests.git"
+    _fake_git(
+        monkeypatch,
+        tmp_path,
+        diffs={
+            "manifests-2": ManifestDiff(
+                stat="prod/api.yaml | 1 +\n",
+                diff="diff --git a/prod/api.yaml b/prod/api.yaml\n+api\n",
+            )
+        },
+    )
+    commenter = Commenter()
+    outputs = [
+        OutputSettings(name="dev", repository=MANIFESTS_REPO, directory=Path("dev")),
+        OutputSettings(name="prod", repository=other_repo, directory=Path("prod")),
+    ]
+
+    result = DiffCommentProcessor(outputs=outputs, commenter=commenter).diff(
+        CONFIG_REPO, "deadbeef", pull_request=7
+    )
+
+    # Both repositories were generated into and diffed; only the one the change
+    # reached is worth a comment, and a single section renders without a heading.
+    assert [entry.repository for entry in result.diffs] == [MANIFESTS_REPO, other_repo]
+    body = commenter.calls[0][2]
+    assert "prod/api.yaml | 1 +" in body
+    assert MANIFESTS_REPO not in body
+    assert other_repo not in body
+
+
+def test_diff_reports_no_changes_when_no_output_is_affected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(monkeypatch, tmp_path)
+    commenter = Commenter()
     outputs = [
         OutputSettings(name="dev", repository=MANIFESTS_REPO, directory=Path("dev")),
         OutputSettings(
@@ -355,32 +410,13 @@ def test_diff_only_clones_the_repository_of_the_configured_output(
         ),
     ]
 
-    result = DiffCommentProcessor(
-        outputs=outputs, diff_output="prod", commenter=Commenter()
-    ).diff(CONFIG_REPO, "deadbeef")
+    result = DiffCommentProcessor(outputs=outputs, commenter=commenter).diff(
+        CONFIG_REPO, "deadbeef", pull_request=7
+    )
 
-    assert [call[1] for call in calls if call[0] == "clone"] == [
-        "https://github.com/acme/other-manifests.git"
-    ]
-    assert [entry.repository for entry in result.diffs] == [
-        "https://github.com/acme/other-manifests.git"
-    ]
-
-
-def test_diff_rejects_a_configured_output_that_does_not_exist(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _fake_git(monkeypatch, tmp_path)
-
-    with pytest.raises(ChangeProcessingError) as excinfo:
-        DiffCommentProcessor(
-            manifests_repository=MANIFESTS_REPO,
-            diff_output="example-dev",
-            commenter=Commenter(),
-        ).diff(CONFIG_REPO, "deadbeef")
-
-    assert "diff-output 'example-dev' does not name a configured output" in str(
-        excinfo.value
+    assert result.comment.body.startswith(
+        "<!-- relcoord:manifest-diff -->\n\n"
+        "The generated output is the same before and after this change"
     )
 
 
@@ -427,6 +463,43 @@ def test_diff_system_mode_uses_the_repository_root(
     generate_call = next(call for call in calls if call[0] == "generate")
     assert generate_call[1] == "source"
     assert generate_call[5] is None
+
+
+def test_diff_checks_out_the_plugins_repository_and_passes_it_to_generate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    _fake_git(monkeypatch, tmp_path, captured=captured)
+
+    DiffCommentProcessor(
+        manifests_repository=MANIFESTS_REPO,
+        plugins_repository=PLUGINS_REPO,
+        commenter=Commenter(),
+    ).diff(CONFIG_REPO, "deadbeef")
+
+    assert captured["plugins"] == ExternalPlugins(
+        path=tmp_path / "plugins" / "plugins",
+        source=f"{PLUGINS_REPO}@feedface",
+    )
+
+
+def test_diff_leaves_the_plugins_repository_out_of_system_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    calls: list[tuple[object, ...]] = []
+    _fake_git(monkeypatch, tmp_path, calls=calls, captured=captured)
+
+    DiffCommentProcessor(
+        manifests_repository=MANIFESTS_REPO,
+        plugins_repository=PLUGINS_REPO,
+        commenter=Commenter(),
+    ).diff(CONFIG_REPO, "deadbeef", system=True)
+
+    assert captured["plugins"] is None
+    assert [
+        call for call in calls if call[0] == "clone" and call[1] == PLUGINS_REPO
+    ] == []
 
 
 def test_diff_requires_the_deploy_directory(
@@ -552,11 +625,11 @@ def test_diff_marks_its_comment_so_a_later_diff_can_update_it(
         OutputSettings(name="dev", repository=MANIFESTS_REPO, directory=Path("dev"))
     ]
 
-    result = DiffCommentProcessor(
-        outputs=outputs, diff_output="dev", commenter=commenter
-    ).diff(CONFIG_REPO, "deadbeef", pull_request=7)
+    result = DiffCommentProcessor(outputs=outputs, commenter=commenter).diff(
+        CONFIG_REPO, "deadbeef", pull_request=7
+    )
 
-    marker = "<!-- relcoord:manifest-diff dev -->"
+    marker = "<!-- relcoord:manifest-diff -->"
     assert commenter.markers == [marker]
     assert marker in commenter.calls[0][2]
     assert result.comment.updated

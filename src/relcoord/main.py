@@ -25,9 +25,12 @@ from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.retrying_store import RetryingImageInfoStore
 from relcoord.store import ImageInfoStore
 from relcoord.surreal_store import SurrealImageInfoStore
+from relcoord.version import version_summary
 
 DEFAULT_CONFIG_PATH = "/config/relcoord.toml"
 LOG_FORMAT = "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s: %(message)s"
+# The HTTP client libraries, which log a line for every request relcoord makes.
+HTTP_CLIENT_LOGGERS = ("httpx", "httpcore")
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +92,9 @@ def make_change_processor(
         )
     return ManifestChangeProcessor(
         manifests_repository=settings.manifests_repository,
+        plugins_repository=settings.plugins_repository,
         outputs=settings.outputs,
+        rollouts=settings.rollouts,
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
     )
@@ -98,11 +103,24 @@ def make_change_processor(
 def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
     return DiffCommentProcessor(
         manifests_repository=settings.manifests_repository,
+        plugins_repository=settings.plugins_repository,
         outputs=settings.outputs,
-        diff_output=settings.diff_output,
         idcat=settings.idcat,
         commenter=GithubIssueCommenter(idcat=settings.idcat),
     )
+
+
+def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
+    """Report both versions and exit, before --config is looked for.
+
+    The option is eager so that ``--version`` answers wherever it is run: the
+    default config path only exists in the container, and click would otherwise
+    reject the invocation for the missing file before printing anything.
+    """
+    if not value or ctx.resilient_parsing:
+        return
+    click.echo(version_summary())
+    ctx.exit()
 
 
 @click.command()
@@ -121,9 +139,18 @@ def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
     default=False,
     help="Disable bearer-token authentication on write endpoints.",
 )
+@click.option(
+    "--version",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=_print_version,
+    help="Print the running release and the manifest-builder it uses, and exit.",
+)
 def main(config_path: str, disable_auth: bool) -> None:
     settings = Settings.from_toml(config_path)
     configure_logging(settings.log_level)
+    logger.info("Starting %s", version_summary())
     asyncio.run(run(settings, disable_auth))
 
 
@@ -137,6 +164,24 @@ def configure_logging(log_level: str) -> None:
             format=LOG_FORMAT,
             datefmt="%Y-%m-%d %H:%M:%S %z",
         )
+    _quieten_http_client_logging(level)
+
+
+def _quieten_http_client_logging(level: int) -> None:
+    """Keep the HTTP clients from logging a line per request.
+
+    relcoord talks to several APIs to serve one change, and httpx logs every
+    request it makes at INFO, which buries the lines about the change itself.
+    Asking for DEBUG is asking to see the traffic, so leave them alone then.
+    """
+    if level <= logging.DEBUG:
+        return
+    # Never below the configured level: a logger with a level of its own is
+    # judged by that level rather than the root's, so pinning these to WARNING
+    # under a quieter root would make them the loudest thing in the log.
+    quiet_level = max(level, logging.WARNING)
+    for name in HTTP_CLIENT_LOGGERS:
+        logging.getLogger(name).setLevel(quiet_level)
 
 
 if __name__ == "__main__":
