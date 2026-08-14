@@ -25,6 +25,7 @@ from relcoord.manifest_diff import (
     DiffSection,
     ManifestDiff,
     build_comment_body,
+    comment_marker,
     manifest_diff,
 )
 
@@ -367,6 +368,7 @@ class DiffComment:
     body: str
     posted: bool
     url: str | None = None
+    updated: bool = False
 
 
 @dataclass(frozen=True)
@@ -539,11 +541,15 @@ class DiffCommentProcessor:
                     logger.info("diff step 6/6: %s", message)
                     report("no-changes", message, repository=repository)
 
+            marker = comment_marker(self.diff_output)
             comment_body = build_comment_body(
                 _diff_sections(repository_diffs),
                 full_diff_reference=FULL_DIFF_REFERENCE,
+                marker=marker,
             )
-            comment = self._comment(repo, pull_request, comment_body.body, report)
+            comment = self._comment(
+                repo, pull_request, comment_body.body, marker, report
+            )
             return DiffResult(
                 repo=repo,
                 commit=commit,
@@ -565,6 +571,7 @@ class DiffCommentProcessor:
         repo: str,
         pull_request: int | None,
         body: str,
+        marker: str,
         report: Callable[..., None],
     ) -> DiffComment:
         if pull_request is None:
@@ -587,7 +594,7 @@ class DiffCommentProcessor:
         logger.info("diff step 6/6: %s", message)
         report("comment", message, repo=repo, pull_request=pull_request)
         try:
-            url = commenter.post_comment(repo, pull_request, body)
+            posted = commenter.post_comment(repo, pull_request, body, marker=marker)
         except GitCredentialError as exc:
             raise CredentialError(
                 "failed to obtain git credentials while posting a manifest diff "
@@ -596,16 +603,20 @@ class DiffCommentProcessor:
         except GithubCommentError as exc:
             raise CommentPostError(str(exc)) from exc
 
-        message = f"posted manifest diff comment to {repo} pull request #{pull_request}"
+        verb = "updated" if posted.updated else "posted"
+        message = f"{verb} manifest diff comment on {repo} pull request #{pull_request}"
         logger.info("diff complete: %s", message)
         report(
             "commented",
             message,
             repo=repo,
             pull_request=pull_request,
-            url=url,
+            url=posted.url,
+            updated=posted.updated,
         )
-        return DiffComment(body=body, posted=True, url=url)
+        return DiffComment(
+            body=body, posted=True, url=posted.url, updated=posted.updated
+        )
 
 
 def _resolve_output_settings(
