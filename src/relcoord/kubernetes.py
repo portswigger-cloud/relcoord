@@ -433,8 +433,7 @@ class KubernetesDeploymentDetector:
                             )
                         )
                         logger.warning(
-                            "watch of %s was throttled (429); listing again "
-                            "after %gs",
+                            "watch of %s was throttled (429); listing again after %gs",
                             _format_ref(ref),
                             wait,
                         )
