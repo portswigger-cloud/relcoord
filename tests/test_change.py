@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from dulwich import porcelain
 from dulwich.errors import NotGitRepository
+from dulwich.repo import Repo
 from manifest_builder import ExternalPlugins
 
 from relcoord import change
@@ -1169,6 +1170,96 @@ def test_checkout_commit_materializes_requested_commit(tmp_path: Path) -> None:
 
     assert (checkout / "README.md").read_text() == "first\n"
     assert not (checkout / ".deploy").exists()
+
+
+def _commit(repo: Repo, message: bytes) -> bytes:
+    author = b"Test <test@example.com>"
+    return porcelain.commit(repo, message=message, author=author, committer=author)
+
+
+def _source_with_stale_branch(source: Path, *, conflict: bool) -> str:
+    """Build a repo whose default branch advanced past a feature branch.
+
+    The feature branch is cut, then the default branch changes ``shared.txt``.
+    When ``conflict`` the feature branch changes the same file (an unrebasable
+    branch); otherwise it only adds ``feature-only.txt`` (a clean rebase).
+    Returns the feature branch's commit.
+    """
+    repo = porcelain.init(source)
+    try:
+        (source / "shared.txt").write_text("base\n")
+        porcelain.add(repo, [b"shared.txt"])
+        base = _commit(repo, b"base")
+        default_ref = next(
+            ref for ref in repo.get_refs() if ref.startswith(b"refs/heads/")
+        )
+        porcelain.branch_create(repo, b"feature")
+
+        (source / "shared.txt").write_text("default change\n")
+        porcelain.add(repo, [b"shared.txt"])
+        default_tip = _commit(repo, b"default change")
+
+        porcelain.update_head(repo, b"refs/heads/feature")
+        porcelain.reset(repo, "hard", base)
+        if conflict:
+            (source / "shared.txt").write_text("feature change\n")
+            porcelain.add(repo, [b"shared.txt"])
+        else:
+            (source / "feature-only.txt").write_text("feature\n")
+            porcelain.add(repo, [b"feature-only.txt"])
+        feature = _commit(repo, b"feature change")
+
+        porcelain.update_head(repo, default_ref)
+        porcelain.reset(repo, "hard", default_tip)
+    finally:
+        repo.close()
+    return feature.decode("ascii")
+
+
+def test_checkout_rebased_commit_brings_in_default_branch_changes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-repo"
+    feature = _source_with_stale_branch(source, conflict=False)
+
+    checkout = tmp_path / "checkout"
+    change._checkout_rebased_commit(str(source), feature, checkout, None)
+
+    assert (checkout / "feature-only.txt").read_text() == "feature\n"
+    assert (checkout / "shared.txt").read_text() == "default change\n"
+
+
+def test_checkout_rebased_commit_leaves_an_up_to_date_branch_intact(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-repo"
+    repo = porcelain.init(source)
+    try:
+        (source / "a.txt").write_text("a\n")
+        porcelain.add(repo, [b"a.txt"])
+        _commit(repo, b"a")
+        (source / "b.txt").write_text("b\n")
+        porcelain.add(repo, [b"b.txt"])
+        tip = _commit(repo, b"b")
+    finally:
+        repo.close()
+
+    checkout = tmp_path / "checkout"
+    change._checkout_rebased_commit(str(source), tip.decode("ascii"), checkout, None)
+
+    assert (checkout / "a.txt").read_text() == "a\n"
+    assert (checkout / "b.txt").read_text() == "b\n"
+
+
+def test_checkout_rebased_commit_raises_when_the_branch_conflicts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-repo"
+    feature = _source_with_stale_branch(source, conflict=True)
+
+    checkout = tmp_path / "checkout"
+    with pytest.raises(change.RebaseConflictError):
+        change._checkout_rebased_commit(str(source), feature, checkout, None)
 
 
 def test_credentials_for_wraps_git_credential_error_with_operation_context(

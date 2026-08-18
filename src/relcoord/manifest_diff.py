@@ -52,6 +52,14 @@ CHECKSUM_ANNOTATION_PREFIX = "checksum/"
 # summary line instead of once per manifest.
 METADATA_SUMMARY_THRESHOLD = 2
 NO_CHANGES_MESSAGE = "The generated output is the same before and after this change"
+REBASE_REQUIRED_MESSAGE = (
+    "⚠️ This branch could not be rebased onto the default branch, so a manifest "
+    "diff would almost certainly be misleading — it would read as though the "
+    "merge reverts whatever landed on the default branch since this branch was "
+    "cut. Please rebase this branch onto the latest default branch, resolve any "
+    "conflicts, and push again to get an accurate diff of what merging would "
+    "deploy."
+)
 COMMENT_MARKER_PREFIX = "relcoord:manifest-diff"
 
 _DIFF_FILE_HEADER = re.compile(r"^diff --git a/(?P<old>.*) b/(?P<new>.*)$")
@@ -520,6 +528,17 @@ class _RenderedSection:
 def comment_marker() -> str:
     """The hidden line a comment carries so a later diff can find and edit it."""
     return f"<!-- {COMMENT_MARKER_PREFIX} -->"
+
+
+def build_rebase_required_comment(*, marker: str | None = None) -> str:
+    """Render the comment asking for a manual rebase before a diff is possible.
+
+    It carries the same ``marker`` an ordinary diff comment does, so posting it
+    edits any earlier diff comment in place rather than leaving a stale, wrong
+    diff standing beside the request to rebase.
+    """
+    preamble = [marker, ""] if marker is not None else []
+    return "\n".join([*preamble, REBASE_REQUIRED_MESSAGE])
 
 
 def build_comment_body(

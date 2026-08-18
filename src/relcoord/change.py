@@ -32,6 +32,7 @@ from relcoord.manifest_diff import (
     DiffSection,
     ManifestDiff,
     build_comment_body,
+    build_rebase_required_comment,
     comment_marker,
     manifest_diff,
 )
@@ -110,6 +111,16 @@ class CommentPostError(ChangeProcessingError):
     The diff itself succeeded in this case, so the failure is about GitHub
     rejecting the comment rather than about the manifests, and is reported
     without a stack trace.
+    """
+
+
+class RebaseConflictError(ChangeProcessingError):
+    """Raised when a diff's source branch will not rebase onto the default branch.
+
+    A diff is only worth publishing if it reflects what merging would actually
+    deploy, and a branch that does not rebase cleanly cannot be diffed honestly.
+    The diff path catches this and asks for a manual rebase rather than
+    publishing a diff that is almost certainly wrong.
     """
 
 
@@ -716,7 +727,10 @@ class DiffCommentProcessor:
                 commit,
             )
             logger.info(
-                "diff step 2/6: checking out source repo %s at commit %s", repo, commit
+                "diff step 2/6: checking out source repo %s at commit %s "
+                "(rebased onto the default branch)",
+                repo,
+                commit,
             )
             report(
                 "source-checkout",
@@ -724,7 +738,10 @@ class DiffCommentProcessor:
                 repo=repo,
                 commit=commit,
             )
-            _checkout_commit(repo, commit, source_checkout, self.idcat)
+            try:
+                _checkout_rebased_commit(repo, commit, source_checkout, self.idcat)
+            except RebaseConflictError as exc:
+                return self._rebase_required(repo, commit, pull_request, report, exc)
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
@@ -957,6 +974,46 @@ class DiffCommentProcessor:
         )
         return DiffComment(
             body=body, posted=True, url=posted.url, updated=posted.updated
+        )
+
+    def _rebase_required(
+        self,
+        repo: str,
+        commit: str,
+        pull_request: int | None,
+        report: Callable[..., None],
+        exc: RebaseConflictError,
+    ) -> DiffResult:
+        """Ask for a manual rebase instead of publishing a misleading diff.
+
+        The comment carries the same marker an ordinary diff would, so it
+        replaces any earlier diff comment on the pull request rather than
+        leaving a stale, wrong diff standing next to it.
+        """
+        logger.info(
+            "diff: %s at %s does not rebase onto its default branch: %s",
+            repo,
+            commit,
+            exc,
+        )
+        report(
+            "rebase-conflict",
+            f"{short_repo(repo)} does not rebase cleanly onto its default branch; "
+            "requesting a manual rebase",
+            repo=repo,
+            commit=commit,
+        )
+        marker = comment_marker()
+        body = build_rebase_required_comment(marker=marker)
+        comment = self._comment(repo, pull_request, body, marker, report)
+        return DiffResult(
+            repo=repo,
+            commit=commit,
+            pull_request=pull_request,
+            generated_count=0,
+            outputs=(),
+            diffs=(),
+            comment=comment,
         )
 
 
@@ -1489,6 +1546,49 @@ def _checkout_commit(
         no_checkout=True,
     )
     _dulwich_checkout(target, commit)
+
+
+def _checkout_rebased_commit(
+    source: str, commit: str, target: Path, idcat: IdcatSettings | None
+) -> None:
+    """Check out ``commit`` rebased onto the source repo's default branch.
+
+    GitHub rebases a pull request onto the default branch as it merges, so a
+    diff is only faithful to what a merge would deploy if it is generated from
+    the same rebased tree. A branch cut before a later change to the default
+    branch would otherwise generate manifests missing that change, and the diff
+    would read as a spurious revert of it (see PLAT-707).
+
+    The clone keeps its full history so the rebase has a merge base to work
+    from, and its ``HEAD`` still points at the default branch, so its tip is the
+    rebase upstream. A rebase that does not apply cleanly raises
+    :class:`RebaseConflictError`.
+    """
+    _clone_repository(
+        source,
+        target,
+        idcat,
+        purpose=f"checking out source repo {source}",
+        no_checkout=True,
+    )
+    default_branch_tip = _head_commit(target)
+    _dulwich_checkout(target, commit)
+    _rebase_onto(target, default_branch_tip)
+
+
+def _rebase_onto(target: Path, upstream: str) -> None:
+    """Rebase the checkout's current branch onto ``upstream``.
+
+    ``porcelain.rebase`` updates the branch ref but not the working tree, so the
+    rebased tip is checked out afterwards. An empty result means the branch was
+    already up to date and the working tree already holds the right thing.
+    """
+    try:
+        rebased = porcelain.rebase(str(target), upstream=upstream)
+    except porcelain.Error as exc:
+        raise RebaseConflictError(f"failed to rebase onto {upstream}: {exc}") from exc
+    if rebased:
+        _dulwich_checkout(target, rebased[-1].decode("ascii"))
 
 
 def _system_plugins(

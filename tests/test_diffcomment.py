@@ -20,7 +20,7 @@ from relcoord.change import (
 from relcoord.config import OutputSettings
 from relcoord.git import GitCredentialError
 from relcoord.github import GithubCommentError, PostedComment
-from relcoord.manifest_diff import ManifestDiff
+from relcoord.manifest_diff import ManifestDiff, comment_marker
 
 CONFIG_REPO = "https://github.com/acme/config.git"
 MANIFESTS_REPO = "https://github.com/acme/manifests.git"
@@ -144,7 +144,7 @@ def _fake_git(
     monkeypatch.setattr(
         change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
     )
-    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_checkout_rebased_commit", fake_checkout_commit)
     monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
     monkeypatch.setattr(change, "generate", fake_generate)
     monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
@@ -290,6 +290,53 @@ def test_diff_reports_no_changes_when_manifest_builder_changed_nothing(
     phases = [event.phase for event in events]
     assert "no-changes" in phases
     assert "diff" not in phases
+
+
+def test_diff_asks_for_a_manual_rebase_when_the_branch_will_not_rebase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    _fake_git(monkeypatch, tmp_path, calls=calls)
+
+    def refuse_rebase(repo: str, commit: str, target: Path, idcat) -> None:
+        raise change.RebaseConflictError("Conflicts in: platform/section.toml")
+
+    monkeypatch.setattr(change, "_checkout_rebased_commit", refuse_rebase)
+    commenter = Commenter()
+
+    events: list[ChangeProgress] = []
+    result = DiffCommentProcessor(
+        manifests_repository=MANIFESTS_REPO, commenter=commenter
+    ).diff(CONFIG_REPO, "deadbeef", pull_request=7, progress=events.append)
+
+    assert len(commenter.calls) == 1
+    assert commenter.calls[0][:2] == (CONFIG_REPO, 7)
+    assert "rebase" in commenter.calls[0][2].lower()
+    assert commenter.markers[0] == comment_marker()
+    assert result.diffs == ()
+    assert result.generated_count == 0
+    assert not any(call[0] in {"clone", "generate", "diff"} for call in calls)
+    assert "rebase-conflict" in [event.phase for event in events]
+
+
+def test_diff_rebase_conflict_without_a_pull_request_returns_the_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(monkeypatch, tmp_path)
+
+    def refuse_rebase(repo: str, commit: str, target: Path, idcat) -> None:
+        raise change.RebaseConflictError("Conflicts in: platform/section.toml")
+
+    monkeypatch.setattr(change, "_checkout_rebased_commit", refuse_rebase)
+    commenter = Commenter()
+
+    result = DiffCommentProcessor(
+        manifests_repository=MANIFESTS_REPO, commenter=commenter
+    ).diff(CONFIG_REPO, "deadbeef")
+
+    assert commenter.calls == []
+    assert not result.comment.posted
+    assert "rebase" in result.comment.body.lower()
 
 
 def test_diff_generates_every_configured_output_before_diffing(
@@ -508,7 +555,7 @@ def test_diff_requires_the_deploy_directory(
     _fake_git(monkeypatch, tmp_path)
     monkeypatch.setattr(
         change,
-        "_checkout_commit",
+        "_checkout_rebased_commit",
         lambda repo, commit, target, idcat: target.mkdir(parents=True),
     )
 
