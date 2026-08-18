@@ -18,6 +18,7 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import random
 import ssl
 import time
 from collections.abc import Callable, Iterator
@@ -43,6 +44,15 @@ WATCH_TIMEOUT_SECONDS = 300.0
 # straight away, so a cluster refusing watches does not spin.
 WATCH_RETRY_SECONDS = 1.0
 CONNECT_TIMEOUT_SECONDS = 10.0
+# A 429 is the API server asking to slow down — most often because its storage
+# layer is briefly (re)initialising — rather than a request that will never
+# succeed. relcoord backs off and retries such a request rather than failing the
+# rollout over it.
+THROTTLED_STATUS_CODE = 429
+DEFAULT_THROTTLE_ATTEMPTS = 10
+DEFAULT_THROTTLE_INITIAL_DELAY_SECONDS = 1.0
+DEFAULT_THROTTLE_BACKOFF_MULTIPLIER = 2.0
+DEFAULT_THROTTLE_MAX_DELAY_SECONDS = 30.0
 # The apps/v1 group, which serves the kinds that have a rollout to wait for.
 APPS_PATH_PREFIX = "/apis/apps/v1"
 DEPLOYMENTS_RESOURCE_NAME = "deployments"
@@ -211,13 +221,27 @@ class KubernetesDeploymentDetector:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         watch_timeout_seconds: float = WATCH_TIMEOUT_SECONDS,
         retry_delay_seconds: float = WATCH_RETRY_SECONDS,
+        throttle_attempts: int = DEFAULT_THROTTLE_ATTEMPTS,
+        throttle_initial_delay_seconds: float = DEFAULT_THROTTLE_INITIAL_DELAY_SECONDS,
+        throttle_backoff_multiplier: float = DEFAULT_THROTTLE_BACKOFF_MULTIPLIER,
+        throttle_max_delay_seconds: float = DEFAULT_THROTTLE_MAX_DELAY_SECONDS,
+        sleep: Callable[[float], object] = time.sleep,
+        jitter: Callable[[float], float] | None = None,
         owns_client: bool = False,
     ) -> None:
+        if throttle_attempts < 1:
+            raise ValueError("throttle_attempts must be at least 1")
         self._client = client
         self._cluster_name = cluster_name
         self._timeout_seconds = timeout_seconds
         self._watch_timeout_seconds = watch_timeout_seconds
         self._retry_delay_seconds = retry_delay_seconds
+        self._throttle_attempts = throttle_attempts
+        self._throttle_initial_delay_seconds = throttle_initial_delay_seconds
+        self._throttle_backoff_multiplier = throttle_backoff_multiplier
+        self._throttle_max_delay_seconds = throttle_max_delay_seconds
+        self._sleep = sleep
+        self._jitter = jitter if jitter is not None else _symmetric_jitter
         self._owns_client = owns_client
         self._resources_by_kind: dict[str, list[KubernetesResource]] | None = None
 
@@ -398,6 +422,23 @@ class KubernetesDeploymentDetector:
                     if response.status_code == 410:
                         # Too old to resume from; the caller lists again.
                         return
+                    if response.status_code == THROTTLED_STATUS_CODE:
+                        # The API server is asking to slow down rather than
+                        # refusing the watch; back off and let the caller list
+                        # and re-watch instead of failing the change.
+                        response.read()
+                        wait = self._jitter(
+                            self._throttle_delay(
+                                response, self._throttle_initial_delay_seconds
+                            )
+                        )
+                        logger.warning(
+                            "watch of %s was throttled (429); listing again after %gs",
+                            _format_ref(ref),
+                            wait,
+                        )
+                        self._sleep(wait)
+                        return
                     # raise_for_status() reports the body, which a streamed
                     # response only has once it has been read.
                     response.read()
@@ -497,29 +538,67 @@ class KubernetesDeploymentDetector:
         return resources
 
     def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
-        try:
-            response = self._client.get(path, params=params)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise DeploymentDetectionError(
-                f"Kubernetes API GET {path} failed with status "
-                f"{exc.response.status_code}: {exc.response.text}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise DeploymentDetectionError(
-                f"Kubernetes API GET {path} failed: {exc}"
-            ) from exc
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise DeploymentDetectionError(
-                f"Kubernetes API GET {path} returned invalid JSON"
-            ) from exc
-        if not isinstance(data, dict):
-            raise DeploymentDetectionError(
-                f"Kubernetes API GET {path} did not return a JSON object"
-            )
-        return data
+        delay = self._throttle_initial_delay_seconds
+        for attempt in range(1, self._throttle_attempts + 1):
+            try:
+                response = self._client.get(path, params=params)
+            except httpx.RequestError as exc:
+                raise DeploymentDetectionError(
+                    f"Kubernetes API GET {path} failed: {exc}"
+                ) from exc
+            if (
+                response.status_code == THROTTLED_STATUS_CODE
+                and attempt < self._throttle_attempts
+            ):
+                wait = self._jitter(self._throttle_delay(response, delay))
+                logger.warning(
+                    "Kubernetes API GET %s was throttled (429); retrying in %gs "
+                    "(attempt %d of %d)",
+                    path,
+                    wait,
+                    attempt,
+                    self._throttle_attempts,
+                )
+                self._sleep(wait)
+                delay = min(
+                    delay * self._throttle_backoff_multiplier,
+                    self._throttle_max_delay_seconds,
+                )
+                continue
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise DeploymentDetectionError(
+                    f"Kubernetes API GET {path} failed with status "
+                    f"{exc.response.status_code}: {exc.response.text}"
+                ) from exc
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise DeploymentDetectionError(
+                    f"Kubernetes API GET {path} returned invalid JSON"
+                ) from exc
+            if not isinstance(data, dict):
+                raise DeploymentDetectionError(
+                    f"Kubernetes API GET {path} did not return a JSON object"
+                )
+            return data
+        raise AssertionError("throttle retry loop exhausted without returning")
+
+    def _throttle_delay(self, response: httpx.Response, fallback: float) -> float:
+        """How long to wait before retrying a throttled request.
+
+        The API server names how long to back off, either in a Retry-After
+        header or in the ``retryAfterSeconds`` of its Status body; honour
+        whichever it gave, and fall back to the caller's exponential backoff when
+        it gave neither. Either way the wait is capped so a server naming an
+        implausibly long delay cannot stall a rollout indefinitely.
+        """
+        directed = _retry_after_header(response)
+        if directed is None:
+            directed = _retry_after_body(response)
+        chosen = fallback if directed is None else max(directed, 0.0)
+        return min(chosen, self._throttle_max_delay_seconds)
 
 
 def _group_versions(group: dict[str, Any]) -> list[dict[str, Any]]:
@@ -534,6 +613,54 @@ def _group_versions(group: dict[str, Any]) -> list[dict[str, Any]]:
         return [preferred]
     versions = group.get("versions", [])
     return [version for version in versions if isinstance(version, dict)]
+
+
+def _symmetric_jitter(delay: float) -> float:
+    """Spread a backoff delay across +/-50% of itself, keeping its mean.
+
+    Concurrent changes all see the same cluster-wide 429 at the same moment and
+    are all told to wait the same Retry-After, so honouring it exactly makes them
+    retry in lockstep and hammer the API server the instant it recovers.
+    Jittering around the delay desynchronises them without, on average, waiting
+    any longer or shorter than the server asked for.
+    """
+    if delay <= 0:
+        return 0.0
+    return random.uniform(0.5 * delay, 1.5 * delay)
+
+
+def _retry_after_header(response: httpx.Response) -> float | None:
+    """The Retry-After of a response, in seconds, when it gave one in seconds.
+
+    The API server sends Retry-After as a number of seconds; the HTTP-date form
+    the header also allows is not something it uses, so anything unparseable as a
+    number falls through to the backoff rather than being second-guessed.
+    """
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _retry_after_body(response: httpx.Response) -> float | None:
+    """The retryAfterSeconds a Status body names, when it names one."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    details = body.get("details")
+    if not isinstance(details, dict):
+        return None
+    seconds = details.get("retryAfterSeconds")
+    # bool is an int, and a JSON true here would be a nonsense delay.
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return None
+    return float(seconds)
 
 
 def _watch_event(line: str) -> tuple[str, dict[str, Any] | None] | None:

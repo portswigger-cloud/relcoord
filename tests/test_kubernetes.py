@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import json
 import logging
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from relcoord.kubernetes import (
     DEPLOY_ID_ANNOTATION,
     DeploymentDetectionError,
     KubernetesDeploymentDetector,
+    _symmetric_jitter,
     cluster_client,
 )
 
@@ -175,6 +177,10 @@ def detector(
     *,
     timeout_seconds: float = 5,
     watch_timeout_seconds: float = 5,
+    throttle_attempts: int = 10,
+    throttle_initial_delay_seconds: float = 1.0,
+    sleep: Any = None,
+    jitter: Any = None,
 ) -> KubernetesDeploymentDetector:
     return KubernetesDeploymentDetector(
         client=httpx.Client(
@@ -185,6 +191,14 @@ def detector(
         timeout_seconds=timeout_seconds,
         watch_timeout_seconds=watch_timeout_seconds,
         retry_delay_seconds=0,
+        throttle_attempts=throttle_attempts,
+        throttle_initial_delay_seconds=throttle_initial_delay_seconds,
+        # Backing off for real would only make the suite slow; the tests that
+        # care assert on what a recording callable was asked to wait.
+        sleep=(lambda _seconds: None) if sleep is None else sleep,
+        # Identity jitter keeps the backoff a test asserts on exact; the tests
+        # that care about jitter pass their own.
+        jitter=(lambda delay: delay) if jitter is None else jitter,
     )
 
 
@@ -845,6 +859,181 @@ def test_detector_reports_a_watch_that_the_api_server_rejects() -> None:
             created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
             removed=set(),
         )
+
+
+def throttled(retry_after_seconds: int | None = None, *, header: str | None = None):
+    """A 429 the API server sends while it is briefly unable to serve a request."""
+    body: dict[str, Any] = {
+        "kind": "Status",
+        "status": "Failure",
+        "reason": "TooManyRequests",
+        "message": "storage is (re)initializing",
+        "code": 429,
+    }
+    if retry_after_seconds is not None:
+        body["details"] = {"retryAfterSeconds": retry_after_seconds}
+    headers = {} if header is None else {"Retry-After": header}
+    return httpx.Response(429, json=body, headers=headers)
+
+
+def test_detector_retries_a_throttled_list_and_honours_the_retry_after_header(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    lists = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal lists
+        path = request.url.path
+        if path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[path])
+        if path != "/apis/apps/v1/namespaces/default/deployments":
+            return httpx.Response(500, json={"unexpected": path})
+        lists += 1
+        if lists == 1:
+            return throttled(retry_after_seconds=1, header="3")
+        return httpx.Response(200, json=listing(deployment("api", DEPLOY_ID)))
+
+    slept: list[float] = []
+    with caplog.at_level(logging.WARNING, logger="relcoord.kubernetes"):
+        detector(handler, sleep=slept.append).wait_for_success(
+            deploy_id=DEPLOY_ID,
+            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+            removed=set(),
+        )
+
+    assert lists == 2
+    # The Retry-After header is honoured in preference to the body.
+    assert slept == [3.0]
+    assert "was throttled" in caplog.text
+
+
+def test_detector_uses_the_bodys_retry_after_when_no_header_is_sent() -> None:
+    lists = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal lists
+        path = request.url.path
+        if path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[path])
+        if path != "/apis/apps/v1/namespaces/default/deployments":
+            return httpx.Response(500, json={"unexpected": path})
+        lists += 1
+        if lists == 1:
+            return throttled(retry_after_seconds=2)
+        return httpx.Response(200, json=listing(deployment("api", DEPLOY_ID)))
+
+    slept: list[float] = []
+    detector(handler, sleep=slept.append).wait_for_success(
+        deploy_id=DEPLOY_ID,
+        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+        removed=set(),
+    )
+
+    assert lists == 2
+    assert slept == [2.0]
+
+
+def test_detector_backs_off_exponentially_when_no_retry_after_is_given() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[path])
+        if path != "/apis/apps/v1/namespaces/default/deployments":
+            return httpx.Response(500, json={"unexpected": path})
+        # A 429 with neither a Retry-After header nor a retryAfterSeconds body.
+        return httpx.Response(429, text="slow down")
+
+    slept: list[float] = []
+    with pytest.raises(DeploymentDetectionError, match="status 429"):
+        detector(
+            handler,
+            throttle_attempts=4,
+            throttle_initial_delay_seconds=1.0,
+            sleep=slept.append,
+        ).wait_for_success(
+            deploy_id=DEPLOY_ID,
+            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+            removed=set(),
+        )
+
+    # Four attempts means three waits, each double the last.
+    assert slept == [1.0, 2.0, 4.0]
+
+
+def test_detector_re_lists_when_a_watch_is_throttled_rather_than_failing() -> None:
+    watches = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal watches
+        path = request.url.path
+        if path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[path])
+        if path != "/apis/apps/v1/namespaces/default/deployments":
+            return httpx.Response(500, json={"unexpected": path})
+        if "watch" not in request.url.params:
+            # Stale until the watch has been throttled once and the loop lists
+            # afresh, which is what a 429 on the watch has to fall back to.
+            deploy_id = "stale" if watches == 0 else DEPLOY_ID
+            return httpx.Response(200, json=listing(deployment("api", deploy_id)))
+        watches += 1
+        return throttled(retry_after_seconds=1, header="1")
+
+    slept: list[float] = []
+    detector(handler, sleep=slept.append).wait_for_success(
+        deploy_id=DEPLOY_ID,
+        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+        removed=set(),
+    )
+
+    assert watches == 1
+    assert slept == [1.0]
+
+
+def test_detector_jitters_the_honoured_delay_before_sleeping() -> None:
+    lists = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal lists
+        path = request.url.path
+        if path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[path])
+        if path != "/apis/apps/v1/namespaces/default/deployments":
+            return httpx.Response(500, json={"unexpected": path})
+        lists += 1
+        if lists == 1:
+            return throttled(retry_after_seconds=4)
+        return httpx.Response(200, json=listing(deployment("api", DEPLOY_ID)))
+
+    jittered: list[float] = []
+    slept: list[float] = []
+
+    def record_jitter(delay: float) -> float:
+        jittered.append(delay)
+        return delay + 0.5
+
+    detector(handler, sleep=slept.append, jitter=record_jitter).wait_for_success(
+        deploy_id=DEPLOY_ID,
+        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+        removed=set(),
+    )
+
+    # Jitter is handed the delay the server asked for, and its result is what is
+    # actually slept.
+    assert jittered == [4.0]
+    assert slept == [4.5]
+
+
+def test_symmetric_jitter_stays_within_half_the_delay_and_keeps_its_mean() -> None:
+    random.seed(1234)
+    samples = [_symmetric_jitter(10.0) for _ in range(10000)]
+
+    assert all(5.0 <= sample <= 15.0 for sample in samples)
+    assert abs(sum(samples) / len(samples) - 10.0) < 0.2
+
+
+def test_symmetric_jitter_of_a_non_positive_delay_is_zero() -> None:
+    assert _symmetric_jitter(0.0) == 0.0
+    assert _symmetric_jitter(-1.0) == 0.0
 
 
 def test_cluster_client_authenticates_with_a_token_for_the_eks_cluster(
