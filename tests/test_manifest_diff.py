@@ -15,6 +15,7 @@ from relcoord.manifest_diff import (
     DiffSection,
     ManifestDiff,
     build_comment_body,
+    build_rebase_required_comment,
     comment_marker,
     filter_metadata_hunks,
     manifest_diff,
@@ -449,6 +450,14 @@ def test_build_comment_body_reports_the_manifest_builder_version() -> None:
     assert "````diff\n```diff\n+hello\n```\n````" in comment.body
     assert f"manifest-builder version: `{MANIFEST_BUILDER_VERSION}`" in comment.body
     assert not comment.omitted_context_diff
+
+
+def test_build_rebase_required_comment_carries_the_marker_and_asks_to_rebase() -> None:
+    marker = comment_marker()
+    body = build_rebase_required_comment(marker=marker)
+
+    assert body.startswith(marker)
+    assert "rebase" in body.lower()
 
 
 def test_build_comment_body_preserves_stat_leading_alignment() -> None:

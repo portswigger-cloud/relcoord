@@ -402,6 +402,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/33/67/6c1a89af18f160a9d7311fddbd62068e347c2bf6cfada8530ebfd4e75b8b/dulwich-1.2.12-py3-none-any.whl", hash = "sha256:713de88063b80ab37d707e7aff17e403efb236156e09c34c149ada48d48b6e96", size = 715939, upload-time = "2026-07-19T11:16:37.722Z" },
 ]
 
+[package.optional-dependencies]
+merge = [
+    { name = "merge3" },
+]
+
 [[package]]
 name = "frozenlist"
 version = "1.8.0"
@@ -603,6 +608,15 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/36/fd/c4a667363f121139db7021b09935bc3e1714a0d0b24696c892c39293da1f/manifest_builder-0.7.9-py3-none-any.whl", hash = "sha256:cb84f673fc63b924de23ae489027eb5377ad515ad45ae240ac59b9ae6181acdd", size = 48827, upload-time = "2026-08-14T17:04:20.391Z" },
+]
+
+[[package]]
+name = "merge3"
+version = "0.0.16"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/12/71/daaa7978561b9a7bfdcee4ba5ec2ead6162f6a9d2e2edf069def96085c6b/merge3-0.0.16.tar.gz", hash = "sha256:0852de4381cb46be5ef4ed49e3ac20c5a4a0cd46a8ff4bbb870bc27aab543306", size = 15915, upload-time = "2025-10-15T16:22:25.548Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e3/e9/a94184895f008ecc70ae4d227deb6a4209bb4f86c5f35b79b8cf6fc23ee4/merge3-0.0.16-py3-none-any.whl", hash = "sha256:b9d907b7281213a5dca1d711d168c4f8fe8aca20d74e2456bb177c4f31dfd927", size = 16546, upload-time = "2025-10-15T16:22:24.08Z" },
 ]
 
 [[package]]
@@ -893,7 +907,7 @@ source = { editable = "." }
 dependencies = [
     { name = "boto3" },
     { name = "click" },
-    { name = "dulwich" },
+    { name = "dulwich", extra = ["merge"] },
     { name = "httpx" },
     { name = "hypercorn" },
     { name = "manifest-builder" },
@@ -917,7 +931,7 @@ dev = [
 requires-dist = [
     { name = "boto3" },
     { name = "click" },
-    { name = "dulwich" },
+    { name = "dulwich", extras = ["merge"] },
     { name = "httpx" },
     { name = "hypercorn" },
     { name = "manifest-builder", specifier = ">=0.7.9", index = "https://pypi.org/simple" },
