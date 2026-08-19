@@ -25,7 +25,12 @@ from manifest_builder.config import (
 )
 
 from relcoord.config import IdcatSettings, OutputSettings, RolloutSettings
-from relcoord.git import GitCredentialError, GitCredentials, github_https_credentials
+from relcoord.git import (
+    GitCredentialError,
+    GitCredentials,
+    github_https_credentials,
+    with_fresh_token_on_unauthorized,
+)
 from relcoord.github import GithubCommentError, GithubIssueCommenter, IssueCommenter
 from relcoord.kubernetes import KubernetesDeploymentDetector, KubernetesObjectRef
 from relcoord.manifest_diff import (
@@ -1674,30 +1679,42 @@ def _clone_repository(
     no_checkout: bool = False,
     branch: str | None = None,
 ) -> None:
-    credentials = _credentials_for(source, idcat, purpose)
     clone_output = BytesIO()
+
+    def clone(credentials: GitCredentials) -> Repo:
+        nonlocal clone_output
+        # A retry reuses the same target and errstream; reset both so a failed
+        # first attempt neither blocks the clone nor pollutes the error detail.
+        clone_output = BytesIO()
+        shutil.rmtree(target, ignore_errors=True)
+        if credentials.username is None:
+            return porcelain.clone(
+                source,
+                target,
+                checkout=not no_checkout,
+                depth=int(depth) if depth is not None else None,
+                branch=branch,
+                errstream=clone_output,
+            )
+        return porcelain.clone(
+            source,
+            target,
+            checkout=not no_checkout,
+            depth=int(depth) if depth is not None else None,
+            branch=branch,
+            errstream=clone_output,
+            username=credentials.username,
+            password=credentials.password or "",
+        )
+
     repo: Repo | None = None
     try:
-        if credentials.username is None:
-            repo = porcelain.clone(
-                source,
-                target,
-                checkout=not no_checkout,
-                depth=int(depth) if depth is not None else None,
-                branch=branch,
-                errstream=clone_output,
-            )
-        else:
-            repo = porcelain.clone(
-                source,
-                target,
-                checkout=not no_checkout,
-                depth=int(depth) if depth is not None else None,
-                branch=branch,
-                errstream=clone_output,
-                username=credentials.username,
-                password=credentials.password or "",
-            )
+        repo = with_fresh_token_on_unauthorized(
+            source,
+            idcat,
+            clone,
+            credentials=lambda: _credentials_for(source, idcat, purpose),
+        )
     except Exception as exc:
         _log_dulwich_output("clone", clone_output)
         raise GitTransportError(
@@ -1741,9 +1758,14 @@ def _push_repository(
     remote: str,
     idcat: IdcatSettings | None,
 ) -> None:
-    credentials = _credentials_for(remote, idcat, f"pushing to manifests repo {remote}")
+    purpose = f"pushing to manifests repo {remote}"
     push_output = BytesIO()
-    try:
+
+    def push(credentials: GitCredentials) -> None:
+        nonlocal push_output
+        # A retry reuses the errstream; reset it so a failed first attempt does
+        # not pollute the error detail of the second.
+        push_output = BytesIO()
         if credentials.username is None:
             porcelain.push(
                 repo_path,
@@ -1758,6 +1780,14 @@ def _push_repository(
                 username=credentials.username,
                 password=credentials.password or "",
             )
+
+    try:
+        with_fresh_token_on_unauthorized(
+            remote,
+            idcat,
+            push,
+            credentials=lambda: _credentials_for(remote, idcat, purpose),
+        )
     except Exception as exc:
         _log_dulwich_output("push", push_output)
         raise GitTransportError(
