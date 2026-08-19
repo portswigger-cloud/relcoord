@@ -7,11 +7,13 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 from dulwich import porcelain
+from dulwich.client import HTTPUnauthorized
 from dulwich.config import StackedConfig
 
 from relcoord.config import IdcatSettings
 from relcoord.git import (
     GitCredentialError,
+    GitCredentials,
     GithubRepo,
     InstallationTokenCache,
     InstallationTokenKey,
@@ -20,7 +22,9 @@ from relcoord.git import (
     github_https_url_from_ssh_style_uri,
     github_repo_from_url,
     installation_token_url,
+    invalidate_installation_token,
     is_ssh_style_git_uri,
+    with_fresh_token_on_unauthorized,
 )
 
 
@@ -272,6 +276,122 @@ def test_github_repo_from_url_matches_idcat_helper_behavior() -> None:
     )
     assert github_repo_from_url("ssh://github.com/acme/api.git") is None
     assert github_repo_from_url("https://example.com/acme/api.git") is None
+
+
+def _idcat(tmp_path: Path) -> IdcatSettings:
+    token_file = tmp_path / "idcat-token"
+    token_file.write_text("idcat-bearer-token\n")
+    return IdcatSettings(
+        endpoint="https://idcat.example.test/base",
+        github_app="deployments",
+        token_path=token_file,
+    )
+
+
+def test_clone_repository_refetches_token_after_github_rejects_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cached token GitHub has already expired triggers one fresh fetch.
+
+    idcat can hand back a reused token close to GitHub's hard expiry, so a
+    cached copy can outlive it; the first clone then fails with
+    HTTPUnauthorized. relcoord should drop the token, fetch a new one and retry
+    rather than wait for a restart (PLAT-734).
+    """
+    caplog.set_level(logging.WARNING, logger="relcoord.git")
+    idcat = _idcat(tmp_path)
+    url = "https://idcat.example.test/base/installation-token/deployments/acme/api"
+    repo = MagicMock()
+    repo.head.return_value = b"abc123"
+
+    with (
+        patch("relcoord.git.httpx.post") as post,
+        patch("relcoord.git.porcelain.clone") as clone,
+    ):
+        post.side_effect = [
+            _idcat_response(url, "stale-token"),
+            _idcat_response(url, "fresh-token"),
+        ]
+        clone.side_effect = [HTTPUnauthorized(None, url), repo]
+
+        result = clone_repository("https://github.com/acme/api.git", idcat=idcat)
+
+    assert result.head == "abc123"
+    assert post.call_count == 2
+    assert clone.call_args_list[0].kwargs["password"] == "stale-token"
+    assert clone.call_args_list[1].kwargs["password"] == "fresh-token"
+    assert "refetching and retrying once" in caplog.text
+
+
+def test_clone_repository_gives_up_after_a_second_rejection(tmp_path: Path) -> None:
+    """The retry happens exactly once; a token GitHub still rejects propagates."""
+    idcat = _idcat(tmp_path)
+    url = "https://idcat.example.test/base/installation-token/deployments/acme/api"
+
+    with (
+        patch("relcoord.git.httpx.post") as post,
+        patch("relcoord.git.porcelain.clone") as clone,
+    ):
+        post.side_effect = [
+            _idcat_response(url, "stale-token"),
+            _idcat_response(url, "still-bad-token"),
+        ]
+        clone.side_effect = [
+            HTTPUnauthorized(None, url),
+            HTTPUnauthorized(None, url),
+        ]
+
+        with pytest.raises(HTTPUnauthorized):
+            clone_repository("https://github.com/acme/api.git", idcat=idcat)
+
+    assert clone.call_count == 2
+    assert post.call_count == 2
+
+
+def test_clone_repository_does_not_retry_without_idcat() -> None:
+    """A repository relcoord has no idcat token for gets no second attempt."""
+    with patch("relcoord.git.porcelain.clone") as clone:
+        clone.side_effect = HTTPUnauthorized(None, "https://example.com/acme/api.git")
+
+        with pytest.raises(HTTPUnauthorized):
+            clone_repository("https://example.com/acme/api.git")
+
+    clone.assert_called_once()
+
+
+def test_with_fresh_token_on_unauthorized_returns_result_without_retry() -> None:
+    """A successful first attempt runs the operation once and returns its value."""
+    calls: list[GitCredentials] = []
+
+    def operation(credentials: GitCredentials) -> str:
+        calls.append(credentials)
+        return "done"
+
+    result = with_fresh_token_on_unauthorized(
+        "https://github.com/acme/api.git",
+        None,
+        operation,
+        credentials=lambda: GitCredentials(username="x-access-token", password="t"),
+    )
+
+    assert result == "done"
+    assert len(calls) == 1
+
+
+def test_invalidate_installation_token_ignores_non_idcat_repositories(
+    tmp_path: Path,
+) -> None:
+    idcat = _idcat(tmp_path)
+
+    assert invalidate_installation_token("https://example.com/acme/api.git", idcat) is (
+        False
+    )
+    assert invalidate_installation_token("https://github.com/acme/api.git", None) is (
+        False
+    )
+    assert invalidate_installation_token("https://github.com/acme/api.git", idcat) is (
+        True
+    )
 
 
 def test_github_https_url_from_ssh_style_uri_converts_github_repos() -> None:

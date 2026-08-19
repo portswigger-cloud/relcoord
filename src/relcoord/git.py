@@ -16,13 +16,21 @@ from urllib.parse import quote, urlparse
 
 import httpx
 from dulwich import porcelain
+from dulwich.client import HTTPUnauthorized
 
 from relcoord.config import IdcatSettings
 
 GITHUB_TOKEN_USERNAME = "x-access-token"
 # idcat installation tokens are valid for 3600 seconds; expire them a little
-# early so a cached token is not handed out just before it stops working.
+# early so a cached token is not handed out just before it stops working. This
+# TTL runs from when relcoord *receives* the token, which assumes idcat always
+# hands back a freshly minted one. idcat serves the token as an opaque string
+# with no expiry attached, so relcoord cannot see how much life a reused token
+# actually has left; when the assumption breaks the cached token outlives
+# GitHub's real expiry and clones fail with "No valid credentials provided".
+# with_fresh_token_on_unauthorized backstops that by refetching once on refusal.
 INSTALLATION_TOKEN_TTL_SECONDS = 3300.0
+
 _SCP_STYLE_GIT_URI = re.compile(r"(?:[^@/:]+@)?([^/:]+):(.+)")
 _SSH_STYLE_SCHEMES = {"ssh", "git+ssh"}
 logger = logging.getLogger(__name__)
@@ -102,6 +110,10 @@ class InstallationTokenCache:
             self._tokens[key] = (now + self._ttl_seconds, token)
         return token
 
+    def invalidate(self, key: InstallationTokenKey) -> None:
+        with self._lock:
+            self._tokens.pop(key, None)
+
     def clear(self) -> None:
         with self._lock:
             self._tokens.clear()
@@ -110,16 +122,64 @@ class InstallationTokenCache:
 installation_token_cache = InstallationTokenCache()
 
 
+def invalidate_installation_token(source: str, idcat: IdcatSettings | None) -> bool:
+    """Drop any cached idcat installation token for source.
+
+    Returns True when there is a GitHub repository served by idcat whose token
+    was dropped, so a caller recovering from a rejected token knows a fresh
+    fetch is worth trying; False when source is not such a repository and the
+    original authorization error should simply propagate.
+    """
+    repo = github_repo_from_url(source)
+    if repo is None or idcat is None:
+        return False
+    installation_token_cache.invalidate(installation_token_key(idcat, repo))
+    return True
+
+
+def with_fresh_token_on_unauthorized[T](
+    source: str,
+    idcat: IdcatSettings | None,
+    operation: Callable[[GitCredentials], T],
+    *,
+    credentials: Callable[[], GitCredentials],
+) -> T:
+    """Run a credentialed git operation, refetching the idcat token once if
+    GitHub rejects it.
+
+    A cached installation token can outlive GitHub's real expiry (see
+    INSTALLATION_TOKEN_TTL_SECONDS), which surfaces as an ``HTTPUnauthorized``
+    ("No valid credentials provided") from dulwich. Dropping the cached token
+    and fetching a fresh one recovers without a process restart. Only GitHub
+    repositories served by idcat are retried, and only once, so a genuinely
+    unauthorized repository still fails fast.
+    """
+    try:
+        return operation(credentials())
+    except HTTPUnauthorized:
+        if not invalidate_installation_token(source, idcat):
+            raise
+        logger.warning(
+            "GitHub rejected the idcat installation token for %s; "
+            "refetching and retrying once",
+            source,
+        )
+        return operation(credentials())
+
+
 def clone_repository(
     source: str,
     *,
     branch: str | None = None,
     idcat: IdcatSettings | None = None,
 ) -> CloneResult:
-    credentials = github_https_credentials(source, idcat)
     target = Path(tempfile.mkdtemp(prefix="relcoord-clone-"))
     clone_output = BytesIO()
-    try:
+
+    def clone(credentials: GitCredentials) -> str:
+        # A retry reuses the same target, so clear anything a failed first
+        # attempt left behind; porcelain.clone recreates the directory.
+        shutil.rmtree(target, ignore_errors=True)
         if credentials.username is None:
             repo = porcelain.clone(
                 source,
@@ -141,9 +201,17 @@ def clone_repository(
                 password=credentials.password or "",
             )
         try:
-            head = repo.head().decode("ascii")
+            return repo.head().decode("ascii")
         finally:
             repo.close()
+
+    try:
+        head = with_fresh_token_on_unauthorized(
+            source,
+            idcat,
+            clone,
+            credentials=lambda: github_https_credentials(source, idcat),
+        )
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
         raise
