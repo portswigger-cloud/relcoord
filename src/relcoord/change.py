@@ -40,6 +40,15 @@ from relcoord.manifest_diff import (
     build_rebase_required_comment,
     comment_marker,
     manifest_diff,
+    render_validation_summary,
+)
+from relcoord.validator import (
+    Finding,
+    OutputValidation,
+    TreeValidator,
+    Validation,
+    ValidationError,
+    read_tree,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,6 +119,17 @@ class RolloutStageError(DeploymentDetectionError):
     """
 
 
+class ManifestValidationError(ChangeProcessingError):
+    """Raised when a generated tree must not be pushed.
+
+    Either manifest-validator failed it, or no verdict could be had at all. The
+    two are one condition here: relcoord pushes on a green verdict and on
+    nothing else, so a scanner that cannot be reached stops a change exactly as
+    a finding does. It says nothing about relcoord, so it is reported without a
+    stack trace.
+    """
+
+
 class CommentPostError(ChangeProcessingError):
     """Raised when a manifest diff comment could not be posted to GitHub.
 
@@ -127,6 +147,11 @@ class RebaseConflictError(ChangeProcessingError):
     The diff path catches this and asks for a manual rebase rather than
     publishing a diff that is almost certainly wrong.
     """
+
+
+# How many findings a failure message names before summarising the rest as a
+# count. The whole verdict is in the progress event and in the response.
+MAX_REPORTED_FINDINGS = 3
 
 
 class DeploymentDetector(Protocol):
@@ -230,6 +255,8 @@ class ChangeProcessor:
     detect_deployment: bool = False
     deployment_detector: DeploymentDetector | None = None
     """Detector to use for every output, in place of connecting to its cluster."""
+    validator: TreeValidator | None = None
+    """Validator every generated tree is gated on, absent without [validator]."""
 
     def process(
         self,
@@ -332,6 +359,7 @@ class ChangeProcessor:
                         generation_results.append(generation_result)
                         stage_results.append((output, generation_result))
                         total_generated += output_result.generated_count
+                        self._validate(output, manifests_checkout, report)
 
                     if not any(
                         result.created_or_modified or result.removed
@@ -373,6 +401,27 @@ class ChangeProcessor:
 
     def _configured_outputs(self) -> tuple[OutputSettings, ...]:
         return _resolve_output_settings(self.outputs, self.manifests_repository)
+
+    def _validate(
+        self,
+        output: OutputSettings,
+        manifests_checkout: Path,
+        report: Callable[..., None],
+    ) -> None:
+        """Gate one output's generated tree on manifest-validator's verdict.
+
+        This runs before the repository is pushed, so a failure leaves the
+        manifests repository untouched. A rollout pushes its stages in order, so
+        a dev output that fails also stops prod: the stages after this one are
+        never reached.
+        """
+        if self.validator is None:
+            return
+        result = _validate_generated_output(
+            self.validator, output, manifests_checkout, report
+        )
+        if result.failed:
+            raise ManifestValidationError(_validation_failure_message([result]))
 
     def _clone_manifests(
         self,
@@ -677,6 +726,7 @@ class DiffResult:
     outputs: tuple[OutputDiff, ...]
     diffs: tuple[RepositoryDiff, ...]
     comment: DiffComment
+    validations: tuple[OutputValidation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -701,6 +751,13 @@ class DiffCommentProcessor:
     outputs: Sequence[OutputSettings] = ()
     idcat: IdcatSettings | None = None
     commenter: IssueCommenter | None = None
+    validator: TreeValidator | None = None
+    """Validator each generated tree is reported on, absent without [validator].
+
+    A diff gates nothing, so a failed verdict goes into the comment rather than
+    into an error: what a reviewer needs is to see it before the merge that
+    would be refused by :class:`ChangeProcessor`.
+    """
 
     def diff(
         self,
@@ -777,6 +834,7 @@ class DiffCommentProcessor:
 
             output_diffs: list[OutputDiff] = []
             repository_diffs: list[RepositoryDiff] = []
+            validations: list[OutputValidation] = []
             total_generated = 0
 
             for repository, manifests_checkout in checkout_by_repository.items():
@@ -860,6 +918,12 @@ class DiffCommentProcessor:
                         )
                     )
                     total_generated += len(generated)
+                    if self.validator is not None:
+                        validations.append(
+                            _validate_generated_output(
+                                self.validator, output, manifests_checkout, report
+                            )
+                        )
 
                 repository_diff = _manifests_diff(manifests_checkout, base_commit)
                 repository_diffs.append(
@@ -895,6 +959,7 @@ class DiffCommentProcessor:
                 _diff_sections(repository_diffs),
                 full_diff_reference=FULL_DIFF_REFERENCE,
                 marker=marker,
+                validation=render_validation_summary(validations),
             )
             comment = self._comment(
                 repo, pull_request, comment_body.body, marker, report
@@ -907,6 +972,7 @@ class DiffCommentProcessor:
                 outputs=tuple(output_diffs),
                 diffs=tuple(repository_diffs),
                 comment=comment,
+                validations=tuple(validations),
             )
         except ChangeProcessingError:
             raise
@@ -1020,6 +1086,199 @@ class DiffCommentProcessor:
             diffs=(),
             comment=comment,
         )
+
+
+def _validate_generated_output(
+    validator: TreeValidator,
+    output: OutputSettings,
+    manifests_checkout: Path,
+    report: Callable[..., None],
+) -> OutputValidation:
+    """Have manifest-validator judge what one output generated.
+
+    The tree is the output's directory as it now stands, not the files this
+    commit happened to touch: the checks are about the manifests that will be
+    deployed, so an output a commit left alone is validated too. Repeating that
+    scan costs nothing beyond a request, because the validator keys its cache on
+    the content digest of exactly this tree.
+
+    A failure to reach a verdict is returned rather than raised, so that the
+    caller decides what it means: a change refuses to push, a diff says the scan
+    did not run and still reports the diff it came for.
+    """
+    tree = read_tree(manifests_checkout / output.directory)
+    if not tree:
+        logger.info(
+            "validation: output %s generated no files; nothing to validate",
+            output.name,
+        )
+        report(
+            "no-validation",
+            f"{output.name}: nothing generated to validate",
+            output=output.name,
+        )
+        return OutputValidation(output=output.name, checks=output.checks)
+
+    report(
+        "validate",
+        _validating_message(output, len(tree)),
+        output=output.name,
+        files=len(tree),
+        checks=list(output.checks),
+    )
+
+    def forward(phase: str, message: str) -> None:
+        report(phase, f"{output.name}: {message}", output=output.name)
+
+    try:
+        validation = validator.validate(tree, output.checks, progress=forward)
+    except ValidationError as exc:
+        logger.warning("validation of output %s did not happen: %s", output.name, exc)
+        report(
+            "validation-error",
+            f"{output.name}: {exc}",
+            output=output.name,
+            error=str(exc),
+        )
+        return OutputValidation(
+            output=output.name, checks=output.checks, error=str(exc)
+        )
+
+    logger.info(
+        "validation: output %s %s (%s, %d finding(s), cached: %s)",
+        output.name,
+        "passed" if validation.passed else "failed",
+        validation.digest,
+        len(validation.failing_findings),
+        validation.cached,
+    )
+    report(
+        "validated" if validation.passed else "validation-failed",
+        _validated_message(output, validation.passed, validation),
+        output=output.name,
+        passed=validation.passed,
+        digest=validation.digest,
+        cached=validation.cached,
+        verdicts=validation_payloads(validation),
+    )
+    return OutputValidation(
+        output=output.name, checks=output.checks, validation=validation
+    )
+
+
+def validation_payloads(validation: Validation) -> list[dict[str, Any]]:
+    """Describe a validation for a progress event or an API response."""
+    return [
+        {
+            "passed": verdict.passed,
+            "tool": verdict.tool,
+            "tool_version": verdict.tool_version,
+            "ruleset_digest": verdict.ruleset_digest,
+            "findings": [
+                {
+                    "rule_id": finding.rule_id,
+                    "severity": finding.severity,
+                    "file": finding.file,
+                    "resource": finding.resource,
+                    "message": finding.message,
+                    "similarity_id": finding.similarity_id,
+                    "accepted": finding.accepted,
+                }
+                for finding in verdict.findings
+            ],
+        }
+        for verdict in validation.verdicts
+    ]
+
+
+def output_validation_payloads(
+    validations: Sequence[OutputValidation],
+) -> list[dict[str, Any]]:
+    """Describe every output's validation for an API response."""
+    return [
+        {
+            "output": result.output,
+            "checks": list(result.checks),
+            "error": result.error,
+            "passed": (
+                result.validation.passed if result.validation is not None else None
+            ),
+            "digest": (
+                result.validation.digest if result.validation is not None else None
+            ),
+            "cached": (
+                result.validation.cached if result.validation is not None else None
+            ),
+            "verdicts": (
+                validation_payloads(result.validation)
+                if result.validation is not None
+                else []
+            ),
+        }
+        for result in validations
+    ]
+
+
+def _validating_message(output: OutputSettings, files: int) -> str:
+    checks = (
+        f"checks: {', '.join(output.checks)}" if output.checks else "default checks"
+    )
+    return f"validating {output.name}: {files} manifests, {checks}"
+
+
+def _validated_message(
+    output: OutputSettings, passed: bool, validation: Validation
+) -> str:
+    """Say what a verdict came to, in the terms someone fixing it needs."""
+    if passed:
+        accepted = validation.accepted_count
+        tolerated = f", {accepted} accepted" if accepted else ""
+        cached = " (cached)" if validation.cached else ""
+        return f"{output.name}: validation passed{tolerated}{cached}"
+    findings = validation.failing_findings
+    if not findings:
+        tools = join_names(
+            [verdict.tool for verdict in validation.failed_verdicts] or ["validation"]
+        )
+        return f"{output.name}: {tools} failed"
+    shown = "; ".join(_describe_finding(f) for f in findings[:MAX_REPORTED_FINDINGS])
+    remaining = len(findings) - MAX_REPORTED_FINDINGS
+    listed = shown if remaining <= 0 else f"{shown} and {remaining} more"
+    count = "1 finding" if len(findings) == 1 else f"{len(findings)} findings"
+    return f"{output.name}: validation failed, {count}: {listed}"
+
+
+def _describe_finding(finding: Finding) -> str:
+    where = f" in {finding.file}" if finding.file else ""
+    return f"{finding.severity} {finding.rule_id}{where}"
+
+
+def _validation_failure_message(validations: Sequence[OutputValidation]) -> str:
+    """Say why a change stopped, naming the output that stopped it.
+
+    What an earlier rollout stage already pushed stays pushed, so this reports on
+    the manifests that were not pushed rather than on the change as a whole.
+    """
+    failed = [result for result in validations if result.failed]
+    parts: list[str] = []
+    for result in failed:
+        if result.error is not None:
+            parts.append(f"{result.output}: no verdict ({result.error})")
+            continue
+        validation = result.validation
+        assert validation is not None
+        findings = validation.failing_findings
+        listed = "; ".join(
+            _describe_finding(f) for f in findings[:MAX_REPORTED_FINDINGS]
+        )
+        remaining = len(findings) - MAX_REPORTED_FINDINGS
+        if remaining > 0:
+            listed = f"{listed} and {remaining} more"
+        parts.append(f"{result.output}: {listed or 'failed with no findings reported'}")
+    return (
+        "manifest validation failed and the manifests it generated were not "
+        "pushed: " + "; ".join(parts)
+    )
 
 
 def _resolve_output_settings(

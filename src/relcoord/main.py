@@ -25,6 +25,7 @@ from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.retrying_store import RetryingImageInfoStore
 from relcoord.store import ImageInfoStore
 from relcoord.surreal_store import SurrealImageInfoStore
+from relcoord.validator import HttpTreeValidator
 from relcoord.version import version_summary
 
 DEFAULT_CONFIG_PATH = "/config/relcoord.toml"
@@ -97,6 +98,7 @@ def make_change_processor(
         rollouts=settings.rollouts,
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
+        validator=make_validator(settings),
     )
 
 
@@ -107,6 +109,25 @@ def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
         outputs=settings.outputs,
         idcat=settings.idcat,
         commenter=GithubIssueCommenter(idcat=settings.idcat),
+        validator=make_validator(settings),
+    )
+
+
+def make_validator(settings: Settings) -> HttpTreeValidator | None:
+    """Build the validator, for a deployment that configured one.
+
+    Without a [validator] section nothing is validated and nothing is gated,
+    which is what a deployment that has not adopted manifest-validator yet gets.
+    """
+    if settings.validator is None:
+        logger.warning(
+            "no [validator] configured; generated manifests are pushed unvalidated"
+        )
+        return None
+    logger.info("validating generated manifests with %s", settings.validator.url)
+    return HttpTreeValidator(
+        url=settings.validator.url,
+        timeout_seconds=settings.validator.timeout_seconds,
     )
 
 

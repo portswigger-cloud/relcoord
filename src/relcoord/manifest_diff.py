@@ -39,6 +39,8 @@ from dulwich.patch import write_tree_diff
 from dulwich.repo import Repo
 from manifest_builder import __version__ as MANIFEST_BUILDER_VERSION
 
+from relcoord.validator import Finding, OutputValidation
+
 logger = logging.getLogger(__name__)
 
 # GitHub rejects a longer issue comment body.
@@ -60,6 +62,8 @@ REBASE_REQUIRED_MESSAGE = (
     "conflicts, and push again to get an accurate diff of what merging would "
     "deploy."
 )
+# How many failing findings the comment tables before pointing at the response.
+MAX_VALIDATION_FINDINGS = 20
 COMMENT_MARKER_PREFIX = "relcoord:manifest-diff"
 
 _DIFF_FILE_HEADER = re.compile(r"^diff --git a/(?P<old>.*) b/(?P<new>.*)$")
@@ -525,6 +529,75 @@ class _RenderedSection:
     empty: bool
 
 
+def render_validation_summary(
+    validations: Sequence[OutputValidation],
+) -> str:
+    """Render manifest-validator's verdicts for the comment.
+
+    A line per output says what the verdict was, and a table carries the
+    findings that failed it. Accepted findings are counted rather than listed:
+    the verdict itself is where the reason each one was tolerated lives, and a
+    comment that led with them would bury the ones a reviewer has to act on.
+    """
+    if not validations:
+        return ""
+    lines = ["### Manifest validation", ""]
+    lines.extend(_validation_line(result) for result in validations)
+    findings = [
+        (result.output, finding)
+        for result in validations
+        if result.validation is not None
+        for finding in result.validation.failing_findings
+    ]
+    if findings:
+        lines.extend(["", *_findings_table(findings)])
+    return "\n".join(lines)
+
+
+def _validation_line(result: OutputValidation) -> str:
+    if result.error is not None:
+        return f"- `{result.output}` — **not validated**: {result.error}"
+    validation = result.validation
+    if validation is None:
+        return f"- `{result.output}` — nothing generated to validate"
+    tools = ", ".join(verdict.tool for verdict in validation.verdicts)
+    ran = f" ({tools})" if tools else ""
+    accepted = validation.accepted_count
+    tolerated = f", {accepted} accepted" if accepted else ""
+    if validation.passed:
+        return f"- `{result.output}` — passed{ran}{tolerated}"
+    failing = validation.failing_findings
+    count = "1 finding" if len(failing) == 1 else f"{len(failing)} findings"
+    return f"- `{result.output}` — **failed**{ran}: {count}{tolerated}"
+
+
+def _findings_table(findings: Sequence[tuple[str, Finding]]) -> list[str]:
+    shown = findings[:MAX_VALIDATION_FINDINGS]
+    rows = [
+        "| Output | Severity | Rule | File | Message |",
+        "| --- | --- | --- | --- | --- |",
+        *(
+            "| {} | {} | {} | {} | {} |".format(
+                output,
+                finding.severity,
+                _table_cell(finding.rule_id),
+                _table_cell(finding.file or ""),
+                _table_cell(finding.message),
+            )
+            for output, finding in shown
+        ),
+    ]
+    remaining = len(findings) - len(shown)
+    if remaining > 0:
+        rows.extend(["", f"_{remaining} further findings are in the response._"])
+    return rows
+
+
+def _table_cell(text: str) -> str:
+    """Keep a finding's own text from breaking the row it is rendered in."""
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
 def comment_marker() -> str:
     """The hidden line a comment carries so a later diff can find and edit it."""
     return f"<!-- {COMMENT_MARKER_PREFIX} -->"
@@ -546,14 +619,22 @@ def build_comment_body(
     *,
     full_diff_reference: str,
     marker: str | None = None,
+    validation: str = "",
 ) -> CommentBody:
     """Render the comment for one or more manifests repository diffs.
 
     The context diff is dropped altogether when a comment carrying it would be
     longer than GitHub accepts; ``omitted_context_diff`` reports whether the
     comment leaves the reader needing the full diff.
+
+    ``validation`` is manifest-validator's verdicts, rendered by
+    :func:`render_validation_summary`. It leads the comment: it is the part that
+    says whether this change can be merged at all, where the diff only says
+    what it would do.
     """
     preamble = [marker, ""] if marker is not None else []
+    if validation:
+        preamble.extend([validation, ""])
     metadata = [f"manifest-builder version: `{MANIFEST_BUILDER_VERSION}`"]
     rendered = [_render_section(section, full_diff_reference) for section in sections]
     if all(section.empty for section in rendered):

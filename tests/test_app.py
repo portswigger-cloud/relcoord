@@ -5,7 +5,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable, MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -27,6 +27,7 @@ from relcoord.change import (
     CredentialError,
     DeployConfigError,
     GitTransportError,
+    ManifestValidationError,
     ProgressSink,
     RolloutStageError,
     ignore_progress,
@@ -35,6 +36,7 @@ from relcoord.errors import PersistenceUnavailableError
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.models import RegisterResult
 from relcoord.store import ImageInfoStore
+from relcoord.validator import Finding, OutputValidation, Validation, Verdict
 
 
 @pytest.fixture
@@ -1502,6 +1504,7 @@ class _StubDiffResult:
     outputs: tuple[_StubOutputDiff, ...]
     diffs: tuple[_StubRepositoryDiff, ...]
     comment: _StubComment
+    validations: tuple[OutputValidation, ...] = ()
 
 
 def _stub_diff_result() -> _StubDiffResult:
@@ -1917,3 +1920,133 @@ def test_diffcomment_streams_a_terminal_error_event_when_processing_fails() -> N
         "error": "comment_post_failed",
         "message": "GitHub returned HTTP 403",
     }
+
+
+def test_diffcomment_reports_the_verdict_for_every_output() -> None:
+    failed = Validation(
+        passed=False,
+        digest="sha256:bad",
+        verdicts=(
+            Verdict(
+                passed=False,
+                tool="kics",
+                tool_version="v2.1.16",
+                ruleset_digest="sha256:rules",
+                findings=(
+                    Finding(
+                        rule_id="RBAC-1",
+                        severity="high",
+                        message="wildcard rule",
+                        file="example-prod/rbac.yaml",
+                    ),
+                ),
+            ),
+        ),
+    )
+    result = replace(
+        _stub_diff_result(),
+        validations=(
+            OutputValidation(
+                output="example-dev",
+                checks=("structural",),
+                validation=Validation(passed=True, digest="sha256:good"),
+            ),
+            OutputValidation(
+                output="example-prod", checks=("kics",), validation=failed
+            ),
+            OutputValidation(output="example-eu", error="connection refused"),
+        ),
+    )
+    client, _processor = _diff_client(_RecordingDiffProcessor(result=result))
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/config",
+            "commit": "deadbeef",
+            "pull_request": 7,
+        },
+    )
+
+    body = response.json()
+    assert body["message"] == (
+        "1 manifests repository would change, validation failed for example-prod "
+        "and example-eu, commented"
+    )
+    assert body["validations"][0] == {
+        "output": "example-dev",
+        "checks": ["structural"],
+        "error": None,
+        "passed": True,
+        "digest": "sha256:good",
+        "cached": False,
+        "verdicts": [],
+    }
+    assert body["validations"][1]["verdicts"] == [
+        {
+            "passed": False,
+            "tool": "kics",
+            "tool_version": "v2.1.16",
+            "ruleset_digest": "sha256:rules",
+            "findings": [
+                {
+                    "rule_id": "RBAC-1",
+                    "severity": "high",
+                    "file": "example-prod/rbac.yaml",
+                    "resource": None,
+                    "message": "wildcard rule",
+                    "similarity_id": None,
+                    "accepted": None,
+                }
+            ],
+        }
+    ]
+    assert body["validations"][2]["error"] == "connection refused"
+    assert body["validations"][2]["passed"] is None
+
+
+def test_change_reports_a_failed_validation_without_a_stack_trace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    message = (
+        "manifest validation failed, so nothing was pushed: "
+        "example-prod: high RBAC-1 in example-prod/rbac.yaml"
+    )
+
+    class Processor:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+            system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
+        ) -> object:
+            raise ManifestValidationError(message)
+
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=Processor(),
+        )
+    )
+    caplog.set_level(logging.WARNING, logger="relcoord.app")
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "https://github.com/acme/config.git",
+            "commit": "deadbeef",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": "manifest_validation_failed",
+        "message": message,
+    }
+    assert "Manifest validation stopped change" in caplog.text
+    assert "Traceback (most recent call last)" not in caplog.text

@@ -12,6 +12,8 @@ from dulwich.repo import Repo
 from relcoord.manifest_diff import (
     MANIFEST_BUILDER_VERSION,
     MAX_COMMENT_CHARS,
+    MAX_VALIDATION_FINDINGS,
+    NO_CHANGES_MESSAGE,
     DiffSection,
     ManifestDiff,
     build_comment_body,
@@ -20,7 +22,9 @@ from relcoord.manifest_diff import (
     filter_metadata_hunks,
     manifest_diff,
     markdown_fence,
+    render_validation_summary,
 )
+from relcoord.validator import Finding, OutputValidation, Validation, Verdict
 
 DEPLOYMENT = (
     "apiVersion: apps/v1\n"
@@ -539,3 +543,71 @@ def test_build_comment_body_carries_the_marker_as_a_hidden_first_line() -> None:
     )
 
     assert comment.body.startswith("<!-- relcoord:manifest-diff -->\n")
+
+
+def test_validation_summary_is_empty_without_any_validation() -> None:
+    assert render_validation_summary([]) == ""
+
+
+def test_validation_summary_tables_findings_and_points_at_the_response() -> None:
+    findings = tuple(
+        Finding(
+            rule_id=f"RULE-{index}",
+            severity="high",
+            message="a | pipe and\na newline",
+            file=f"prod/{index}.yaml",
+        )
+        for index in range(MAX_VALIDATION_FINDINGS + 2)
+    )
+    summary = render_validation_summary(
+        [
+            OutputValidation(
+                output="prod",
+                validation=Validation(
+                    passed=False,
+                    digest="sha256:bad",
+                    verdicts=(Verdict(passed=False, tool="kics", findings=findings),),
+                ),
+            )
+        ]
+    )
+
+    rows = [line for line in summary.splitlines() if line.startswith("| prod |")]
+    assert len(rows) == MAX_VALIDATION_FINDINGS
+    assert "a \\| pipe and a newline" in rows[0]
+    assert "_2 further findings are in the response._" in summary
+
+
+def test_validation_summary_leads_the_comment_body() -> None:
+    body = build_comment_body(
+        [
+            DiffSection(
+                heading=None, diff=ManifestDiff(stat="a.yaml | 1 +\n", diff="+a")
+            )
+        ],
+        full_diff_reference="returned in the response",
+        marker="<!-- relcoord:manifest-diff -->",
+        validation=render_validation_summary(
+            [
+                OutputValidation(
+                    output="dev",
+                    validation=Validation(passed=True, digest="sha256:good"),
+                )
+            ]
+        ),
+    ).body
+
+    assert body.index("Manifest validation") < body.index("a.yaml | 1 +")
+
+
+def test_validation_summary_appears_even_where_nothing_changed() -> None:
+    body = build_comment_body(
+        [],
+        full_diff_reference="returned in the response",
+        validation=render_validation_summary(
+            [OutputValidation(output="dev", error="connection refused")]
+        ),
+    ).body
+
+    assert "**not validated**: connection refused" in body
+    assert NO_CHANGES_MESSAGE in body
