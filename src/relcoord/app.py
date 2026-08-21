@@ -27,11 +27,13 @@ from relcoord.change import (
     CredentialError,
     DeployConfigError,
     GitTransportError,
+    ManifestValidationError,
     ProgressSink,
     RolloutStageError,
     ignore_progress,
     join_names,
     object_ref_payloads,
+    output_validation_payloads,
     short_commit,
     short_repo,
 )
@@ -693,11 +695,20 @@ def _diff_summary(payload: dict[str, Any]) -> str:
     changed = sum(1 for diff in payload["diffs"] if diff["diff"].strip())
     comment = payload["comment"]
     posted = comment is not None and comment["posted"]
-    if not changed:
-        return "no manifest changes" + (", commented" if posted else "")
-    repositories = "repository" if changed == 1 else "repositories"
-    summary = f"{changed} manifests {repositories} would change"
-    return f"{summary}, commented" if posted else summary
+    parts = ["no manifest changes"]
+    if changed:
+        repositories = "repository" if changed == 1 else "repositories"
+        parts = [f"{changed} manifests {repositories} would change"]
+    failed = [
+        entry["output"]
+        for entry in payload["validations"]
+        if entry["passed"] is False or entry["error"] is not None
+    ]
+    if failed:
+        parts.append(f"validation failed for {join_names(failed)}")
+    if posted:
+        parts.append("commented")
+    return ", ".join(parts)
 
 
 def _diff_result_payload(result: object) -> dict[str, Any]:
@@ -721,6 +732,7 @@ def _diff_result_payload(result: object) -> dict[str, Any]:
             }
             for entry in getattr(result, "diffs", ())
         ],
+        "validations": output_validation_payloads(getattr(result, "validations", ())),
         "comment": _comment_payload(getattr(result, "comment", None)),
     }
 
@@ -848,6 +860,15 @@ def _report_processing_failure(
             exc,
         )
         return 502, "git_transport_failed", str(exc)
+    if isinstance(exc, ManifestValidationError):
+        logger.warning(
+            "Manifest validation stopped %s for repo %s at commit %s: %s",
+            action,
+            repo,
+            commit,
+            exc,
+        )
+        return 422, "manifest_validation_failed", str(exc)
     if isinstance(exc, RolloutStageError):
         logger.warning(
             "Rollout stopped while processing %s for repo %s at commit %s: %s",

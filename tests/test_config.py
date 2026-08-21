@@ -1115,3 +1115,104 @@ def test_settings_reject_a_rollout_that_is_not_a_table(tmp_path: Path) -> None:
 
     with pytest.raises(TypeError, match="each rollout entry must be a table"):
         Settings.from_toml(config)
+
+
+def test_settings_parse_the_validator_and_the_checks_each_output_wants(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [validator]
+        url = "http://manifest-validator:8080"
+        timeout-seconds = 300
+
+        [[output]]
+        name = "platform-dev"
+        repository = "https://github.com/acme/manifests"
+        checks = ["structural", "image-policy"]
+
+        [[output]]
+        name = "platform-prod"
+        repository = "https://github.com/acme/manifests"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.validator is not None
+    assert settings.validator.url == "http://manifest-validator:8080"
+    assert settings.validator.timeout_seconds == 300
+    assert settings.outputs[0].checks == ("structural", "image-policy")
+    assert settings.outputs[1].checks == ()
+
+
+def test_settings_default_to_no_validator(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('manifests-repository = "https://github.com/acme/manifests"\n')
+
+    assert Settings.from_toml(config).validator is None
+
+
+def test_settings_default_the_validator_timeout(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('[validator]\nurl = "http://manifest-validator:8080"\n')
+
+    settings = Settings.from_toml(config)
+
+    assert settings.validator is not None
+    assert settings.validator.timeout_seconds == 900
+
+
+def test_settings_reject_a_validator_without_a_url(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("[validator]\ntimeout-seconds = 300\n")
+
+    with pytest.raises(ValueError, match="validator.url must be a non-empty string"):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_a_validator_timeout_that_is_not_positive(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('[validator]\nurl = "http://v"\ntimeout-seconds = 0\n')
+
+    with pytest.raises(ValueError, match="must be greater than zero"):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_checks_with_no_validator_to_run_them(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "platform-dev"
+        repository = "https://github.com/acme/manifests"
+        checks = ["structural"]
+        """
+    )
+
+    with pytest.raises(ValueError, match="output.checks requires a \\[validator\\]"):
+        Settings.from_toml(config)
+
+
+@pytest.mark.parametrize("checks", ["[]", '""', '[""]', '"structural"'])
+def test_settings_reject_checks_that_are_not_a_list_of_names(
+    tmp_path: Path, checks: str
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        f"""
+        [validator]
+        url = "http://v"
+
+        [[output]]
+        name = "platform-dev"
+        repository = "https://github.com/acme/manifests"
+        checks = {checks}
+        """
+    )
+
+    with pytest.raises(ValueError, match="output.checks must be a non-empty array"):
+        Settings.from_toml(config)

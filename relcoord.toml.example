@@ -19,6 +19,17 @@ system-repository = "https://github.com/example/system"
 name = "example-dev"
 repository = "https://github.com/example/manifests"
 directory = "example-dev"
+# manifest-validator checks this output's generated tree is validated with.
+# Names only: the rulesets, tool versions and the pass/fail decision are
+# manifest-validator's own configuration. Omit this to use whatever that service
+# defaults to, which is worth confirming rather than assuming. Requires
+# [validator], below.
+#
+# Give every output the same checks. This is per output because each output is a
+# separate tree and so a separate scan, not because dev should be held to less:
+# a rule dev is exempt from fails for the first time on the way to prod, and
+# scanning the same rules on dev first is the whole early warning.
+checks = ["structural", "image-policy", "kics"]
 # How relcoord reaches the cluster this output is deployed to. This must be
 # explicit when deployment detection is enabled: "eks" uses ambient AWS
 # credentials; "local" uses the service account of relcoord's own cluster.
@@ -46,6 +57,7 @@ name = "example-prod"
 repository = "https://github.com/example/manifests"
 directory = "example-prod"
 target = "prod"
+checks = ["structural", "image-policy", "kics"]
 connection-type = "eks"
 api-endpoint = "https://EXAMPLEPRODCLUSTERID.gr7.eu-west-1.eks.amazonaws.com"
 ca-path = "/etc/relcoord/example-prod-ca.pem"
@@ -88,6 +100,16 @@ issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEPRODCLUSTERID"
 #     --query 'cluster.{endpoint:endpoint,ca:certificateAuthority.data}'
 #
 # The CA is base64 in that output; ca-path points at the decoded PEM.
+
+# Where manifest-validator is. With this section every generated tree is
+# validated before it is pushed, and a tree that fails, or a validator that
+# cannot be reached, fails the change: relcoord pushes on a green verdict and on
+# nothing else. A diff comments the verdict instead of gating on it. Without this
+# section nothing is validated.
+[validator]
+url = "http://manifest-validator.platform.svc:8080"
+# How long a scan may take. A cold kics run over a large tree is the slow case.
+timeout-seconds = 900
 
 [persistence]
 backend = "surrealdb"
