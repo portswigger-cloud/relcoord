@@ -64,6 +64,10 @@ REBASE_REQUIRED_MESSAGE = (
 )
 # How many failing findings the comment tables before pointing at the response.
 MAX_VALIDATION_FINDINGS = 20
+ADVISORY_CHECKS_MESSAGE = (
+    "Reported for information. No promotion is gated on these, so a finding here "
+    "does not stop this change from being merged and deployed."
+)
 COMMENT_MARKER_PREFIX = "relcoord:manifest-diff"
 
 _DIFF_FILE_HEADER = re.compile(r"^diff --git a/(?P<old>.*) b/(?P<new>.*)$")
@@ -538,11 +542,34 @@ def render_validation_summary(
     findings that failed it. Accepted findings are counted rather than listed:
     the verdict itself is where the reason each one was tolerated lives, and a
     comment that led with them would bury the ones a reviewer has to act on.
+
+    Advisory checks are rendered under their own heading, because a reviewer who
+    reads a failing verdict reasonably assumes the merge is blocked, and for
+    these it is not. Whether a finding stops a promotion is the first thing the
+    comment has to be unambiguous about.
     """
     if not validations:
         return ""
+    gated = [result for result in validations if result.gated]
+    advisory = [result for result in validations if not result.gated]
     lines = ["### Manifest validation", ""]
-    lines.extend(_validation_line(result) for result in validations)
+    lines.extend(_validation_section(gated))
+    if advisory:
+        lines.extend(
+            [
+                "",
+                "#### Advisory checks",
+                "",
+                ADVISORY_CHECKS_MESSAGE,
+                "",
+                *_validation_section(advisory),
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _validation_section(validations: Sequence[OutputValidation]) -> list[str]:
+    lines = [_validation_line(result) for result in validations]
     findings = [
         (result.output, finding)
         for result in validations
@@ -551,7 +578,7 @@ def render_validation_summary(
     ]
     if findings:
         lines.extend(["", *_findings_table(findings)])
-    return "\n".join(lines)
+    return lines
 
 
 def _validation_line(result: OutputValidation) -> str:
@@ -568,7 +595,8 @@ def _validation_line(result: OutputValidation) -> str:
         return f"- `{result.output}` — passed{ran}{tolerated}"
     failing = validation.failing_findings
     count = "1 finding" if len(failing) == 1 else f"{len(failing)} findings"
-    return f"- `{result.output}` — **failed**{ran}: {count}{tolerated}"
+    verdict = "**failed**" if result.gated else "reported"
+    return f"- `{result.output}` — {verdict}{ran}: {count}{tolerated}"
 
 
 def _findings_table(findings: Sequence[tuple[str, Finding]]) -> list[str]:

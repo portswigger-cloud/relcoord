@@ -1976,6 +1976,7 @@ def test_diffcomment_reports_the_verdict_for_every_output() -> None:
     assert body["validations"][0] == {
         "output": "example-dev",
         "checks": ["structural"],
+        "gated": True,
         "error": None,
         "passed": True,
         "digest": "sha256:good",

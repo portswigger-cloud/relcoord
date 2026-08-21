@@ -190,12 +190,20 @@ class OutputSettings:
     region: str | None = None
     eks_cluster_name: str | None = None
     checks: tuple[str, ...] = ()
-    """manifest-validator checks this output's generated tree is validated with.
+    """manifest-validator checks a promotion of this output is gated on.
 
     Names only, and empty means the checks that service defaults to; relcoord
     never learns what any of them do. This is per output because each output is
     a separate tree and so a separate scan, and not so that a dev output can be
     held to less than the prod one it warns about.
+    """
+    preview_checks: tuple[str, ...] = ()
+    """Checks a diff reports for this output and no promotion is gated on.
+
+    Somewhere to put a check whose findings nobody has triaged yet: the pull
+    request shows what it would say while merging stays possible, so the
+    findings can be worked through before the check earns a place in ``checks``.
+    A check left here indefinitely is one nobody is acting on.
     """
 
     @property
@@ -250,7 +258,8 @@ class OutputSettings:
             ca_path=Path(ca_path) if ca_path is not None else None,
             region=_optional_output_string(data, "region"),
             eks_cluster_name=_optional_output_string(data, "eks-cluster-name"),
-            checks=_output_checks(data),
+            checks=_output_checks(data, "checks"),
+            preview_checks=_output_checks(data, "preview-checks"),
         )
 
 
@@ -554,13 +563,27 @@ def _check_validated_outputs(
     Naming checks and getting no scan is the worst of the two mistakes this can
     be, so it is a startup error rather than a line in the log.
     """
+    both = [
+        output.name
+        for output in outputs
+        if set(output.checks) & set(output.preview_checks)
+    ]
+    if both:
+        raise ValueError(
+            "a check cannot be in both checks and preview-checks; "
+            f"{', '.join(sorted(both))} names one in each, and a gated check is "
+            "already reported"
+        )
     if validator is not None:
         return
-    named = [output.name for output in outputs if output.checks]
+    named = [
+        output.name for output in outputs if output.checks or output.preview_checks
+    ]
     if named:
         raise ValueError(
-            "output.checks requires a [validator] section; "
-            f"{', '.join(sorted(named))} names checks with no validator configured"
+            "output.checks and output.preview-checks require a [validator] "
+            f"section; {', '.join(sorted(named))} names checks with no validator "
+            "configured"
         )
 
 
@@ -639,16 +662,17 @@ def _required_output_directory(data: dict[str, Any]) -> Path:
     return directory
 
 
-def _output_checks(data: dict[str, Any]) -> tuple[str, ...]:
-    value = data.get("checks")
+def _output_checks(data: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = data.get(key)
     if value is None:
         return ()
+    message = f"output.{key} must be a non-empty array of check names"
     if not isinstance(value, list) or not value:
-        raise ValueError("output.checks must be a non-empty array of check names")
+        raise ValueError(message)
     names: list[str] = []
     for name in value:
         if not isinstance(name, str) or not name.strip():
-            raise ValueError("output.checks must be a non-empty array of check names")
+            raise ValueError(message)
         names.append(name)
     return tuple(names)
 

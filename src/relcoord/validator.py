@@ -384,16 +384,26 @@ class OutputValidation:
     ``error`` carries the reason there is no ``validation``, which only a diff
     reports: a change that cannot get a verdict fails rather than pushing.
     Neither means there was nothing to validate.
+
+    ``gated`` is false for the checks a diff reports and no promotion is held to,
+    which is what keeps an advisory verdict from reading as a refused merge.
     """
 
     output: str
     checks: tuple[str, ...] = ()
     validation: Validation | None = None
     error: str | None = None
+    gated: bool = True
 
     @property
     def failed(self) -> bool:
-        """Whether this output must not be pushed."""
+        """Whether this output must not be pushed.
+
+        Always false for an advisory verdict: nothing is gated on it, so it can
+        report a finding without stopping anything.
+        """
+        if not self.gated:
+            return False
         if self.error is not None:
             return True
         return self.validation is not None and not self.validation.passed

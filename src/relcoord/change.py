@@ -919,8 +919,8 @@ class DiffCommentProcessor:
                     )
                     total_generated += len(generated)
                     if self.validator is not None:
-                        validations.append(
-                            _validate_generated_output(
+                        validations.extend(
+                            _validate_for_diff(
                                 self.validator, output, manifests_checkout, report
                             )
                         )
@@ -1093,6 +1093,9 @@ def _validate_generated_output(
     output: OutputSettings,
     manifests_checkout: Path,
     report: Callable[..., None],
+    *,
+    checks: tuple[str, ...] | None = None,
+    gated: bool = True,
 ) -> OutputValidation:
     """Have manifest-validator judge what one output generated.
 
@@ -1102,10 +1105,17 @@ def _validate_generated_output(
     scan costs nothing beyond a request, because the validator keys its cache on
     the content digest of exactly this tree.
 
+    ``checks`` defaults to the checks a promotion is gated on. A diff also asks
+    for the output's preview checks, as a separate request rather than as extra
+    names on this one, because a verdict names the tool that produced it and not
+    the configured check that asked for it: two requests is what lets relcoord
+    say which verdicts are gated without reading anything into a tool name.
+
     A failure to reach a verdict is returned rather than raised, so that the
     caller decides what it means: a change refuses to push, a diff says the scan
     did not run and still reports the diff it came for.
     """
+    requested = output.checks if checks is None else checks
     tree = read_tree(manifests_checkout / output.directory)
     if not tree:
         logger.info(
@@ -1117,21 +1127,22 @@ def _validate_generated_output(
             f"{output.name}: nothing generated to validate",
             output=output.name,
         )
-        return OutputValidation(output=output.name, checks=output.checks)
+        return OutputValidation(output=output.name, checks=requested, gated=gated)
 
     report(
         "validate",
-        _validating_message(output, len(tree)),
+        _validating_message(output, len(tree), requested, gated),
         output=output.name,
         files=len(tree),
-        checks=list(output.checks),
+        checks=list(requested),
+        gated=gated,
     )
 
     def forward(phase: str, message: str) -> None:
         report(phase, f"{output.name}: {message}", output=output.name)
 
     try:
-        validation = validator.validate(tree, output.checks, progress=forward)
+        validation = validator.validate(tree, requested, progress=forward)
     except ValidationError as exc:
         logger.warning("validation of output %s did not happen: %s", output.name, exc)
         report(
@@ -1141,7 +1152,7 @@ def _validate_generated_output(
             error=str(exc),
         )
         return OutputValidation(
-            output=output.name, checks=output.checks, error=str(exc)
+            output=output.name, checks=requested, error=str(exc), gated=gated
         )
 
     logger.info(
@@ -1154,16 +1165,46 @@ def _validate_generated_output(
     )
     report(
         "validated" if validation.passed else "validation-failed",
-        _validated_message(output, validation.passed, validation),
+        _validated_message(output, validation.passed, validation, gated),
         output=output.name,
         passed=validation.passed,
         digest=validation.digest,
         cached=validation.cached,
+        gated=gated,
         verdicts=validation_payloads(validation),
     )
     return OutputValidation(
-        output=output.name, checks=output.checks, validation=validation
+        output=output.name, checks=requested, validation=validation, gated=gated
     )
+
+
+def _validate_for_diff(
+    validator: TreeValidator,
+    output: OutputSettings,
+    manifests_checkout: Path,
+    report: Callable[..., None],
+) -> tuple[OutputValidation, ...]:
+    """Report what both sets of checks say about one output, gating neither.
+
+    The gated checks are reported so a reviewer sees what a merge will be held
+    to, and the preview checks so they see what is being trialled without it
+    reading as a refused merge.
+    """
+    results = [
+        _validate_generated_output(validator, output, manifests_checkout, report)
+    ]
+    if output.preview_checks:
+        results.append(
+            _validate_generated_output(
+                validator,
+                output,
+                manifests_checkout,
+                report,
+                checks=output.preview_checks,
+                gated=False,
+            )
+        )
+    return tuple(results)
 
 
 def validation_payloads(validation: Validation) -> list[dict[str, Any]]:
@@ -1199,6 +1240,7 @@ def output_validation_payloads(
         {
             "output": result.output,
             "checks": list(result.checks),
+            "gated": result.gated,
             "error": result.error,
             "passed": (
                 result.validation.passed if result.validation is not None else None
@@ -1219,17 +1261,22 @@ def output_validation_payloads(
     ]
 
 
-def _validating_message(output: OutputSettings, files: int) -> str:
-    checks = (
-        f"checks: {', '.join(output.checks)}" if output.checks else "default checks"
-    )
-    return f"validating {output.name}: {files} manifests, {checks}"
+def _validating_message(
+    output: OutputSettings, files: int, requested: Sequence[str], gated: bool
+) -> str:
+    checks = f"checks: {', '.join(requested)}" if requested else "default checks"
+    advisory = "" if gated else ", advisory"
+    return f"validating {output.name}: {files} manifests, {checks}{advisory}"
 
 
 def _validated_message(
-    output: OutputSettings, passed: bool, validation: Validation
+    output: OutputSettings, passed: bool, validation: Validation, gated: bool = True
 ) -> str:
     """Say what a verdict came to, in the terms someone fixing it needs."""
+    if not gated and not passed:
+        findings = validation.failing_findings
+        count = "1 finding" if len(findings) == 1 else f"{len(findings)} findings"
+        return f"{output.name}: advisory checks reported {count}, not gated"
     if passed:
         accepted = validation.accepted_count
         tolerated = f", {accepted} accepted" if accepted else ""

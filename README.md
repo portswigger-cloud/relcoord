@@ -113,13 +113,15 @@ timeout-seconds = 900
 name = "example-dev"
 repository = "https://github.com/example/manifests"
 directory = "example-dev"
-checks = ["structural", "image-policy", "kics"]
+checks = ["structural", "image-policy"]
+preview-checks = ["kics"]
 
 [[output]]
 name = "example-prod"
 repository = "https://github.com/example/manifests"
 directory = "example-prod"
-checks = ["structural", "image-policy", "kics"]
+checks = ["structural", "image-policy"]
+preview-checks = ["kics"]
 ```
 
 One output is one tree is one validation, so promoting to `example-dev` scans
@@ -133,6 +135,19 @@ should differ.
 An output that names no `checks` is validated with whatever manifest-validator
 configured as its defaults — worth checking rather than assuming, since a
 service with no check marked `default = true` would then run none.
+
+`preview-checks` is for a check whose findings nobody has triaged yet. A diff
+reports it and no promotion is gated on it, so the pull request shows what the
+check would say while merging stays possible, and the findings can be worked
+through before it earns a place in `checks`. A diff asks for the two sets in two
+requests rather than one, because a verdict names the tool that produced it and
+not the check that asked for it: two requests is what lets relcoord say which
+verdicts a merge is held to without reading anything into a tool name.
+
+The comment renders them under their own heading, saying plainly that nothing is
+gated on them — a reviewer who reads a failing verdict otherwise assumes the
+merge is blocked, and for these it is not. A check that sits in `preview-checks`
+indefinitely is one nobody is acting on; it belongs in `checks` or in neither.
 
 `checks` are names and nothing else. Which tools run, their versions, the
 rulesets and the pass/fail decision are manifest-validator's configuration,
@@ -161,9 +176,10 @@ is what a deployment that has not adopted manifest-validator gets. Naming
 a line in the log.
 
 `validations` in the `/v1/diffcomment` response carries every output's verdict:
-its `checks`, the content `digest` that was scanned, whether the verdict was
-`cached`, and each check's findings with the `tool_version` and `ruleset_digest`
-that produced them. A finding whose `accepted` is set did not fail the verdict,
+its `checks`, whether a promotion is `gated` on them, the content `digest` that
+was scanned, whether the verdict was `cached`, and each check's findings with the
+`tool_version` and `ruleset_digest` that produced them. An output with
+`preview-checks` has two entries, one per set. A finding whose `accepted` is set did not fail the verdict,
 and says why.
 
 

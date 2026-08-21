@@ -86,10 +86,12 @@ class Validator:
         self,
         verdicts: Mapping[str, Validation | Exception] | None = None,
         default: Validation | Exception = PASSED,
+        by_checks: Mapping[tuple[str, ...], Validation | Exception] | None = None,
     ) -> None:
         self.calls: list[tuple[tuple[str, ...], dict[str, bytes]]] = []
         self._verdicts = dict(verdicts or {})
         self._default = default
+        self._by_checks = dict(by_checks or {})
 
     def validate(
         self,
@@ -100,7 +102,9 @@ class Validator:
     ) -> Validation:
         self.calls.append((tuple(checks), dict(files)))
         progress("running", f"kics: {len(files)} files")
-        answer = self._verdicts.get(_output_of(files), self._default)
+        answer = self._by_checks.get(
+            tuple(checks), self._verdicts.get(_output_of(files), self._default)
+        )
         if isinstance(answer, Exception):
             raise answer
         return answer
@@ -376,3 +380,87 @@ def test_a_diff_without_a_validator_says_nothing_about_validation(
 
     assert result.validations == ()
     assert "Manifest validation" not in commenter.bodies[0]
+
+
+PREVIEW = OutputSettings(
+    name="acme-dev",
+    repository=MANIFESTS_REPO,
+    directory=Path("acme-dev"),
+    checks=("structural",),
+    preview_checks=("kics",),
+)
+
+
+def test_a_change_is_gated_on_the_gated_checks_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preview check cannot stop a promotion, however it answers."""
+    pushed: list[str] = []
+    _fake_git(monkeypatch, tmp_path, pushed=pushed)
+    validator = Validator(by_checks={("kics",): FAILED})
+
+    ChangeProcessor(outputs=[PREVIEW], validator=validator).process(
+        CONFIG_REPO, "deadbeef", None
+    )
+
+    assert [checks for checks, _ in validator.calls] == [("structural",)]
+    assert pushed == [MANIFESTS_REPO]
+
+
+def test_a_diff_reports_the_preview_checks_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(monkeypatch, tmp_path)
+    commenter = Commenter()
+    validator = Validator({"acme-dev": PASSED}, default=PASSED)
+
+    result = DiffCommentProcessor(
+        outputs=[PREVIEW], commenter=commenter, validator=validator
+    ).diff(CONFIG_REPO, "deadbeef", pull_request=7)
+
+    assert [checks for checks, _ in validator.calls] == [("structural",), ("kics",)]
+    assert [entry.gated for entry in result.validations] == [True, False]
+
+
+def test_a_failing_preview_check_reads_as_advisory_not_as_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(monkeypatch, tmp_path)
+    commenter = Commenter()
+
+    result = DiffCommentProcessor(
+        outputs=[PREVIEW],
+        commenter=commenter,
+        validator=Validator(by_checks={("kics",): FAILED}),
+    ).diff(CONFIG_REPO, "deadbeef", pull_request=7)
+
+    assert [entry.failed for entry in result.validations] == [False, False]
+    body = commenter.bodies[0]
+    assert "#### Advisory checks" in body
+    assert "does not stop this change from being merged" in body
+    assert "- `acme-dev` — reported (kics): 1 finding" in body
+    assert "**failed**" not in body
+
+
+def test_an_advisory_verdict_says_so_in_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(monkeypatch, tmp_path)
+    events: list[ChangeProgress] = []
+
+    DiffCommentProcessor(
+        outputs=[PREVIEW],
+        commenter=Commenter(),
+        validator=Validator(by_checks={("kics",): FAILED}),
+    ).diff(CONFIG_REPO, "deadbeef", pull_request=7, progress=events.append)
+
+    messages = [event.message for event in events if event.phase == "validate"]
+    assert messages == [
+        "validating acme-dev: 1 manifests, checks: structural",
+        "validating acme-dev: 1 manifests, checks: kics, advisory",
+    ]
+    failures = [event for event in events if event.phase == "validation-failed"]
+    assert failures[-1].message == (
+        "acme-dev: advisory checks reported 1 finding, not gated"
+    )
+    assert failures[-1].detail["gated"] is False

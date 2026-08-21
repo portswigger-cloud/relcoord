@@ -1193,7 +1193,7 @@ def test_settings_reject_checks_with_no_validator_to_run_them(tmp_path: Path) ->
         """
     )
 
-    with pytest.raises(ValueError, match="output.checks requires a \\[validator\\]"):
+    with pytest.raises(ValueError, match="require a \\[validator\\] section"):
         Settings.from_toml(config)
 
 
@@ -1215,4 +1215,80 @@ def test_settings_reject_checks_that_are_not_a_list_of_names(
     )
 
     with pytest.raises(ValueError, match="output.checks must be a non-empty array"):
+        Settings.from_toml(config)
+
+
+def test_settings_parse_the_preview_checks_an_output_is_not_gated_on(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [validator]
+        url = "http://v"
+
+        [[output]]
+        name = "platform-dev"
+        repository = "https://github.com/acme/manifests"
+        checks = ["structural"]
+        preview-checks = ["kics"]
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.outputs[0].checks == ("structural",)
+    assert settings.outputs[0].preview_checks == ("kics",)
+
+
+def test_settings_default_to_no_preview_checks(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [validator]
+        url = "http://v"
+
+        [[output]]
+        name = "platform-dev"
+        repository = "https://github.com/acme/manifests"
+        checks = ["structural"]
+        """
+    )
+
+    assert Settings.from_toml(config).outputs[0].preview_checks == ()
+
+
+def test_settings_reject_a_check_that_is_both_gated_and_preview(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [validator]
+        url = "http://v"
+
+        [[output]]
+        name = "platform-dev"
+        repository = "https://github.com/acme/manifests"
+        checks = ["structural", "kics"]
+        preview-checks = ["kics"]
+        """
+    )
+
+    with pytest.raises(ValueError, match="cannot be in both checks and preview-checks"):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_preview_checks_with_no_validator(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "platform-dev"
+        repository = "https://github.com/acme/manifests"
+        preview-checks = ["kics"]
+        """
+    )
+
+    with pytest.raises(ValueError, match="require a \\[validator\\] section"):
         Settings.from_toml(config)
