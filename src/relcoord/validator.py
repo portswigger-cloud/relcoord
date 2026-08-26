@@ -76,9 +76,26 @@ class Verdict:
     tool_version: str = ""
     ruleset_digest: str = ""
     findings: tuple[Finding, ...] = ()
+    advisory: bool = False
+    """Whether the validator reports this check without gating on it.
+
+    ``passed`` is already true for an advisory check, so nothing here changes
+    what relcoord pushes. It matters only for what a comment says: findings that
+    stopped nothing have to read that way, or a reviewer assumes their merge is
+    blocked.
+    """
 
     @property
     def failing_findings(self) -> tuple[Finding, ...]:
+        """Findings that fail the verdict, which an advisory check has none of."""
+        if self.advisory:
+            return ()
+        return tuple(finding for finding in self.findings if finding.fails)
+
+    @property
+    def advisory_findings(self) -> tuple[Finding, ...]:
+        if not self.advisory:
+            return ()
         return tuple(finding for finding in self.findings if finding.fails)
 
 
@@ -99,6 +116,14 @@ class Validation:
     def failing_findings(self) -> tuple[Finding, ...]:
         return tuple(
             finding for verdict in self.verdicts for finding in verdict.failing_findings
+        )
+
+    @property
+    def advisory_findings(self) -> tuple[Finding, ...]:
+        return tuple(
+            finding
+            for verdict in self.verdicts
+            for finding in verdict.advisory_findings
         )
 
     @property
@@ -344,6 +369,7 @@ def _verdict_from_payload(payload: Mapping[str, Any]) -> Verdict:
     findings = raw_findings if isinstance(raw_findings, list) else []
     return Verdict(
         passed=bool(payload.get("passed")),
+        advisory=bool(payload.get("advisory")),
         tool=_string(payload, "tool"),
         tool_version=_string(payload, "tool_version"),
         ruleset_digest=_string(payload, "ruleset_digest"),

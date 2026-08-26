@@ -1114,7 +1114,7 @@ def _validate_generated_output(
         )
         report(
             "no-validation",
-            f"{output.name}: nothing generated to validate",
+            f"{output.name}: nothing to validate",
             output=output.name,
         )
         return OutputValidation(output=output.name, checks=output.checks)
@@ -1171,6 +1171,7 @@ def validation_payloads(validation: Validation) -> list[dict[str, Any]]:
     return [
         {
             "passed": verdict.passed,
+            "advisory": verdict.advisory,
             "tool": verdict.tool,
             "tool_version": verdict.tool_version,
             "ruleset_digest": verdict.ruleset_digest,
@@ -1220,21 +1221,24 @@ def output_validation_payloads(
 
 
 def _validating_message(output: OutputSettings, files: int) -> str:
-    checks = (
-        f"checks: {', '.join(output.checks)}" if output.checks else "default checks"
-    )
+    checks = ", ".join(output.checks) if output.checks else "default checks"
     return f"validating {output.name}: {files} manifests, {checks}"
 
 
 def _validated_message(
     output: OutputSettings, passed: bool, validation: Validation
 ) -> str:
-    """Say what a verdict came to, in the terms someone fixing it needs."""
+    """Say what the verdict was, in the terms someone fixing it needs."""
     if passed:
-        accepted = validation.accepted_count
-        tolerated = f", {accepted} accepted" if accepted else ""
+        parts = []
+        if validation.accepted_count:
+            parts.append(f"{validation.accepted_count} accepted")
+        advisory = len(validation.advisory_findings)
+        if advisory:
+            parts.append(f"{advisory} advisory")
+        reported = f", {', '.join(parts)}" if parts else ""
         cached = " (cached)" if validation.cached else ""
-        return f"{output.name}: validation passed{tolerated}{cached}"
+        return f"{output.name}: passed{reported}{cached}"
     findings = validation.failing_findings
     if not findings:
         tools = join_names(
@@ -1244,8 +1248,7 @@ def _validated_message(
     shown = "; ".join(_describe_finding(f) for f in findings[:MAX_REPORTED_FINDINGS])
     remaining = len(findings) - MAX_REPORTED_FINDINGS
     listed = shown if remaining <= 0 else f"{shown} and {remaining} more"
-    count = "1 finding" if len(findings) == 1 else f"{len(findings)} findings"
-    return f"{output.name}: validation failed, {count}: {listed}"
+    return f"{output.name}: failed, {listed}"
 
 
 def _describe_finding(finding: Finding) -> str:
@@ -1263,7 +1266,7 @@ def _validation_failure_message(validations: Sequence[OutputValidation]) -> str:
     parts: list[str] = []
     for result in failed:
         if result.error is not None:
-            parts.append(f"{result.output}: no verdict ({result.error})")
+            parts.append(f"{result.output}: no verdict, {result.error}")
             continue
         validation = result.validation
         assert validation is not None
@@ -1274,11 +1277,8 @@ def _validation_failure_message(validations: Sequence[OutputValidation]) -> str:
         remaining = len(findings) - MAX_REPORTED_FINDINGS
         if remaining > 0:
             listed = f"{listed} and {remaining} more"
-        parts.append(f"{result.output}: {listed or 'failed with no findings reported'}")
-    return (
-        "manifest validation failed and the manifests it generated were not "
-        "pushed: " + "; ".join(parts)
-    )
+        parts.append(f"{result.output}: {listed or 'failed, no findings reported'}")
+    return "manifest validation failed, nothing pushed: " + "; ".join(parts)
 
 
 def _resolve_output_settings(

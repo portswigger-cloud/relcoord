@@ -292,10 +292,10 @@ def test_a_change_reports_the_validation_it_ran_as_progress(
     assert phases.index("validated") < phases.index("push")
     by_phase = {event.phase: event for event in events}
     assert by_phase["validate"].message == (
-        "validating acme-dev: 1 manifests, checks: structural, kics-dev"
+        "validating acme-dev: 1 manifests, structural, kics-dev"
     )
     assert by_phase["running"].message == "acme-dev: kics: 1 files"
-    assert by_phase["validated"].message == "acme-dev: validation passed"
+    assert by_phase["validated"].message == "acme-dev: passed"
     assert by_phase["validated"].detail["digest"] == "sha256:good"
 
 
@@ -360,7 +360,7 @@ def test_a_diff_still_reports_the_diff_when_the_validator_is_unreachable(
 
     assert result.diffs[0].manifest_diff.diff == "+api"
     assert result.validations[0].error == "connection refused"
-    assert "**not validated**: connection refused" in commenter.bodies[0]
+    assert "no verdict: connection refused" in commenter.bodies[0]
     assert "api.yaml | 1 +" in commenter.bodies[0]
 
 
@@ -376,3 +376,64 @@ def test_a_diff_without_a_validator_says_nothing_about_validation(
 
     assert result.validations == ()
     assert "Manifest validation" not in commenter.bodies[0]
+
+
+ADVISORY = Validation(
+    passed=True,
+    digest="sha256:advisory",
+    verdicts=(
+        Verdict(passed=True, tool="structural"),
+        Verdict(
+            passed=True,
+            tool="kics",
+            advisory=True,
+            findings=(
+                Finding(
+                    rule_id="RBAC Wildcard In Rule",
+                    severity="high",
+                    message="wildcard rule",
+                    file="acme-dev/rbac.yaml",
+                ),
+            ),
+        ),
+    ),
+)
+
+
+def test_an_advisory_finding_does_not_stop_a_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The validator passed the tree, so relcoord pushes it and says what it saw."""
+    pushed: list[str] = []
+    _fake_git(monkeypatch, tmp_path, pushed=pushed)
+    events: list[ChangeProgress] = []
+
+    ChangeProcessor(outputs=[DEV], validator=Validator(default=ADVISORY)).process(
+        CONFIG_REPO, "deadbeef", None, progress=events.append
+    )
+
+    assert pushed == [MANIFESTS_REPO]
+    by_phase = {event.phase: event for event in events}
+    assert by_phase["validated"].message == "acme-dev: passed, 1 advisory"
+
+
+def test_a_diff_shows_advisory_findings_apart_from_the_ones_that_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(monkeypatch, tmp_path)
+    commenter = Commenter()
+
+    result = DiffCommentProcessor(
+        outputs=[DEV], commenter=commenter, validator=Validator(default=ADVISORY)
+    ).diff(CONFIG_REPO, "deadbeef", pull_request=7)
+
+    assert [entry.failed for entry in result.validations] == [False]
+    body = commenter.bodies[0]
+    assert "- `acme-dev` — passed (structural, kics), 1 advisory" in body
+    assert "#### Advisory findings" in body
+    assert "These failed no verdict and blocked nothing." in body
+    assert (
+        "| acme-dev | high | RBAC Wildcard In Rule | acme-dev/rbac.yaml "
+        "| wildcard rule |"
+    ) in body
+    assert "**failed**" not in body

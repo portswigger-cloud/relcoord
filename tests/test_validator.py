@@ -224,3 +224,29 @@ def test_validate_raises_when_a_verdict_has_no_passed_flag() -> None:
 
     with pytest.raises(ValidationError, match="without a passed flag"):
         _validator(handler).validate(TREE)
+
+
+def test_validate_reads_the_advisory_flag_off_a_verdict() -> None:
+    advisory = {
+        "passed": True,
+        "digest": TREE_DIGEST,
+        "verdicts": [
+            {
+                "passed": True,
+                "advisory": True,
+                "tool": "kics",
+                "findings": [
+                    {"rule_id": "RBAC-1", "severity": "high", "message": "wildcard"}
+                ],
+            }
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(("result", json.dumps(advisory))))
+
+    validation = _validator(handler).validate(TREE)
+
+    assert validation.passed
+    assert validation.failing_findings == ()
+    assert [f.rule_id for f in validation.advisory_findings] == ["RBAC-1"]

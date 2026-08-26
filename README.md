@@ -130,9 +130,10 @@ scanning dev first is what makes it an early warning instead. `checks` is per
 output because the two trees are separate scans, not because their policies
 should differ.
 
-An output that names no `checks` is validated with whatever manifest-validator
-configured as its defaults — worth checking rather than assuming, since a
-service with no check marked `default = true` would then run none.
+An output that names no `checks` is validated with manifest-validator's default
+checks, which is every check it configures without `default = false`. Naming
+none is the usual case: that service owns which checks exist and which are
+defaults, so leaving `checks` out keeps the selection in one place.
 
 `checks` are names and nothing else. Which tools run, their versions, the
 rulesets and the pass/fail decision are manifest-validator's configuration,
@@ -159,6 +160,14 @@ Without a `[validator]` section nothing is validated and nothing is gated, which
 is what a deployment that has not adopted manifest-validator gets. Naming
 `checks` on an output with no validator configured is a startup error rather than
 a line in the log.
+
+A check manifest-validator marked `advisory` reports its findings without
+failing the verdict, so relcoord pushes the tree and the comment shows those
+findings under a heading saying they gated nothing. That distinction is the
+comment's most important job: findings shown without it read as a refused merge.
+Which checks are advisory is that service's business, not relcoord's — relcoord
+gates on `passed` and never recomputes it, so a check starts or stops gating
+without a change here.
 
 `validations` in the `/v1/diffcomment` response carries every output's verdict:
 its `checks`, the content `digest` that was scanned, whether the verdict was
