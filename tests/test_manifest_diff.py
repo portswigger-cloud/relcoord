@@ -575,7 +575,7 @@ def test_validation_summary_tables_findings_and_points_at_the_response() -> None
     rows = [line for line in summary.splitlines() if line.startswith("| prod |")]
     assert len(rows) == MAX_VALIDATION_FINDINGS
     assert "a \\| pipe and a newline" in rows[0]
-    assert "_2 further findings are in the response._" in summary
+    assert "_2 more in the response._" in summary
 
 
 def test_validation_summary_leads_the_comment_body() -> None:
@@ -609,5 +609,5 @@ def test_validation_summary_appears_even_where_nothing_changed() -> None:
         ),
     ).body
 
-    assert "**not validated**: connection refused" in body
+    assert "no verdict: connection refused" in body
     assert NO_CHANGES_MESSAGE in body

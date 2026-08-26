@@ -64,11 +64,7 @@ REBASE_REQUIRED_MESSAGE = (
 )
 # How many failing findings the comment tables before pointing at the response.
 MAX_VALIDATION_FINDINGS = 20
-ADVISORY_FINDINGS_MESSAGE = (
-    "The validator reports these without gating on them, so they do not stop "
-    "this change from being merged and deployed. They are here to be worked "
-    "through, after which the check that found them can start gating."
-)
+ADVISORY_FINDINGS_MESSAGE = "These failed no verdict and blocked nothing."
 COMMENT_MARKER_PREFIX = "relcoord:manifest-diff"
 
 _DIFF_FILE_HEADER = re.compile(r"^diff --git a/(?P<old>.*) b/(?P<new>.*)$")
@@ -588,10 +584,10 @@ def _collected_findings(
 
 def _validation_line(result: OutputValidation) -> str:
     if result.error is not None:
-        return f"- `{result.output}` — **not validated**: {result.error}"
+        return f"- `{result.output}` — no verdict: {result.error}"
     validation = result.validation
     if validation is None:
-        return f"- `{result.output}` — nothing generated to validate"
+        return f"- `{result.output}` — nothing to validate"
     tools = ", ".join(verdict.tool for verdict in validation.verdicts)
     ran = f" ({tools})" if tools else ""
     accepted = validation.accepted_count
@@ -623,7 +619,7 @@ def _findings_table(findings: Sequence[tuple[str, Finding]]) -> list[str]:
     ]
     remaining = len(findings) - len(shown)
     if remaining > 0:
-        rows.extend(["", f"_{remaining} further findings are in the response._"])
+        rows.extend(["", f"_{remaining} more in the response._"])
     return rows
 
 

@@ -292,10 +292,10 @@ def test_a_change_reports_the_validation_it_ran_as_progress(
     assert phases.index("validated") < phases.index("push")
     by_phase = {event.phase: event for event in events}
     assert by_phase["validate"].message == (
-        "validating acme-dev: 1 manifests, checks: structural, kics-dev"
+        "validating acme-dev: 1 manifests, structural, kics-dev"
     )
     assert by_phase["running"].message == "acme-dev: kics: 1 files"
-    assert by_phase["validated"].message == "acme-dev: validation passed"
+    assert by_phase["validated"].message == "acme-dev: passed"
     assert by_phase["validated"].detail["digest"] == "sha256:good"
 
 
@@ -360,7 +360,7 @@ def test_a_diff_still_reports_the_diff_when_the_validator_is_unreachable(
 
     assert result.diffs[0].manifest_diff.diff == "+api"
     assert result.validations[0].error == "connection refused"
-    assert "**not validated**: connection refused" in commenter.bodies[0]
+    assert "no verdict: connection refused" in commenter.bodies[0]
     assert "api.yaml | 1 +" in commenter.bodies[0]
 
 
@@ -414,7 +414,7 @@ def test_an_advisory_finding_does_not_stop_a_change(
 
     assert pushed == [MANIFESTS_REPO]
     by_phase = {event.phase: event for event in events}
-    assert by_phase["validated"].message == ("acme-dev: validation passed, 1 advisory")
+    assert by_phase["validated"].message == "acme-dev: passed, 1 advisory"
 
 
 def test_a_diff_shows_advisory_findings_apart_from_the_ones_that_gate(
@@ -431,7 +431,7 @@ def test_a_diff_shows_advisory_findings_apart_from_the_ones_that_gate(
     body = commenter.bodies[0]
     assert "- `acme-dev` — passed (structural, kics), 1 advisory" in body
     assert "#### Advisory findings" in body
-    assert "do not stop this change from being merged and deployed" in body
+    assert "These failed no verdict and blocked nothing." in body
     assert (
         "| acme-dev | high | RBAC Wildcard In Rule | acme-dev/rbac.yaml "
         "| wildcard rule |"
