@@ -1,4 +1,4 @@
-FROM cleanstart/helm:4.2.3 AS helm
+FROM cleanstart/helm:4.2.4 AS helm
 
 FROM astral/uv:trixie-slim AS builder
 
