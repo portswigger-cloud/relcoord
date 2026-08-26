@@ -160,6 +160,14 @@ is what a deployment that has not adopted manifest-validator gets. Naming
 `checks` on an output with no validator configured is a startup error rather than
 a line in the log.
 
+A check manifest-validator marked `advisory` reports its findings without
+failing the verdict, so relcoord pushes the tree and the comment shows those
+findings under a heading saying they gated nothing. That distinction is the
+comment's most important job: findings shown without it read as a refused merge.
+Which checks are advisory is that service's business, not relcoord's — relcoord
+gates on `passed` and never recomputes it, so a check starts or stops gating
+without a change here.
+
 `validations` in the `/v1/diffcomment` response carries every output's verdict:
 its `checks`, the content `digest` that was scanned, whether the verdict was
 `cached`, and each check's findings with the `tool_version` and `ruleset_digest`

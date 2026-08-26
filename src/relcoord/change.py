@@ -1171,6 +1171,7 @@ def validation_payloads(validation: Validation) -> list[dict[str, Any]]:
     return [
         {
             "passed": verdict.passed,
+            "advisory": verdict.advisory,
             "tool": verdict.tool,
             "tool_version": verdict.tool_version,
             "ruleset_digest": verdict.ruleset_digest,
@@ -1231,10 +1232,15 @@ def _validated_message(
 ) -> str:
     """Say what a verdict came to, in the terms someone fixing it needs."""
     if passed:
-        accepted = validation.accepted_count
-        tolerated = f", {accepted} accepted" if accepted else ""
+        parts = []
+        if validation.accepted_count:
+            parts.append(f"{validation.accepted_count} accepted")
+        advisory = len(validation.advisory_findings)
+        if advisory:
+            parts.append(f"{advisory} advisory")
+        reported = f", {', '.join(parts)}" if parts else ""
         cached = " (cached)" if validation.cached else ""
-        return f"{output.name}: validation passed{tolerated}{cached}"
+        return f"{output.name}: validation passed{reported}{cached}"
     findings = validation.failing_findings
     if not findings:
         tools = join_names(
