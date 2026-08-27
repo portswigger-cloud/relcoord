@@ -535,10 +535,11 @@ def render_validation_summary(
 ) -> str:
     """Render manifest-validator's verdicts for the comment.
 
-    A line per output says what the verdict was, and a table carries the
-    findings that failed it. Accepted findings are counted rather than listed:
-    the verdict itself is where the reason each one was tolerated lives, and a
-    comment that led with them would bury the ones a reviewer has to act on.
+    A line per output says what the verdict was, and the tables of findings sit
+    collapsed behind them: the verdict is what a reviewer reads this for, and on
+    a passing change the tables are a wall of text between them and the diff.
+    Accepted findings are counted rather than listed: the verdict itself is
+    where the reason each one was tolerated lives.
 
     A check the validator marked advisory gets its findings under a heading of
     their own, saying they gate nothing. Whether a finding blocks the merge is
@@ -550,11 +551,12 @@ def render_validation_summary(
     lines = ["### Manifest validation", ""]
     lines.extend(_validation_line(result) for result in validations)
     findings = _collected_findings(validations, advisory=False)
-    if findings:
-        lines.extend(["", *_findings_table(findings)])
     advisory = _collected_findings(validations, advisory=True)
+    detail: list[str] = []
+    if findings:
+        detail.extend(["", *_findings_table(findings)])
     if advisory:
-        lines.extend(
+        detail.extend(
             [
                 "",
                 "#### Advisory findings",
@@ -564,7 +566,29 @@ def render_validation_summary(
                 *_findings_table(advisory),
             ]
         )
+    if detail:
+        lines.extend(
+            [
+                "",
+                "<details>",
+                f"<summary>{_findings_summary(findings, advisory)}</summary>",
+                *detail,
+                "",
+                "</details>",
+            ]
+        )
     return "\n".join(lines)
+
+
+def _findings_summary(
+    findings: Sequence[tuple[str, Finding]], advisory: Sequence[tuple[str, Finding]]
+) -> str:
+    counts = []
+    if findings:
+        counts.append(f"{len(findings)} failing")
+    if advisory:
+        counts.append(f"{len(advisory)} advisory")
+    return f"Findings ({', '.join(counts)})"
 
 
 def _collected_findings(
@@ -658,14 +682,13 @@ def build_comment_body(
     comment leaves the reader needing the full diff.
 
     ``validation`` is manifest-validator's verdicts, rendered by
-    :func:`render_validation_summary`. It leads the comment: it is the part that
-    says whether this change can be merged at all, where the diff only says
-    what it would do.
+    :func:`render_validation_summary`. It closes the comment, below the diff the
+    reader came for.
     """
     preamble = [marker, ""] if marker is not None else []
-    if validation:
-        preamble.extend([validation, ""])
     metadata = [f"manifest-builder version: `{MANIFEST_BUILDER_VERSION}`"]
+    if validation:
+        metadata.extend(["", validation])
     rendered = [_render_section(section, full_diff_reference) for section in sections]
     if all(section.empty for section in rendered):
         return CommentBody(
