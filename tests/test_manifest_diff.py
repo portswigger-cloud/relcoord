@@ -549,6 +549,67 @@ def test_validation_summary_is_empty_without_any_validation() -> None:
     assert render_validation_summary([]) == ""
 
 
+def test_validation_summary_collapses_its_findings_behind_the_verdicts() -> None:
+    summary = render_validation_summary(
+        [
+            OutputValidation(
+                output="prod",
+                validation=Validation(
+                    passed=False,
+                    digest="sha256:bad",
+                    verdicts=(
+                        Verdict(
+                            passed=False,
+                            tool="kics",
+                            findings=(
+                                Finding(
+                                    rule_id="RULE-1",
+                                    severity="high",
+                                    message="wildcard rule",
+                                    file="prod/rbac.yaml",
+                                ),
+                            ),
+                        ),
+                        Verdict(
+                            passed=True,
+                            tool="structural",
+                            advisory=True,
+                            findings=(
+                                Finding(
+                                    rule_id="RULE-2",
+                                    severity="low",
+                                    message="missing label",
+                                    file="prod/app.yaml",
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        ]
+    )
+
+    assert "<summary>Findings (1 failing, 1 advisory)</summary>" in summary
+    assert "<details open>" not in summary
+    assert summary.index("- `prod` — **failed**") < summary.index("<details>")
+    assert summary.index("<details>") < summary.index("| prod | high |")
+    assert summary.index("#### Advisory findings") < summary.index("</details>")
+    assert summary.endswith("</details>")
+
+
+def test_validation_summary_omits_the_findings_block_when_there_are_none() -> None:
+    summary = render_validation_summary(
+        [
+            OutputValidation(
+                output="dev",
+                validation=Validation(passed=True, digest="sha256:good"),
+            )
+        ]
+    )
+
+    assert "<details>" not in summary
+
+
 def test_validation_summary_tables_findings_and_points_at_the_response() -> None:
     findings = tuple(
         Finding(
@@ -578,7 +639,7 @@ def test_validation_summary_tables_findings_and_points_at_the_response() -> None
     assert "_2 more in the response._" in summary
 
 
-def test_validation_summary_leads_the_comment_body() -> None:
+def test_validation_summary_closes_the_comment_body() -> None:
     body = build_comment_body(
         [
             DiffSection(
@@ -597,7 +658,7 @@ def test_validation_summary_leads_the_comment_body() -> None:
         ),
     ).body
 
-    assert body.index("Manifest validation") < body.index("a.yaml | 1 +")
+    assert body.index("Manifest validation") > body.index("a.yaml | 1 +")
 
 
 def test_validation_summary_appears_even_where_nothing_changed() -> None:
