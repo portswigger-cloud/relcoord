@@ -98,10 +98,14 @@ points a reader who needs the part it left out.
 
 With a `[validator]` section, every generated tree is validated by
 [manifest-validator](https://github.com/portswigger-cloud/manifest-validator)
-before it goes anywhere. `/v1/change` gates on the verdict and pushes nothing
-that failed; `/v1/diffcomment` reports the verdict in its comment and gates
-nothing, so a reviewer sees on the pull request what the merge would be refused
-for.
+before it goes anywhere. `/v1/diffcomment` reports the verdict in its comment
+and gates nothing, so a reviewer sees on the pull request what the merge would
+be refused for.
+
+Validation on `/v1/change` is disabled for now: the verdict gated nothing worth
+the latency and the extra way for a change to fail, so those call sites are
+commented out in `ChangeProcessor.process` and `make_change_processor`. What
+follows describes them as they will behave once they are restored.
 
 ```toml
 [validator]
@@ -148,13 +152,13 @@ a request and no scan, because the validator keys its cache on the content diges
 of exactly that tree.
 
 A tree that fails, and a validator that cannot be reached, are one condition for
-`/v1/change`: it pushes on a green verdict and on nothing else, so both fail the
-request with `manifest_validation_failed` (422) and leave the manifests
-repository untouched. Because a rollout pushes its stages in order, a dev output
-that fails also stops prod — the stages after it are never generated. A diff
-reports either as part of its comment and still returns the diff it came for: an
-endpoint that loses the diff because a scanner was down is worse than one that
-says the scan did not run.
+`/v1/change` when it validates: it pushes on a green verdict and on nothing
+else, so both fail the request with `manifest_validation_failed` (422) and leave
+the manifests repository untouched. Because a rollout pushes its stages in
+order, a dev output that fails also stops prod — the stages after it are never
+generated. A diff reports either as part of its comment and still returns the
+diff it came for: an endpoint that loses the diff because a scanner was down is
+worse than one that says the scan did not run.
 
 Without a `[validator]` section nothing is validated and nothing is gated, which
 is what a deployment that has not adopted manifest-validator gets. Naming
@@ -162,8 +166,8 @@ is what a deployment that has not adopted manifest-validator gets. Naming
 a line in the log.
 
 A check manifest-validator marked `advisory` reports its findings without
-failing the verdict, so relcoord pushes the tree and the comment shows those
-findings under a heading saying they gated nothing. That distinction is the
+failing the verdict, so the comment shows those findings under a heading saying
+they gated nothing. That distinction is the
 comment's most important job: findings shown without it read as a refused merge.
 Which checks are advisory is that service's business, not relcoord's — relcoord
 gates on `passed` and never recomputes it, so a check starts or stops gating
@@ -196,10 +200,11 @@ The stream carries four kinds of event:
   work starts.
 - `progress` — one per step, with a stable `phase` (`source-checkout`,
   `deploy-config`, `system-checkout`, `rollout-stage`, `manifests-checkout`,
-  `generate`, `generated`, `changed-objects`, `validate`, `running`, `validated`,
-  `validation-failed`, `validation-error`, `no-validation`, `no-changes`, `push`,
+  `generate`, `generated`, `changed-objects`, `no-changes`, `push`,
   `pushed`, `deployment-detection`, `rollout-stage-verified`),
   a human readable `message`, and a `detail` object with specifics of the step.
+  The validation phases (`validate`, `running`, `validated`, `validation-failed`,
+  `validation-error`, `no-validation`) come back with validation on a change.
 - `complete` — the same body the non-streaming response would have returned,
   whose `message` says where the change was deployed.
 - `error` — a change that failed, carrying the `status`, `error` and `message`
