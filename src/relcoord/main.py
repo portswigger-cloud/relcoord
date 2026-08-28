@@ -98,7 +98,9 @@ def make_change_processor(
         rollouts=settings.rollouts,
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
-        validator=make_validator(settings),
+        # Left unset while validation on a change is disabled; see
+        # ChangeProcessor.process.
+        # validator=make_validator(settings),
     )
 
 

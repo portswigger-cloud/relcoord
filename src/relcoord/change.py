@@ -359,7 +359,13 @@ class ChangeProcessor:
                         generation_results.append(generation_result)
                         stage_results.append((output, generation_result))
                         total_generated += output_result.generated_count
-                        self._validate(output, manifests_checkout, report)
+                        # Validation on a change is disabled for now: nothing
+                        # is gated on the verdict yet, so calling out here only
+                        # adds latency and a way for a change to fail. The
+                        # diffcomment path still validates. Restore this line
+                        # (and validator= in make_change_processor) to bring it
+                        # back.
+                        # self._validate(output, manifests_checkout, report)
 
                     if not any(
                         result.created_or_modified or result.removed
