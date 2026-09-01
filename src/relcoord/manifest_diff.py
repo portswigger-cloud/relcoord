@@ -64,7 +64,6 @@ REBASE_REQUIRED_MESSAGE = (
 )
 # How many failing findings the comment tables before pointing at the response.
 MAX_VALIDATION_FINDINGS = 20
-ADVISORY_FINDINGS_MESSAGE = "These failed no verdict and blocked nothing."
 COMMENT_MARKER_PREFIX = "relcoord:manifest-diff"
 
 _DIFF_FILE_HEADER = re.compile(r"^diff --git a/(?P<old>.*) b/(?P<new>.*)$")
@@ -540,39 +539,25 @@ def render_validation_summary(
     a passing change the tables are a wall of text between them and the diff.
     Accepted findings are counted rather than listed: the verdict itself is
     where the reason each one was tolerated lives.
-
-    A check the validator marked advisory gets its findings under a heading of
-    their own, saying they gate nothing. Whether a finding blocks the merge is
-    the first thing a reviewer reads this for, and findings shown without that
-    distinction read as a refusal.
     """
     if not validations:
         return ""
-    lines = ["### Manifest validation", ""]
-    lines.extend(_validation_line(result) for result in validations)
-    findings = _collected_findings(validations, advisory=False)
-    advisory = _collected_findings(validations, advisory=True)
-    detail: list[str] = []
+    lines = [
+        "### Manifest validation",
+        "",
+        _verdict_line(validations),
+        "",
+        *(_validation_line(result) for result in validations),
+    ]
+    findings = _collected_findings(validations)
     if findings:
-        detail.extend(["", *_findings_table(findings)])
-    if advisory:
-        detail.extend(
-            [
-                "",
-                "#### Advisory findings",
-                "",
-                ADVISORY_FINDINGS_MESSAGE,
-                "",
-                *_findings_table(advisory),
-            ]
-        )
-    if detail:
         lines.extend(
             [
                 "",
                 "<details>",
-                f"<summary>{_findings_summary(findings, advisory)}</summary>",
-                *detail,
+                f"<summary>Findings ({len(findings)} failing)</summary>",
+                "",
+                *_findings_table(findings),
                 "",
                 "</details>",
             ]
@@ -580,29 +565,28 @@ def render_validation_summary(
     return "\n".join(lines)
 
 
-def _findings_summary(
-    findings: Sequence[tuple[str, Finding]], advisory: Sequence[tuple[str, Finding]]
-) -> str:
-    counts = []
-    if findings:
-        counts.append(f"{len(findings)} failing")
-    if advisory:
-        counts.append(f"{len(advisory)} advisory")
-    return f"Findings ({', '.join(counts)})"
+def _verdict_line(validations: Sequence[OutputValidation]) -> str:
+    """One line for the whole change, before the per-output detail.
+
+    A reader scanning the comment needs the answer in the first line they meet,
+    not assembled from four. Which outputs failed is part of it: a change that
+    fails one tree and passes three is not the same as one that fails all four.
+    """
+    failed = [result.output for result in validations if result.failed]
+    if not failed:
+        return "**Passed**"
+    outputs = ", ".join(f"`{output}`" for output in failed)
+    return f"**Failed** — {outputs}"
 
 
 def _collected_findings(
-    validations: Sequence[OutputValidation], *, advisory: bool
+    validations: Sequence[OutputValidation],
 ) -> list[tuple[str, Finding]]:
     return [
         (result.output, finding)
         for result in validations
         if result.validation is not None
-        for finding in (
-            result.validation.advisory_findings
-            if advisory
-            else result.validation.failing_findings
-        )
+        for finding in result.validation.failing_findings
     ]
 
 
@@ -617,9 +601,7 @@ def _validation_line(result: OutputValidation) -> str:
     accepted = validation.accepted_count
     tolerated = f", {accepted} accepted" if accepted else ""
     if validation.passed:
-        advisory = len(validation.advisory_findings)
-        reported = f", {advisory} advisory" if advisory else ""
-        return f"- `{result.output}` — passed{ran}{tolerated}{reported}"
+        return f"- `{result.output}` — passed{ran}{tolerated}"
     failing = validation.failing_findings
     count = "1 finding" if len(failing) == 1 else f"{len(failing)} findings"
     return f"- `{result.output}` — **failed**{ran}: {count}{tolerated}"
@@ -682,13 +664,14 @@ def build_comment_body(
     comment leaves the reader needing the full diff.
 
     ``validation`` is manifest-validator's verdicts, rendered by
-    :func:`render_validation_summary`. It closes the comment, below the diff the
-    reader came for.
+    :func:`render_validation_summary`. It opens the comment: whether the change
+    is deployable is read before the diff, and its findings stay collapsed so
+    they cost a reader who only wants the diff one line.
     """
     preamble = [marker, ""] if marker is not None else []
-    metadata = [f"manifest-builder version: `{MANIFEST_BUILDER_VERSION}`"]
     if validation:
-        metadata.extend(["", validation])
+        preamble.extend([validation, ""])
+    metadata = [f"manifest-builder version: `{MANIFEST_BUILDER_VERSION}`"]
     rendered = [_render_section(section, full_diff_reference) for section in sections]
     if all(section.empty for section in rendered):
         return CommentBody(

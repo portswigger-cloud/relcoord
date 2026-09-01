@@ -388,15 +388,14 @@ def test_a_diff_without_a_validator_says_nothing_about_validation(
     assert "Manifest validation" not in commenter.bodies[0]
 
 
-ADVISORY = Validation(
-    passed=True,
-    digest="sha256:advisory",
+UNACCEPTED = Validation(
+    passed=False,
+    digest="sha256:unaccepted",
     verdicts=(
         Verdict(passed=True, tool="structural"),
         Verdict(
-            passed=True,
+            passed=False,
             tool="kics",
-            advisory=True,
             findings=(
                 Finding(
                     rule_id="RBAC Wildcard In Rule",
@@ -410,41 +409,19 @@ ADVISORY = Validation(
 )
 
 
-@on_change_disabled
-def test_an_advisory_finding_does_not_stop_a_change(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The validator passed the tree, so relcoord pushes it and says what it saw."""
-    pushed: list[str] = []
-    _fake_git(monkeypatch, tmp_path, pushed=pushed)
-    events: list[ChangeProgress] = []
-
-    ChangeProcessor(outputs=[DEV], validator=Validator(default=ADVISORY)).process(
-        CONFIG_REPO, "deadbeef", None, progress=events.append
-    )
-
-    assert pushed == [MANIFESTS_REPO]
-    by_phase = {event.phase: event for event in events}
-    assert by_phase["validated"].message == "acme-dev: passed, 1 advisory"
-
-
-def test_a_diff_shows_advisory_findings_apart_from_the_ones_that_gate(
+def test_a_diff_shows_a_finding_that_was_not_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _fake_git(monkeypatch, tmp_path)
     commenter = Commenter()
 
-    result = DiffCommentProcessor(
-        outputs=[DEV], commenter=commenter, validator=Validator(default=ADVISORY)
+    DiffCommentProcessor(
+        outputs=[DEV], commenter=commenter, validator=Validator(default=UNACCEPTED)
     ).diff(CONFIG_REPO, "deadbeef", pull_request=7)
 
-    assert [entry.failed for entry in result.validations] == [False]
     body = commenter.bodies[0]
-    assert "- `acme-dev` — passed (structural, kics), 1 advisory" in body
-    assert "#### Advisory findings" in body
-    assert "These failed no verdict and blocked nothing." in body
+    assert "- `acme-dev` — **failed** (structural, kics): 1 finding" in body
     assert (
         "| acme-dev | high | RBAC Wildcard In Rule | acme-dev/rbac.yaml "
         "| wildcard rule |"
     ) in body
-    assert "**failed**" not in body

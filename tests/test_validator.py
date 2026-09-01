@@ -226,13 +226,14 @@ def test_validate_raises_when_a_verdict_has_no_passed_flag() -> None:
         _validator(handler).validate(TREE)
 
 
-def test_validate_reads_the_advisory_flag_off_a_verdict() -> None:
-    advisory = {
-        "passed": True,
+def test_validate_ignores_a_verdict_key_it_no_longer_reads() -> None:
+    """An older validator still sends `advisory`; it is not a field here."""
+    payload = {
+        "passed": False,
         "digest": TREE_DIGEST,
         "verdicts": [
             {
-                "passed": True,
+                "passed": False,
                 "advisory": True,
                 "tool": "kics",
                 "findings": [
@@ -243,10 +244,9 @@ def test_validate_reads_the_advisory_flag_off_a_verdict() -> None:
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=_sse(("result", json.dumps(advisory))))
+        return httpx.Response(200, content=_sse(("result", json.dumps(payload))))
 
     validation = _validator(handler).validate(TREE)
 
-    assert validation.passed
-    assert validation.failing_findings == ()
-    assert [f.rule_id for f in validation.advisory_findings] == ["RBAC-1"]
+    assert not validation.passed
+    assert [f.rule_id for f in validation.failing_findings] == ["RBAC-1"]
