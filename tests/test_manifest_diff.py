@@ -637,7 +637,46 @@ def test_validation_summary_tables_findings_and_points_at_the_response() -> None
     assert "_2 more in the response._" in summary
 
 
-def test_validation_summary_closes_the_comment_body() -> None:
+def test_the_verdict_line_says_passed_when_every_output_did() -> None:
+    summary = render_validation_summary(
+        [
+            OutputValidation(
+                output="dev", validation=Validation(passed=True, digest="sha256:a")
+            ),
+            OutputValidation(
+                output="prod", validation=Validation(passed=True, digest="sha256:b")
+            ),
+        ]
+    )
+
+    assert summary.splitlines()[2] == "**Passed**"
+
+
+def test_the_verdict_line_names_the_outputs_that_failed() -> None:
+    summary = render_validation_summary(
+        [
+            OutputValidation(
+                output="dev", validation=Validation(passed=True, digest="sha256:a")
+            ),
+            OutputValidation(
+                output="prod", validation=Validation(passed=False, digest="sha256:b")
+            ),
+        ]
+    )
+
+    assert summary.splitlines()[2] == "**Failed** — `prod`"
+
+
+def test_an_output_with_no_verdict_fails_the_change() -> None:
+    """A validator that could not be reached is not a pass."""
+    summary = render_validation_summary(
+        [OutputValidation(output="dev", error="connection refused")]
+    )
+
+    assert summary.splitlines()[2] == "**Failed** — `dev`"
+
+
+def test_validation_summary_opens_the_comment_body() -> None:
     body = build_comment_body(
         [
             DiffSection(
@@ -656,7 +695,7 @@ def test_validation_summary_closes_the_comment_body() -> None:
         ),
     ).body
 
-    assert body.index("Manifest validation") > body.index("a.yaml | 1 +")
+    assert body.index("Manifest validation") < body.index("a.yaml | 1 +")
 
 
 def test_validation_summary_appears_even_where_nothing_changed() -> None:

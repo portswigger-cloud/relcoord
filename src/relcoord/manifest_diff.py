@@ -542,8 +542,13 @@ def render_validation_summary(
     """
     if not validations:
         return ""
-    lines = ["### Manifest validation", ""]
-    lines.extend(_validation_line(result) for result in validations)
+    lines = [
+        "### Manifest validation",
+        "",
+        _verdict_line(validations),
+        "",
+        *(_validation_line(result) for result in validations),
+    ]
     findings = _collected_findings(validations)
     if findings:
         lines.extend(
@@ -558,6 +563,20 @@ def render_validation_summary(
             ]
         )
     return "\n".join(lines)
+
+
+def _verdict_line(validations: Sequence[OutputValidation]) -> str:
+    """One line for the whole change, before the per-output detail.
+
+    A reader scanning the comment needs the answer in the first line they meet,
+    not assembled from four. Which outputs failed is part of it: a change that
+    fails one tree and passes three is not the same as one that fails all four.
+    """
+    failed = [result.output for result in validations if result.failed]
+    if not failed:
+        return "**Passed**"
+    outputs = ", ".join(f"`{output}`" for output in failed)
+    return f"**Failed** — {outputs}"
 
 
 def _collected_findings(
@@ -645,13 +664,14 @@ def build_comment_body(
     comment leaves the reader needing the full diff.
 
     ``validation`` is manifest-validator's verdicts, rendered by
-    :func:`render_validation_summary`. It closes the comment, below the diff the
-    reader came for.
+    :func:`render_validation_summary`. It opens the comment: whether the change
+    is deployable is read before the diff, and its findings stay collapsed so
+    they cost a reader who only wants the diff one line.
     """
     preamble = [marker, ""] if marker is not None else []
-    metadata = [f"manifest-builder version: `{MANIFEST_BUILDER_VERSION}`"]
     if validation:
-        metadata.extend(["", validation])
+        preamble.extend([validation, ""])
+    metadata = [f"manifest-builder version: `{MANIFEST_BUILDER_VERSION}`"]
     rendered = [_render_section(section, full_diff_reference) for section in sections]
     if all(section.empty for section in rendered):
         return CommentBody(
