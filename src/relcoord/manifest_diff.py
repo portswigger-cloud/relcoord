@@ -64,7 +64,6 @@ REBASE_REQUIRED_MESSAGE = (
 )
 # How many failing findings the comment tables before pointing at the response.
 MAX_VALIDATION_FINDINGS = 20
-ADVISORY_FINDINGS_MESSAGE = "These failed no verdict and blocked nothing."
 COMMENT_MARKER_PREFIX = "relcoord:manifest-diff"
 
 _DIFF_FILE_HEADER = re.compile(r"^diff --git a/(?P<old>.*) b/(?P<new>.*)$")
@@ -540,39 +539,20 @@ def render_validation_summary(
     a passing change the tables are a wall of text between them and the diff.
     Accepted findings are counted rather than listed: the verdict itself is
     where the reason each one was tolerated lives.
-
-    A check the validator marked advisory gets its findings under a heading of
-    their own, saying they gate nothing. Whether a finding blocks the merge is
-    the first thing a reviewer reads this for, and findings shown without that
-    distinction read as a refusal.
     """
     if not validations:
         return ""
     lines = ["### Manifest validation", ""]
     lines.extend(_validation_line(result) for result in validations)
-    findings = _collected_findings(validations, advisory=False)
-    advisory = _collected_findings(validations, advisory=True)
-    detail: list[str] = []
+    findings = _collected_findings(validations)
     if findings:
-        detail.extend(["", *_findings_table(findings)])
-    if advisory:
-        detail.extend(
-            [
-                "",
-                "#### Advisory findings",
-                "",
-                ADVISORY_FINDINGS_MESSAGE,
-                "",
-                *_findings_table(advisory),
-            ]
-        )
-    if detail:
         lines.extend(
             [
                 "",
                 "<details>",
-                f"<summary>{_findings_summary(findings, advisory)}</summary>",
-                *detail,
+                f"<summary>Findings ({len(findings)} failing)</summary>",
+                "",
+                *_findings_table(findings),
                 "",
                 "</details>",
             ]
@@ -580,29 +560,14 @@ def render_validation_summary(
     return "\n".join(lines)
 
 
-def _findings_summary(
-    findings: Sequence[tuple[str, Finding]], advisory: Sequence[tuple[str, Finding]]
-) -> str:
-    counts = []
-    if findings:
-        counts.append(f"{len(findings)} failing")
-    if advisory:
-        counts.append(f"{len(advisory)} advisory")
-    return f"Findings ({', '.join(counts)})"
-
-
 def _collected_findings(
-    validations: Sequence[OutputValidation], *, advisory: bool
+    validations: Sequence[OutputValidation],
 ) -> list[tuple[str, Finding]]:
     return [
         (result.output, finding)
         for result in validations
         if result.validation is not None
-        for finding in (
-            result.validation.advisory_findings
-            if advisory
-            else result.validation.failing_findings
-        )
+        for finding in result.validation.failing_findings
     ]
 
 
@@ -617,9 +582,7 @@ def _validation_line(result: OutputValidation) -> str:
     accepted = validation.accepted_count
     tolerated = f", {accepted} accepted" if accepted else ""
     if validation.passed:
-        advisory = len(validation.advisory_findings)
-        reported = f", {advisory} advisory" if advisory else ""
-        return f"- `{result.output}` — passed{ran}{tolerated}{reported}"
+        return f"- `{result.output}` — passed{ran}{tolerated}"
     failing = validation.failing_findings
     count = "1 finding" if len(failing) == 1 else f"{len(failing)} findings"
     return f"- `{result.output}` — **failed**{ran}: {count}{tolerated}"

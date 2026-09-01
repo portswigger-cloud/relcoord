@@ -1985,7 +1985,6 @@ def test_diffcomment_reports_the_verdict_for_every_output() -> None:
     assert body["validations"][1]["verdicts"] == [
         {
             "passed": False,
-            "advisory": False,
             "tool": "kics",
             "tool_version": "v2.1.16",
             "ruleset_digest": "sha256:rules",

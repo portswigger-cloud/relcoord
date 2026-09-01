@@ -571,9 +571,8 @@ def test_validation_summary_collapses_its_findings_behind_the_verdicts() -> None
                             ),
                         ),
                         Verdict(
-                            passed=True,
+                            passed=False,
                             tool="structural",
-                            advisory=True,
                             findings=(
                                 Finding(
                                     rule_id="RULE-2",
@@ -589,11 +588,10 @@ def test_validation_summary_collapses_its_findings_behind_the_verdicts() -> None
         ]
     )
 
-    assert "<summary>Findings (1 failing, 1 advisory)</summary>" in summary
+    assert "<summary>Findings (2 failing)</summary>" in summary
     assert "<details open>" not in summary
     assert summary.index("- `prod` — **failed**") < summary.index("<details>")
     assert summary.index("<details>") < summary.index("| prod | high |")
-    assert summary.index("#### Advisory findings") < summary.index("</details>")
     assert summary.endswith("</details>")
 
 
