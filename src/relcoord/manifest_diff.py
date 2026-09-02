@@ -634,6 +634,9 @@ def _table_cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
+DIFF_HEADING = "Manifest diff"
+
+
 def comment_marker() -> str:
     """The hidden line a comment carries so a later diff can find and edit it."""
     return f"<!-- {COMMENT_MARKER_PREFIX} -->"
@@ -667,12 +670,19 @@ def build_comment_body(
     :func:`render_validation_summary`. It opens the comment: whether the change
     is deployable is read before the diff, and its findings stay collapsed so
     they cost a reader who only wants the diff one line.
+
+    The diff gets a heading of its own beneath it, so the two do not run
+    together. Not when there is nothing above it to separate it from, and not
+    when the sections carry their own repository headings, which separate them
+    already.
     """
     preamble = [marker, ""] if marker is not None else []
     if validation:
         preamble.extend([validation, ""])
     metadata = [f"manifest-builder version: `{MANIFEST_BUILDER_VERSION}`"]
     rendered = [_render_section(section, full_diff_reference) for section in sections]
+    if validation and all(section.heading is None for section in sections):
+        preamble.extend([f"### {DIFF_HEADING}", ""])
     if all(section.empty for section in rendered):
         return CommentBody(
             body="\n".join([*preamble, NO_CHANGES_MESSAGE, "", *metadata]),
