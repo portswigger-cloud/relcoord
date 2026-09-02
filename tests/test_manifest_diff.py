@@ -676,6 +676,28 @@ def test_an_output_with_no_verdict_fails_the_change() -> None:
     assert summary.splitlines()[2] == "**Failed** — `dev`"
 
 
+def test_the_diff_gets_a_heading_below_the_validation_section() -> None:
+    body = build_comment_body(
+        [
+            DiffSection(
+                heading=None, diff=ManifestDiff(stat="a.yaml | 1 +\n", diff="+a")
+            )
+        ],
+        full_diff_reference="returned in the response",
+        validation=render_validation_summary(
+            [
+                OutputValidation(
+                    output="dev",
+                    validation=Validation(passed=True, digest="sha256:good"),
+                )
+            ]
+        ),
+    ).body
+
+    assert body.index("### Manifest validation") < body.index("### Manifest diff")
+    assert body.index("### Manifest diff") < body.index("a.yaml | 1 +")
+
+
 def test_validation_summary_opens_the_comment_body() -> None:
     body = build_comment_body(
         [
