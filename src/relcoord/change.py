@@ -22,6 +22,7 @@ from manifest_builder.config import (
     config_version,
     find_config_file,
     load_toml_file,
+    parse_targets,
 )
 
 from relcoord.config import IdcatSettings, OutputSettings, RolloutSettings
@@ -303,7 +304,11 @@ class ChangeProcessor:
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
-            declares_targets = _declares_targets(deploy_config)
+            declared_targets = _declared_targets(deploy_config)
+            declares_targets = declared_targets is not None
+            selected_outputs = _selected_outputs(
+                output_settings, declared_targets, system
+            )
             logger.info(
                 "change step 3/7: found deploy config at %s (system mode: %s, "
                 "targets: %s)",
@@ -332,7 +337,9 @@ class ChangeProcessor:
             total_generated = 0
             cloned: set[str] = set()
 
-            for stage in _change_stages(output_settings, self.rollouts):
+            for stage in _change_stages(
+                output_settings, self.rollouts, selected_outputs
+            ):
                 _report_stage(stage, report)
                 stage_results: list[tuple[OutputSettings, GenerationResult]] = []
 
@@ -813,7 +820,11 @@ class DiffCommentProcessor:
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
-            declares_targets = _declares_targets(deploy_config)
+            declared_targets = _declared_targets(deploy_config)
+            declares_targets = declared_targets is not None
+            selected_outputs = _selected_outputs(
+                output_settings, declared_targets, system
+            )
             logger.info(
                 "diff step 3/6: found deploy config at %s (system mode: %s, "
                 "targets: %s)",
@@ -863,7 +874,7 @@ class DiffCommentProcessor:
                 )
                 base_commit = _head_commit(manifests_checkout)
 
-                for output in _outputs_for_repository(output_settings, repository):
+                for output in _outputs_for_repository(selected_outputs, repository):
                     output_path = manifests_checkout / output.directory
                     output_path.mkdir(parents=True, exist_ok=True)
                     selection = _generate_selection(output, declares_targets)
@@ -1425,16 +1436,26 @@ def _report_stage(stage: ChangeStage, report: Callable[..., None]) -> None:
 
 
 def _change_stages(
-    outputs: Sequence[OutputSettings], rollouts: Sequence[RolloutSettings]
+    outputs: Sequence[OutputSettings],
+    rollouts: Sequence[RolloutSettings],
+    selected: Sequence[OutputSettings] | None = None,
 ) -> tuple[ChangeStage, ...]:
     """Order the outputs into the stages a change deploys them in.
 
     Rollouts are walked in the order they are configured, one at a time, so that
     a change deploys and verifies in an order the configuration states rather
     than one that depends on how the work happens to interleave.
+
+    ``selected`` narrows the outputs a stage carries to the ones this change
+    generates into, while a rollout's own outputs are still validated against
+    everything configured: a stage naming a cluster this change does not deploy
+    to is correct configuration, and leaves that stage with nothing to do.
     """
+    if selected is None:
+        selected = outputs
+    selected_names = {output.name for output in selected}
     if not rollouts:
-        return (ChangeStage(outputs=tuple(outputs)),)
+        return (ChangeStage(outputs=tuple(selected)),)
     by_name = {output.name: output for output in outputs}
     stages: list[ChangeStage] = []
     for rollout in rollouts:
@@ -1447,7 +1468,11 @@ def _change_stages(
                 )
             stages.append(
                 ChangeStage(
-                    outputs=tuple(by_name[name] for name in stage.outputs),
+                    outputs=tuple(
+                        by_name[name]
+                        for name in stage.outputs
+                        if name in selected_names
+                    ),
                     rollout=rollout.name,
                     index=index,
                     count=len(rollout.stages),
@@ -1456,20 +1481,56 @@ def _change_stages(
     return tuple(stages)
 
 
-def _declares_targets(deploy_config: Path) -> bool:
-    """Report whether a config directory declares targets.
+def _declared_targets(deploy_config: Path) -> tuple[str, ...] | None:
+    """Return the names of the targets a config directory declares.
 
     manifest-builder takes what to generate either as template variables or, for
     a ``version = 2`` config directory, as the name of a target, so relcoord has
     to know which layout a config commit uses before it calls generate(). A
     directory holding no top-level config file at all is left to manifest-builder
     to report on, since it says that better than a version check would.
+
+    Returns None for a config directory that declares config blocks directly,
+    which has no targets to choose between.
     """
     try:
         config_file = find_config_file(deploy_config)
     except FileNotFoundError:
-        return False
-    return config_version(load_toml_file(config_file), config_file) == TARGETS_VERSION
+        return None
+    data = load_toml_file(config_file)
+    if config_version(data, config_file) != TARGETS_VERSION:
+        return None
+    return tuple(target.name for target in parse_targets(data, config_file))
+
+
+def _selected_outputs(
+    outputs: Sequence[OutputSettings],
+    declared: tuple[str, ...] | None,
+    system: bool,
+) -> tuple[OutputSettings, ...]:
+    """Return the outputs a config commit asks to be generated into.
+
+    A config repository that declares targets names the outputs it deploys to,
+    one target per output name, so relcoord generates the targets it declares
+    rather than asking it for a target per configured output. An output nothing
+    declares is then not work to skip: it is not work at all, and an output
+    added to this service's configuration cannot break a repository that has
+    never heard of it.
+
+    A directory that declares config blocks directly has no targets to select
+    with and is generated into every output, as is the system repository, which
+    is where the outputs are declared in the first place.
+    """
+    if declared is None or system:
+        return tuple(outputs)
+    by_target = {output.target_name: output for output in outputs}
+    unmatched = sorted(set(declared) - set(by_target))
+    if unmatched:
+        raise ChangeProcessingError(
+            f"config declares target(s) {', '.join(unmatched)}, which match no "
+            f"configured output"
+        )
+    return tuple(by_target[name] for name in declared)
 
 
 def _generate_selection(

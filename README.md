@@ -40,12 +40,13 @@ The token that posts the comment is an idcat-issued installation token for
 GitHub app configured under `[idcat]` needs permission to write pull request
 comments on the repositories that call this endpoint.
 
-Every configured output is generated, because which of them a commit affects is
-not something the commit says: it is what generating shows. The comment then
-covers the manifests repositories that changed, and leaves the ones the commit
-generates nothing for out of it, so a change to a section only one cluster is
-built from reads as that cluster's diff rather than as a wall of unchanged
-clusters. A comment left with a single repository renders without a heading, and
+Every output the commit asks for is generated, because which of *those* it
+affects is not something the commit says: it is what generating shows. Which
+outputs it asks for is a separate question, answered under "Selecting outputs"
+below. The comment then covers the manifests repositories that changed, and
+leaves the ones the commit generates nothing for out of it, so a change to a
+section only one cluster is built from reads as that cluster's diff rather than
+as a wall of unchanged clusters. A comment left with a single repository renders without a heading, and
 one covering several heads each repository's diff with its URL; a change no
 output is affected by comments that the generated output is unchanged.
 
@@ -93,6 +94,29 @@ points a reader who needs the part it left out.
 `manifests-checkout`, `generate`, `generated`, `validate`, `running`,
 `validated`, `validation-failed`, `validation-error`, `no-validation`, `diff`,
 `no-changes`, `comment`, `commented` and `no-comment`.
+
+## Selecting outputs
+
+A config repository that declares targets is generated into the outputs whose
+targets it declares, and no others. relcoord matches a target name against each
+output's `target`, or its name where it sets none, so a repository deploying to
+one cluster of several declares that one target and stays unaffected by outputs
+added here later.
+
+A declared target matching no configured output fails the change, naming the
+target. "Not for any of these clusters" is not a thing a repository can mean by
+a target: read that way, a mistyped name would deploy nothing and report
+nothing.
+
+Two kinds of config are generated into every output instead. A directory that
+declares config blocks directly has no targets to select with, and a system-mode
+request comes from the repository where the outputs are declared in the first
+place, so an unknown target there is a misconfiguration and stays
+manifest-builder's to report.
+
+Rollout stages are configured against every output, so a change that generates
+into some of them keeps the configured ordering and finds the other stages with
+nothing to do.
 
 ## Manifest validation
 

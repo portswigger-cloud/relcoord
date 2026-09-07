@@ -52,6 +52,11 @@ issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEDEVCLUSTERID"
 # which is what "example-dev" above relies on. Config repositories that declare
 # config blocks directly are generated with [output.vars] instead, so an output
 # serving both kinds of repository configures both.
+#
+# This name is also how a config repository says it deploys here: one that
+# declares targets is generated into the outputs whose targets it declares, and
+# no others. Renaming this, or the output, stops such a repository deploying
+# until it declares the new name.
 [[output]]
 name = "example-prod"
 repository = "https://github.com/example/manifests"
