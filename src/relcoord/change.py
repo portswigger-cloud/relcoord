@@ -16,13 +16,11 @@ from typing import Any, Protocol, cast
 from dulwich import porcelain
 from dulwich.objects import Commit, ObjectID
 from dulwich.repo import Repo
-from manifest_builder import ExternalPlugins, GenerationResult, generate
-from manifest_builder.config import (
-    TARGETS_VERSION,
-    config_version,
-    find_config_file,
-    load_toml_file,
-    parse_targets,
+from manifest_builder import (
+    ExternalPlugins,
+    GenerationResult,
+    declared_targets,
+    generate,
 )
 
 from relcoord.config import IdcatSettings, OutputSettings, RolloutSettings
@@ -304,11 +302,9 @@ class ChangeProcessor:
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
-            declared_targets = _declared_targets(deploy_config)
-            declares_targets = declared_targets is not None
-            selected_outputs = _selected_outputs(
-                output_settings, declared_targets, system
-            )
+            declared = declared_targets(deploy_config)
+            declares_targets = declared is not None
+            selected_outputs = _selected_outputs(output_settings, declared, system)
             logger.info(
                 "change step 3/7: found deploy config at %s (system mode: %s, "
                 "targets: %s)",
@@ -820,11 +816,9 @@ class DiffCommentProcessor:
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
-            declared_targets = _declared_targets(deploy_config)
-            declares_targets = declared_targets is not None
-            selected_outputs = _selected_outputs(
-                output_settings, declared_targets, system
-            )
+            declared = declared_targets(deploy_config)
+            declares_targets = declared is not None
+            selected_outputs = _selected_outputs(output_settings, declared, system)
             logger.info(
                 "diff step 3/6: found deploy config at %s (system mode: %s, "
                 "targets: %s)",
@@ -1479,28 +1473,6 @@ def _change_stages(
                 )
             )
     return tuple(stages)
-
-
-def _declared_targets(deploy_config: Path) -> tuple[str, ...] | None:
-    """Return the names of the targets a config directory declares.
-
-    manifest-builder takes what to generate either as template variables or, for
-    a ``version = 2`` config directory, as the name of a target, so relcoord has
-    to know which layout a config commit uses before it calls generate(). A
-    directory holding no top-level config file at all is left to manifest-builder
-    to report on, since it says that better than a version check would.
-
-    Returns None for a config directory that declares config blocks directly,
-    which has no targets to choose between.
-    """
-    try:
-        config_file = find_config_file(deploy_config)
-    except FileNotFoundError:
-        return None
-    data = load_toml_file(config_file)
-    if config_version(data, config_file) != TARGETS_VERSION:
-        return None
-    return tuple(target.name for target in parse_targets(data, config_file))
 
 
 def _selected_outputs(

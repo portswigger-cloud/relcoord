@@ -449,37 +449,6 @@ def test_change_processor_generates_configured_outputs_with_vars(
     ]
 
 
-@pytest.mark.parametrize(
-    ("contents", "expected"),
-    [
-        pytest.param(None, None, id="no-config-file"),
-        pytest.param('[simple.api]\nimage = "api:1"\n', None, id="blocks"),
-        pytest.param('version = 1\n[simple.api]\nimage = "api:1"\n', None, id="v1"),
-        pytest.param(
-            'version = 2\n\n[[target]]\nname = "dev"\nsections = ["app"]\n\n'
-            '[[target]]\nname = "prod"\nsections = ["app"]\n',
-            ("dev", "prod"),
-            id="v2",
-        ),
-    ],
-)
-def test_declared_targets_reads_the_names_a_config_declares(
-    tmp_path: Path, contents: str | None, expected: tuple[str, ...] | None
-) -> None:
-    if contents is not None:
-        (tmp_path / "config.toml").write_text(contents)
-
-    assert change._declared_targets(tmp_path) == expected
-
-
-def test_declared_targets_reads_a_manifest_builder_toml(tmp_path: Path) -> None:
-    (tmp_path / "manifest-builder.toml").write_text(
-        'version = 2\n\n[[target]]\nname = "dev"\nsections = ["app"]\n'
-    )
-
-    assert change._declared_targets(tmp_path) == ("dev",)
-
-
 def test_change_processor_generates_only_the_targets_a_config_declares(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
