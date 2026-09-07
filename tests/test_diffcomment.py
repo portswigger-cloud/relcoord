@@ -93,7 +93,7 @@ def _fake_git(
         deploy_config.mkdir(parents=True)
         if targets:
             (deploy_config / "config.toml").write_text(
-                'version = 2\n\n[[target]]\nname = "dev"\n'
+                'version = 2\n\n[[target]]\nname = "dev"\nsections = ["app"]\n'
             )
 
     def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
@@ -390,7 +390,15 @@ def test_diff_generates_a_target_for_a_version_2_config(
             directory=Path("example-dev"),
             vars={"cluster_name": "example-dev"},
             target="dev",
-        )
+        ),
+        # Nothing in the config declares this output's target, so a diff of it
+        # is not something the commit asks for.
+        OutputSettings(
+            name="example-prod",
+            repository=MANIFESTS_REPO,
+            directory=Path("example-prod"),
+            target="prod",
+        ),
     ]
 
     DiffCommentProcessor(outputs=outputs, commenter=Commenter()).diff(

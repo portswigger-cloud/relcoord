@@ -449,33 +449,7 @@ def test_change_processor_generates_configured_outputs_with_vars(
     ]
 
 
-@pytest.mark.parametrize(
-    ("contents", "expected"),
-    [
-        pytest.param(None, False, id="no-config-file"),
-        pytest.param('[simple.api]\nimage = "api:1"\n', False, id="blocks"),
-        pytest.param('version = 1\n[simple.api]\nimage = "api:1"\n', False, id="v1"),
-        pytest.param('version = 2\n\n[[target]]\nname = "dev"\n', True, id="v2"),
-    ],
-)
-def test_declares_targets_reads_the_top_level_config_version(
-    tmp_path: Path, contents: str | None, expected: bool
-) -> None:
-    if contents is not None:
-        (tmp_path / "config.toml").write_text(contents)
-
-    assert change._declares_targets(tmp_path) is expected
-
-
-def test_declares_targets_reads_a_manifest_builder_toml(tmp_path: Path) -> None:
-    (tmp_path / "manifest-builder.toml").write_text(
-        'version = 2\n\n[[target]]\nname = "dev"\n'
-    )
-
-    assert change._declares_targets(tmp_path) is True
-
-
-def test_change_processor_generates_targets_for_a_version_2_config(
+def test_change_processor_generates_only_the_targets_a_config_declares(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[tuple[object, ...]] = []
@@ -501,7 +475,7 @@ def test_change_processor_generates_targets_for_a_version_2_config(
         deploy_config = target / ".deploy"
         deploy_config.mkdir(parents=True)
         (deploy_config / "config.toml").write_text(
-            'version = 2\n\n[[target]]\nname = "example-dev"\n'
+            'version = 2\n\n[[target]]\nname = "example-dev"\nsections = ["app"]\n'
         )
 
     def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
@@ -545,15 +519,102 @@ def test_change_processor_generates_targets_for_a_version_2_config(
         progress=events.append,
     )
 
-    assert result.generated_count == 2
-    # An output that names no target generates the one sharing its name.
-    assert calls == [
-        ("generate", "example-dev", "example-dev"),
-        ("generate", "example-prod", "prod"),
-    ]
+    assert result.generated_count == 1
+    # Only the declared target is generated, and an output that names no target
+    # of its own is matched by its name. example-prod, whose target is 'prod',
+    # is nothing this config asks for and so is not work at all.
+    assert calls == [("generate", "example-dev", "example-dev")]
     by_phase = {event.phase: event for event in events}
     assert by_phase["deploy-config"].detail["targets"] is True
-    assert by_phase["generate"].detail["target"] == "prod"
+    assert by_phase["generate"].detail["target"] == "example-dev"
+
+
+def test_change_processor_fails_when_a_declared_target_matches_no_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A target reaching no output is a mistake, not a cluster to skip.
+
+    Read as "not for any of these clusters", a mistyped target name would
+    deploy nothing and say nothing, so it fails by name instead.
+    """
+    outputs = [
+        OutputSettings(
+            name="example-dev",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-dev"),
+        )
+    ]
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        deploy_config = target / ".deploy"
+        deploy_config.mkdir(parents=True)
+        (deploy_config / "config.toml").write_text(
+            'version = 2\n\n[[target]]\nname = "exampel-dev"\nsections = ["app"]\n'
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", lambda *a, **k: None)
+
+    with pytest.raises(ChangeProcessingError, match="exampel-dev"):
+        ChangeProcessor(outputs=outputs).process(
+            "https://github.com/acme/config.git", "deadbeef", None
+        )
+
+
+def test_change_processor_generates_every_output_in_system_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The system repository is where outputs are declared, so it selects none.
+
+    An unknown target there is a misconfiguration of the repository that owns
+    the outputs, and stays manifest-builder's to report.
+    """
+    calls: list[str] = []
+    outputs = [
+        OutputSettings(
+            name="example-dev",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-dev"),
+        ),
+        OutputSettings(
+            name="example-prod",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-prod"),
+        ),
+    ]
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "config.toml").write_text(
+            'version = 2\n\n[[target]]\nname = "example-dev"\nsections = ["app"]\n'
+        )
+
+    def fake_generate(deploy_config, output_path, **kwargs) -> GenerationResult:
+        calls.append(kwargs["target"])
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified=set(),
+            removed=set(),
+            deploy_id=None,
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", lambda *a, **k: None)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *args, **kwargs: None)
+
+    ChangeProcessor(outputs=outputs).process(
+        "https://github.com/acme/system.git", "deadbeef", None, system=True
+    )
+
+    assert calls == ["example-dev", "example-prod"]
 
 
 def test_change_processor_skips_commit_and_push_when_no_changes(
@@ -1703,6 +1764,33 @@ def test_change_stages_without_rollouts_deploy_every_output_at_once() -> None:
         "platform-dev",
         "platform-prod",
         "observability",
+    ]
+
+
+def test_change_stages_narrow_a_stage_to_the_selected_outputs() -> None:
+    """A stage naming a cluster this change does not deploy to is left empty.
+
+    Rollout stages are configured against every output, so a change that
+    generates into one of them keeps the ordering and finds the other stages
+    with nothing to do.
+    """
+    rollout = RolloutSettings(
+        name="linear",
+        stages=(
+            RolloutStage(outputs=("platform-dev",)),
+            RolloutStage(outputs=("platform-prod", "observability")),
+        ),
+    )
+
+    stages = change._change_stages(
+        ROLLOUT_OUTPUTS,
+        (rollout,),
+        [output for output in ROLLOUT_OUTPUTS if output.name == "platform-prod"],
+    )
+
+    assert [[output.name for output in stage.outputs] for stage in stages] == [
+        [],
+        ["platform-prod"],
     ]
 
 
