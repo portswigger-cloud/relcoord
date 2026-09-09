@@ -65,6 +65,24 @@ DISCOVERY = {
             },
         ]
     },
+    # Served as well as advertised, as an API server does, and serving the same
+    # resources as v1: discovery reads every version a group offers.
+    "/apis/apps/v1beta1": {
+        "resources": [
+            {
+                "name": "deployments",
+                "kind": "Deployment",
+                "namespaced": True,
+                "verbs": ["get", "list", "watch"],
+            },
+            {
+                "name": "statefulsets",
+                "kind": "StatefulSet",
+                "namespaced": True,
+                "verbs": ["get", "list", "watch"],
+            },
+        ]
+    },
 }
 
 
@@ -1119,3 +1137,103 @@ def test_cluster_client_rejects_a_missing_ca_certificate(tmp_path: Path) -> None
                 ca_path=tmp_path / "absent.pem",
             )
         )
+
+
+def teleport_shaped_discovery() -> dict[str, Any]:
+    """DISCOVERY, plus a group whose versions serve different kinds.
+
+    The Teleport operator's CRDs: resources.teleport.dev prefers v6, which
+    serves only TeleportRole, while v1 serves TeleportRoleV8 and most of the
+    others. Discovering the preferred version alone finds neither the kinds
+    the other versions define nor, therefore, most of what it installs.
+    """
+    discovery: dict[str, Any] = dict(DISCOVERY)
+    discovery["/apis"] = {
+        "groups": [
+            {"name": "apps", "preferredVersion": {"version": "v1"}},
+            {
+                "name": "resources.teleport.dev",
+                "preferredVersion": {"version": "v6"},
+                "versions": [{"version": "v6"}, {"version": "v5"}, {"version": "v1"}],
+            },
+        ]
+    }
+    for version, name, kind in (
+        ("v6", "teleportroles", "TeleportRole"),
+        ("v5", "teleportroles", "TeleportRole"),
+        ("v1", "teleportrolesv8", "TeleportRoleV8"),
+    ):
+        discovery[f"/apis/resources.teleport.dev/{version}"] = {
+            "resources": [
+                {
+                    "name": name,
+                    "kind": kind,
+                    "namespaced": True,
+                    "verbs": ["get", "list", "watch"],
+                }
+            ]
+        }
+    return discovery
+
+
+def test_detector_finds_a_kind_a_non_preferred_group_version_serves() -> None:
+    discovery = teleport_shaped_discovery()
+    listed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in discovery:
+            return httpx.Response(200, json=discovery[path])
+        listed.append(path)
+        return httpx.Response(200, json=listing(annotated("canary", DEPLOY_ID)))
+
+    detector(handler).wait_for_success(
+        deploy_id=DEPLOY_ID,
+        created_or_modified={
+            Ref(
+                "TeleportRoleV8",
+                "teleport-permissions",
+                "canary",
+                "resources.teleport.dev/v1",
+            )
+        },
+        removed=set(),
+    )
+
+    expected = (
+        "/apis/resources.teleport.dev/v1"
+        "/namespaces/teleport-permissions/teleportrolesv8"
+    )
+    assert listed == [expected]
+
+
+def test_detector_keeps_a_kind_several_versions_share_unambiguous() -> None:
+    """TeleportRole is served by v5 and v6, and is one resource, not two."""
+    discovery = teleport_shaped_discovery()
+    listed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in discovery:
+            return httpx.Response(200, json=discovery[path])
+        listed.append(path)
+        return httpx.Response(200, json=listing(annotated("sso-user", DEPLOY_ID)))
+
+    detector(handler).wait_for_success(
+        deploy_id=DEPLOY_ID,
+        created_or_modified={
+            Ref(
+                "TeleportRole",
+                "teleport-permissions",
+                "sso-user",
+                "resources.teleport.dev/v5",
+            )
+        },
+        removed=set(),
+    )
+
+    # The preferred version, not the one the ref named and not both.
+    expected = (
+        "/apis/resources.teleport.dev/v6/namespaces/teleport-permissions/teleportroles"
+    )
+    assert listed == [expected]
