@@ -498,8 +498,9 @@ class KubernetesDeploymentDetector:
 
         The group comes from the ref's apiVersion and is what separates a kind
         Kubernetes defines from one a provider CRD defines under the same name.
-        Only the group is compared, not the version: discovery reports one
-        version of each group, and a kind is the same kind in all of them.
+        Only the group is compared, not the version: a kind is the same kind in
+        every version of its group that serves it, and a manifest may name a
+        version other than the one discovery reached it through.
 
         A ref carrying no apiVersion is matched on kind and scope alone, which
         is all there is to go on. Where that leaves several resources the wait
@@ -604,15 +605,27 @@ class KubernetesDeploymentDetector:
 def _group_versions(group: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the versions of an API group to discover resources from.
 
-    Only the preferred version, where the group names one: a kind served by
-    several versions of the same group is one kind, and discovering all of them
-    would make it look ambiguous.
+    Every version, because a group is free to serve different kinds from
+    different versions rather than different versions of the same kinds. The
+    Teleport operator's CRDs do exactly that: resources.teleport.dev prefers
+    v6, which serves one of its 31 kinds, while v1 serves 25 of the others.
+
+    The preferred version comes first so that a kind several versions do share
+    is reached through the version the group nominates; _add_resources drops
+    the later duplicates.
     """
+    versions = [
+        version for version in group.get("versions", []) if isinstance(version, dict)
+    ]
     preferred = group.get("preferredVersion")
     if isinstance(preferred, dict) and preferred.get("version"):
-        return [preferred]
-    versions = group.get("versions", [])
-    return [version for version in versions if isinstance(version, dict)]
+        others = [
+            version
+            for version in versions
+            if version.get("version") != preferred.get("version")
+        ]
+        return [preferred, *others]
+    return versions
 
 
 def _symmetric_jitter(delay: float) -> float:
@@ -952,13 +965,23 @@ def _add_resources(
             or "watch" not in verbs
         ):
             continue
-        resources.setdefault(kind, []).append(
-            KubernetesResource(
-                path_prefix=path_prefix,
-                name=name,
-                namespaced=namespaced,
-            )
+        candidate = KubernetesResource(
+            path_prefix=path_prefix,
+            name=name,
+            namespaced=namespaced,
         )
+        already_known = resources.setdefault(kind, [])
+        # Several versions of one group may serve the same resource, and those
+        # are the same resource: keep the first, which _group_versions ordered
+        # to be the group's preferred version, so a kind stays unambiguous.
+        if any(
+            known.name == candidate.name
+            and known.namespaced == candidate.namespaced
+            and known.group == candidate.group
+            for known in already_known
+        ):
+            continue
+        already_known.append(candidate)
 
 
 def _api_group(api_version: str) -> str:
