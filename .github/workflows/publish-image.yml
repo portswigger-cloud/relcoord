@@ -69,7 +69,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: arn:aws:iam::436027055282:role/product-roles/relcoord-ecr-publish
+          role-to-assume: arn:aws:iam::436027055282:role/crossplane/relcoord-ecr-publish
           aws-region: us-east-1
 
       - name: Check whether the image is already published
