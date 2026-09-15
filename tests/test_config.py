@@ -607,6 +607,75 @@ def test_settings_rejects_duplicate_role_names(tmp_path: Path) -> None:
         Settings.from_toml(config)
 
 
+def test_settings_parses_a_role_restricted_to_an_output(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "observability-prod"
+        repository = "https://github.com/acme/manifests"
+        directory = "observability-prod"
+
+        [[role]]
+        name = "grafana-resources"
+        audience = "relcoord"
+        issuer = "https://issuer"
+        output = "observability-prod"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.roles[0].outputs == ("observability-prod",)
+
+
+def test_settings_rejects_a_role_naming_an_unconfigured_output(
+    tmp_path: Path,
+) -> None:
+    """A restriction naming nothing would refuse every change that used it."""
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "observability-prod"
+        repository = "https://github.com/acme/manifests"
+        directory = "observability-prod"
+
+        [[role]]
+        name = "grafana-resources"
+        audience = "relcoord"
+        issuer = "https://issuer"
+        output = "observability-prd"
+        """
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="role 'grafana-resources' names output 'observability-prd'",
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_role_outputs_without_output_entries(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        manifests-repository = "https://github.com/acme/manifests"
+
+        [[role]]
+        name = "grafana-resources"
+        audience = "relcoord"
+        issuer = "https://issuer"
+        output = "observability-prod"
+        """
+    )
+
+    with pytest.raises(ValueError, match="requires \\[\\[output\\]\\] entries"):
+        Settings.from_toml(config)
+
+
 def test_settings_explains_multiline_inline_table_parse_errors(
     tmp_path: Path,
 ) -> None:

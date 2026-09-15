@@ -369,6 +369,7 @@ class Settings:
                 raise ValueError(f"duplicate role '{role.name}'")
             seen.add(role.name)
             roles.append(role)
+        _check_role_outputs(roles, outputs)
         if "host" in data:
             logger.warning(
                 "The 'host' config option is deprecated; use 'listen' instead"
@@ -544,6 +545,32 @@ def _check_rollout_outputs(
             "every output must appear in a rollout stage once rollouts are "
             f"configured; {', '.join(unstaged)} does not"
         )
+
+
+def _check_role_outputs(roles: list[RoleConfig], outputs: list[OutputSettings]) -> None:
+    """Reject a role naming an output this deployment does not configure.
+
+    A role's outputs are the set a change from it may deploy to, so a name
+    matching no output refuses every change that selects it -- and, because a
+    role naming outputs deploys only those, a typo silently narrows a pipeline
+    to nothing rather than failing loudly at the request.
+    """
+    configured = {output.name for output in outputs}
+    for role in roles:
+        if not role.outputs:
+            continue
+        if not configured:
+            raise ValueError(
+                f"role '{role.name}' names outputs, which requires [[output]] "
+                "entries; manifests-repository does not name outputs a role can "
+                "be restricted to"
+            )
+        for name in role.outputs:
+            if name not in configured:
+                raise ValueError(
+                    f"role '{role.name}' names output '{name}', which is not "
+                    f"configured; expected one of {', '.join(sorted(configured))}"
+                )
 
 
 def _check_validated_outputs(

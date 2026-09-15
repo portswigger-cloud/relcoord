@@ -55,6 +55,8 @@ class RoleConfig:
     jwks_uri: str | None = None
     claims: dict[str, str] = field(default_factory=dict)
     allow_system: bool = False
+    outputs: tuple[str, ...] = ()
+    """Outputs a change from this role may deploy to, empty for every output."""
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> RoleConfig:
@@ -67,6 +69,7 @@ class RoleConfig:
         allow_system = _optional_bool(
             data, "allow_system", context=f"role '{name}'", alias="allow-system"
         )
+        outputs = _role_outputs(data, context=f"role '{name}'")
 
         raw_claims = data.get("claims", {})
         if not isinstance(raw_claims, dict):
@@ -87,6 +90,7 @@ class RoleConfig:
             jwks_uri=jwks_uri,
             claims=claims,
             allow_system=allow_system,
+            outputs=outputs,
         )
 
 
@@ -95,6 +99,8 @@ class ValidatedClaims:
     role: str
     claims: dict[str, Any]
     allow_system: bool = False
+    outputs: tuple[str, ...] = ()
+    """Outputs a change from this role may deploy to, empty for every output."""
 
     @property
     def subject(self) -> str:
@@ -227,7 +233,10 @@ class TokenValidator:
                 "Bearer token accepted for role '%s' (%s)", role.name, token_summary
             )
             return ValidatedClaims(
-                role=role.name, claims=claims, allow_system=role.allow_system
+                role=role.name,
+                claims=claims,
+                allow_system=role.allow_system,
+                outputs=role.outputs,
             )
         raise AuthError(
             f"token did not validate against any configured role: {last_error}"
@@ -443,6 +452,43 @@ def _optional_string(
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{context} {key} must be a non-empty string")
     return value
+
+
+def _role_outputs(data: dict[str, Any], *, context: str) -> tuple[str, ...]:
+    """Parse a role's ``output``/``outputs`` into the outputs it may deploy to.
+
+    One output is the common case, so it may be written as a bare ``output``
+    string rather than a list of one. A role that names none deploys every
+    configured output, as every role did before this existed, and a change from
+    it may not select between them: the set it would be selecting from was never
+    configured, so a request naming one is asking for something the role does
+    not have.
+    """
+    single = data.get("output")
+    plural = data.get("outputs")
+    if single is not None and plural is not None:
+        raise ValueError(f"{context} must set either output or outputs, not both")
+    if single is not None:
+        if not isinstance(single, str) or not single.strip():
+            raise ValueError(f"{context} output must be a non-empty string")
+        return (single,)
+    if plural is None:
+        return ()
+    if not isinstance(plural, list):
+        raise TypeError(f"{context} outputs must be an array of strings")
+    names: list[str] = []
+    for value in plural:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{context} outputs must be non-empty strings")
+        if value in names:
+            raise ValueError(f"{context} names output '{value}' twice")
+        names.append(value)
+    if not names:
+        raise ValueError(
+            f"{context} outputs must name at least one output; leave it out for "
+            "every configured output"
+        )
+    return tuple(names)
 
 
 def _optional_bool(

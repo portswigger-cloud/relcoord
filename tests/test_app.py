@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import threading
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -312,6 +312,7 @@ def test_change_passes_image_reference_to_processor() -> None:
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -386,6 +387,7 @@ def test_change_processes_deploy_config_when_processor_is_configured(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -440,6 +442,7 @@ def test_change_processor_logs_from_worker_thread(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -484,6 +487,7 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -560,6 +564,7 @@ def test_change_reports_missing_deploy_config(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -604,6 +609,7 @@ def test_change_reports_credential_error_without_traceback(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -656,6 +662,7 @@ def test_change_reports_git_transport_error_without_traceback(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -704,6 +711,7 @@ def test_change_reports_a_stopped_rollout_without_traceback(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -756,6 +764,7 @@ def _config_path_recording_client() -> tuple[TestClient, list[str]]:
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -822,16 +831,18 @@ def test_change_rejects_invalid_config_path(config_path: str) -> None:
 
 
 class _StubPrincipal:
-    def __init__(self, allow_system: bool) -> None:
+    def __init__(self, allow_system: bool, outputs: tuple[str, ...] = ()) -> None:
         self.allow_system = allow_system
+        self.outputs = outputs
 
 
 class _StubValidator:
-    def __init__(self, allow_system: bool) -> None:
+    def __init__(self, allow_system: bool, outputs: tuple[str, ...] = ()) -> None:
         self._allow_system = allow_system
+        self._outputs = outputs
 
     def validate(self, authorization_header: str | None) -> object:
-        return _StubPrincipal(self._allow_system)
+        return _StubPrincipal(self._allow_system, self._outputs)
 
 
 def _system_recording_client(
@@ -847,6 +858,7 @@ def _system_recording_client(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:
@@ -938,6 +950,147 @@ def test_change_rejects_system_with_image() -> None:
     assert response.status_code == 400
     assert response.json()["error"] == "invalid_system_image"
     assert systems == []
+
+
+def _outputs_recording_client(
+    token_validator: RequestTokenValidator | None = None,
+) -> tuple[TestClient, list[tuple[str, ...]]]:
+    """A client whose processor records the outputs each change was handed."""
+    selections: list[tuple[str, ...]] = []
+
+    class Processor:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+            system: bool = False,
+            outputs: Sequence[str] = (),
+            *,
+            progress: ProgressSink = ignore_progress,
+        ) -> object:
+            selections.append(tuple(outputs))
+            return type("Result", (), {"generated_count": 0})()
+
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=(
+                token_validator if token_validator is not None else NoopTokenValidator()
+            ),
+            change_processor=Processor(),
+        )
+    )
+    return client, selections
+
+
+CHANGE_REQUEST = {"config_repo": "acme/config", "commit": "deadbeef"}
+
+
+def test_change_deploys_the_outputs_its_role_is_restricted_to() -> None:
+    """A restricted role needs no request field: its outputs are the default."""
+    client, selections = _outputs_recording_client(
+        _StubValidator(allow_system=False, outputs=("observability-prod",))
+    )
+
+    response = client.post("/v1/change", json=CHANGE_REQUEST)
+
+    assert response.status_code == 202
+    assert selections == [("observability-prod",)]
+
+
+def test_change_deploys_every_output_for_an_unrestricted_role() -> None:
+    client, selections = _outputs_recording_client(_StubValidator(allow_system=True))
+
+    response = client.post("/v1/change", json=CHANGE_REQUEST)
+
+    assert response.status_code == 202
+    assert selections == [()]
+
+
+def test_change_narrows_to_the_output_the_request_selects() -> None:
+    client, selections = _outputs_recording_client(
+        _StubValidator(
+            allow_system=False, outputs=("observability-prod", "platform-dev")
+        )
+    )
+
+    response = client.post(
+        "/v1/change", json={**CHANGE_REQUEST, "output": "platform-dev"}
+    )
+
+    assert response.status_code == 202
+    assert selections == [("platform-dev",)]
+
+
+def test_change_narrows_to_the_outputs_list_the_request_selects() -> None:
+    client, selections = _outputs_recording_client(
+        _StubValidator(
+            allow_system=False,
+            outputs=("observability-prod", "platform-dev", "management"),
+        )
+    )
+
+    response = client.post(
+        "/v1/change",
+        json={**CHANGE_REQUEST, "outputs": ["platform-dev", "management"]},
+    )
+
+    assert response.status_code == 202
+    assert selections == [("platform-dev", "management")]
+
+
+def test_change_refuses_an_output_the_role_does_not_permit() -> None:
+    client, selections = _outputs_recording_client(
+        _StubValidator(allow_system=False, outputs=("observability-prod",))
+    )
+
+    response = client.post(
+        "/v1/change", json={**CHANGE_REQUEST, "output": "platform-prod"}
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "output_not_allowed"
+    assert "platform-prod" in response.json()["message"]
+    assert selections == []
+
+
+def test_change_refuses_an_output_selection_from_an_unrestricted_role() -> None:
+    """Nothing was configured to choose between, so there is no choice to make."""
+    client, selections = _outputs_recording_client(_StubValidator(allow_system=True))
+
+    response = client.post(
+        "/v1/change", json={**CHANGE_REQUEST, "output": "platform-prod"}
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "output_not_allowed"
+    assert selections == []
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        {"output": "a", "outputs": ["a"]},
+        {"outputs": []},
+        {"outputs": "observability-prod"},
+        {"output": ""},
+    ],
+    ids=["both", "empty-list", "not-a-list", "empty-string"],
+)
+def test_change_rejects_a_malformed_output_selection(
+    selection: dict[str, object],
+) -> None:
+    client, selections = _outputs_recording_client(
+        _StubValidator(allow_system=False, outputs=("a",))
+    )
+
+    response = client.post("/v1/change", json={**CHANGE_REQUEST, **selection})
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_outputs"
+    assert selections == []
 
 
 def test_change_system_mode_rejected_when_role_disallows() -> None:
@@ -1126,6 +1279,7 @@ class ReportingProcessor:
         image: str | None,
         config_path: str = ".deploy",
         system: bool = False,
+        outputs: Sequence[str] = (),
         *,
         progress: ProgressSink = ignore_progress,
     ) -> object:
@@ -1252,6 +1406,7 @@ class BlockingProcessor:
         image: str | None,
         config_path: str = ".deploy",
         system: bool = False,
+        outputs: Sequence[str] = (),
         *,
         progress: ProgressSink = ignore_progress,
     ) -> object:
@@ -1546,6 +1701,7 @@ class _RecordingDiffProcessor:
         result: object | None = None,
     ) -> None:
         self.calls: list[tuple[str, str, str, bool, int | None]] = []
+        self.selections: list[tuple[str, ...]] = []
         self._steps = steps or []
         self._failure = failure
         self._result = result if result is not None else _stub_diff_result()
@@ -1556,11 +1712,13 @@ class _RecordingDiffProcessor:
         commit: str,
         config_path: str = ".deploy",
         system: bool = False,
+        outputs: Sequence[str] = (),
         *,
         pull_request: int | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         self.calls.append((repo, commit, config_path, system, pull_request))
+        self.selections.append(tuple(outputs))
         for step in self._steps:
             progress(step)
         if self._failure is not None:
@@ -1741,6 +1899,47 @@ def test_diffcomment_rejects_invalid_requests(
 
     assert response.status_code == 400
     assert response.json()["error"] == error
+    assert processor.calls == []
+
+
+def test_diffcomment_reports_only_the_outputs_its_role_permits() -> None:
+    """A diff is scoped like the change it previews, or it previews the wrong one."""
+    client, processor = _diff_client(
+        token_validator=_StubValidator(
+            allow_system=False, outputs=("observability-prod",)
+        )
+    )
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/config",
+            "commit": "deadbeef",
+        },
+    )
+
+    assert response.status_code == 200
+    assert processor.selections == [("observability-prod",)]
+
+
+def test_diffcomment_refuses_an_output_the_role_does_not_permit() -> None:
+    client, processor = _diff_client(
+        token_validator=_StubValidator(
+            allow_system=False, outputs=("observability-prod",)
+        )
+    )
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/config",
+            "commit": "deadbeef",
+            "output": "platform-prod",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "output_not_allowed"
     assert processor.calls == []
 
 
@@ -2021,6 +2220,7 @@ def test_change_reports_a_failed_validation_without_a_stack_trace(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            outputs: Sequence[str] = (),
             *,
             progress: ProgressSink = ignore_progress,
         ) -> object:

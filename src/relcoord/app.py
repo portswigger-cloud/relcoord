@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -68,6 +68,7 @@ class ChangeProcessor(Protocol):
         image: str | None,
         config_path: str = ...,
         system: bool = ...,
+        outputs: Sequence[str] = ...,
         *,
         progress: ProgressSink = ...,
     ) -> object: ...
@@ -80,6 +81,7 @@ class DiffProcessor(Protocol):
         commit: str,
         config_path: str = ...,
         system: bool = ...,
+        outputs: Sequence[str] = ...,
         *,
         pull_request: int | None = ...,
         progress: ProgressSink = ...,
@@ -117,6 +119,8 @@ class _ChangePlan:
     config_path: str
     system: bool
     manifest_image: str | None
+    outputs: tuple[str, ...] = ()
+    """Outputs this change may deploy to, empty for every configured output."""
     registered: dict[str, Any] | None = field(default=None)
 
 
@@ -129,10 +133,16 @@ class _DiffPlan:
     config_path: str
     system: bool
     pull_request: int | None
+    outputs: tuple[str, ...] = ()
+    """Outputs this diff may report on, empty for every configured output."""
 
 
 class _SystemNotAllowedError(Exception):
     """Raised when a principal requests system mode without the role for it."""
+
+
+class _OutputNotAllowedError(Exception):
+    """Raised when a request selects an output its role is not configured for."""
 
 
 class NoopChangeProcessor:
@@ -143,6 +153,7 @@ class NoopChangeProcessor:
         image: str | None,
         config_path: str = ".deploy",
         system: bool = False,
+        outputs: Sequence[str] = (),
         *,
         progress: ProgressSink = ignore_progress,
     ) -> object:
@@ -303,6 +314,7 @@ def create_app(
             config_path=config_path,
             system=system,
             manifest_image=manifest_image,
+            outputs=_permitted_outputs(payload, principal),
             registered=registered,
         )
 
@@ -323,6 +335,12 @@ def create_app(
                 error="system_not_allowed",
                 message="the authenticated role is not permitted to "
                 "request system-mode changes",
+            )
+        except _OutputNotAllowedError as exc:
+            return _json_error(
+                status_code=403,
+                error="output_not_allowed",
+                message=str(exc),
             )
         except TimestampConflictError as exc:
             return _bad_request(
@@ -355,6 +373,7 @@ def create_app(
                 plan.manifest_image,
                 plan.config_path,
                 plan.system,
+                plan.outputs,
             )
         except ChangeProcessingError as exc:
             status_code, error, message = _report_change_failure(request, plan, exc)
@@ -386,6 +405,12 @@ def create_app(
                 message="the authenticated role is not permitted to "
                 "request system-mode diffs",
             )
+        except _OutputNotAllowedError as exc:
+            return _json_error(
+                status_code=403,
+                error="output_not_allowed",
+                message=str(exc),
+            )
 
         logger.info(
             "Diffing change for repo %s at commit %s (pull request %s)",
@@ -407,6 +432,7 @@ def create_app(
                 plan.commit,
                 plan.config_path,
                 plan.system,
+                plan.outputs,
                 pull_request=plan.pull_request,
             )
         except ChangeProcessingError as exc:
@@ -600,6 +626,90 @@ def _principal_allows_system(principal: object) -> bool:
     return bool(getattr(principal, "allow_system", False))
 
 
+def _principal_outputs(principal: object) -> tuple[str, ...]:
+    """Return the outputs the authenticated role may deploy to.
+
+    Empty for a role that names none, which is every output -- and for a None
+    principal, meaning authentication is disabled and there is no restriction
+    to enforce.
+    """
+    if principal is None:
+        return ()
+    outputs = getattr(principal, "outputs", ())
+    return tuple(outputs) if isinstance(outputs, tuple | list) else ()
+
+
+def _permitted_outputs(payload: dict[str, Any], principal: object) -> tuple[str, ...]:
+    """Resolve which outputs this request is allowed to deploy to.
+
+    The role's outputs are the ceiling and the default: a request that selects
+    none deploys every output the role names, and a request that selects some
+    may only narrow within them. A role naming none is unrestricted, and cannot
+    be narrowed by a request either -- the set it would be choosing from was
+    never configured, so naming one is asking for something the role does not
+    have rather than for less than it has.
+    """
+    requested = _requested_outputs(payload)
+    permitted = _principal_outputs(principal)
+    if not permitted:
+        if requested:
+            raise _OutputNotAllowedError(
+                "the authenticated role configures no outputs, so a request "
+                "cannot select between them"
+            )
+        return ()
+    if not requested:
+        return permitted
+    refused = [name for name in requested if name not in permitted]
+    if refused:
+        raise _OutputNotAllowedError(
+            f"the authenticated role is not permitted to deploy to "
+            f"{', '.join(refused)}; it is configured for {', '.join(permitted)}"
+        )
+    return requested
+
+
+def _requested_outputs(payload: dict[str, Any]) -> tuple[str, ...]:
+    """Parse the request's ``output``/``outputs`` selection.
+
+    Spelled the same way a role spells its own restriction, so the one output a
+    request usually wants is a bare string rather than a list of one.
+    """
+    single = payload.get("output")
+    plural = payload.get("outputs")
+    if single is not None and plural is not None:
+        raise ValidationError(
+            error="invalid_outputs",
+            message="output and outputs cannot be combined; use one of them",
+        )
+    if single is not None:
+        return (
+            ensure_string(
+                payload,
+                "output",
+                error="invalid_outputs",
+                message="output must be a non-empty string",
+            ),
+        )
+    if plural is None:
+        return ()
+    names = _required_non_empty_string_list(
+        payload,
+        "outputs",
+        error="invalid_outputs",
+        message="outputs must be an array of non-empty strings",
+    )
+    if not names:
+        # An empty list is not "every output": a request that means that leaves
+        # the field out, and one that sent an empty list built it from something.
+        raise ValidationError(
+            error="invalid_outputs",
+            message="outputs must name at least one output; leave it out to "
+            "deploy every output the role permits",
+        )
+    return tuple(dict.fromkeys(names))
+
+
 def _change_system_flag(payload: dict[str, Any]) -> bool:
     if "system" not in payload:
         return False
@@ -654,6 +764,7 @@ def _plan_diff(payload: dict[str, Any], principal: object) -> _DiffPlan:
         config_path=_change_config_path(payload),
         system=system,
         pull_request=pull_request,
+        outputs=_permitted_outputs(payload, principal),
     )
 
 
@@ -924,6 +1035,7 @@ def _change_events(
                 plan.manifest_image,
                 plan.config_path,
                 plan.system,
+                plan.outputs,
                 progress=progress,
             ),
             complete=lambda result: _change_completion(plan, result),
