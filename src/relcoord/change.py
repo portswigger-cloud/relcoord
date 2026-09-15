@@ -264,6 +264,7 @@ class ChangeProcessor:
         image: str | None,
         config_path: str = ".deploy",
         system: bool = False,
+        outputs: Sequence[str] = (),
         *,
         progress: ProgressSink = ignore_progress,
     ) -> ChangeResult:
@@ -274,9 +275,8 @@ class ChangeProcessor:
         try:
             source_checkout = workdir / "source"
             output_settings = self._configured_outputs()
-            checkout_by_repository = _checkout_paths_by_repository(
-                workdir, output_settings
-            )
+            permitted = _permitted_outputs(output_settings, outputs)
+            checkout_by_repository = _checkout_paths_by_repository(workdir, permitted)
             # The workspace is a temporary directory nobody watching a deployment
             # cares about, so it is logged for whoever debugs a change and left
             # out of the stream.
@@ -304,7 +304,9 @@ class ChangeProcessor:
             )
             declared = declared_targets(deploy_config)
             declares_targets = declared is not None
-            selected_outputs = _selected_outputs(output_settings, declared, system)
+            selected_outputs = _selected_outputs(
+                permitted, declared, system, configured=output_settings
+            )
             logger.info(
                 "change step 3/7: found deploy config at %s (system mode: %s, "
                 "targets: %s)",
@@ -339,14 +341,14 @@ class ChangeProcessor:
                 _report_stage(stage, report)
                 stage_results: list[tuple[OutputSettings, GenerationResult]] = []
 
-                for repository, outputs in _outputs_by_repository(stage.outputs):
+                for repository, stage_outputs in _outputs_by_repository(stage.outputs):
                     manifests_checkout = checkout_by_repository[repository]
                     if repository not in cloned:
                         self._clone_manifests(repository, manifests_checkout, report)
                         cloned.add(repository)
                     generation_results: list[GenerationResult] = []
 
-                    for output in outputs:
+                    for output in stage_outputs:
                         output_result, generation_result = self._generate_output(
                             output,
                             stage,
@@ -774,6 +776,7 @@ class DiffCommentProcessor:
         commit: str,
         config_path: str = ".deploy",
         system: bool = False,
+        outputs: Sequence[str] = (),
         *,
         pull_request: int | None = None,
         progress: ProgressSink = ignore_progress,
@@ -787,9 +790,8 @@ class DiffCommentProcessor:
             output_settings = _resolve_output_settings(
                 self.outputs, self.manifests_repository
             )
-            checkout_by_repository = _checkout_paths_by_repository(
-                workdir, output_settings
-            )
+            permitted = _permitted_outputs(output_settings, outputs)
+            checkout_by_repository = _checkout_paths_by_repository(workdir, permitted)
             logger.info(
                 "diff step 1/6: created temporary workspace %s for repo %s "
                 "at commit %s",
@@ -818,7 +820,9 @@ class DiffCommentProcessor:
             )
             declared = declared_targets(deploy_config)
             declares_targets = declared is not None
-            selected_outputs = _selected_outputs(output_settings, declared, system)
+            selected_outputs = _selected_outputs(
+                permitted, declared, system, configured=output_settings
+            )
             logger.info(
                 "diff step 3/6: found deploy config at %s (system mode: %s, "
                 "targets: %s)",
@@ -1475,10 +1479,34 @@ def _change_stages(
     return tuple(stages)
 
 
+def _permitted_outputs(
+    configured: Sequence[OutputSettings], permitted: Sequence[str]
+) -> tuple[OutputSettings, ...]:
+    """Narrow the configured outputs to the ones this change may deploy to.
+
+    This is the authenticated role's restriction, so it is a ceiling rather than
+    a selection: a change from a restricted role cannot reach an output outside
+    it however its config is written, and what the config then declares is
+    selected from what is left. An empty restriction is every configured output,
+    which is what a role that names none gets.
+    """
+    if not permitted:
+        return tuple(configured)
+    by_name = {output.name: output for output in configured}
+    unknown = [name for name in permitted if name not in by_name]
+    if unknown:
+        raise ChangeProcessingError(
+            f"output(s) {', '.join(unknown)} are not configured; expected one of "
+            f"{', '.join(sorted(by_name))}"
+        )
+    return tuple(by_name[name] for name in dict.fromkeys(permitted))
+
+
 def _selected_outputs(
     outputs: Sequence[OutputSettings],
     declared: tuple[str, ...] | None,
     system: bool,
+    configured: Sequence[OutputSettings] | None = None,
 ) -> tuple[OutputSettings, ...]:
     """Return the outputs a config commit asks to be generated into.
 
@@ -1492,12 +1520,28 @@ def _selected_outputs(
     A directory that declares config blocks directly has no targets to select
     with and is generated into every output, as is the system repository, which
     is where the outputs are declared in the first place.
+
+    ``outputs`` are the ones this change may reach, which a role restricted to
+    an output has already narrowed; ``configured`` is every output there is, and
+    is what tells a target withheld from this caller apart from one naming no
+    output at all.
     """
     if declared is None or system:
         return tuple(outputs)
     by_target = {output.target_name: output for output in outputs}
     unmatched = sorted(set(declared) - set(by_target))
     if unmatched:
+        # A target matching an output the role was restricted away from is a
+        # refusal, not a misconfiguration, and reads as one: the config is
+        # right and this caller is not allowed to deploy it.
+        withheld = sorted(
+            set(unmatched) & {output.target_name for output in configured or ()}
+        )
+        if withheld:
+            raise ChangeProcessingError(
+                f"config declares target(s) {', '.join(withheld)}, which the "
+                f"authenticated role is not permitted to deploy to"
+            )
         raise ChangeProcessingError(
             f"config declares target(s) {', '.join(unmatched)}, which match no "
             f"configured output"

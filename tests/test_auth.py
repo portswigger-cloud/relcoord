@@ -86,6 +86,7 @@ def _role(
     issuer: str = "https://issuer.example.com",
     claims: dict[str, str] | None = None,
     allow_system: bool = False,
+    outputs: tuple[str, ...] = (),
 ) -> RoleConfig:
     return RoleConfig(
         name=name,
@@ -94,6 +95,7 @@ def _role(
         jwks_uri="https://issuer.example.com/.well-known/jwks.json",
         claims=claims or {"sub": "system:serviceaccount:default:default"},
         allow_system=allow_system,
+        outputs=outputs,
     )
 
 
@@ -147,6 +149,83 @@ def test_validator_exposes_allow_system_from_role(
     claims = validator.validate(token)
 
     assert claims.allow_system is True
+
+
+def test_validator_exposes_outputs_from_role(
+    private_pem: str, signing_key: PyJWK
+) -> None:
+    validator = _make_validator([_role(outputs=("observability-prod",))], signing_key)
+    token = _make_token(private_pem)
+
+    claims = validator.validate(token)
+
+    assert claims.outputs == ("observability-prod",)
+
+
+def test_validator_reports_no_outputs_for_an_unrestricted_role(
+    private_pem: str, signing_key: PyJWK
+) -> None:
+    validator = _make_validator([_role()], signing_key)
+    token = _make_token(private_pem)
+
+    claims = validator.validate(token)
+
+    assert claims.outputs == ()
+
+
+def _role_mapping(**extra: object) -> dict[str, object]:
+    return {
+        "name": "x",
+        "audience": "relcoord",
+        "issuer": "https://issuer.example.com",
+        **extra,
+    }
+
+
+def test_role_config_parses_a_single_output_as_a_one_element_tuple() -> None:
+    role = RoleConfig.from_mapping(_role_mapping(output="observability-prod"))
+
+    assert role.outputs == ("observability-prod",)
+
+
+def test_role_config_parses_an_outputs_list() -> None:
+    role = RoleConfig.from_mapping(
+        _role_mapping(outputs=["observability-prod", "platform-dev"])
+    )
+
+    assert role.outputs == ("observability-prod", "platform-dev")
+
+
+def test_role_config_defaults_to_no_outputs() -> None:
+    assert RoleConfig.from_mapping(_role_mapping()).outputs == ()
+
+
+def test_role_config_rejects_both_output_and_outputs() -> None:
+    with pytest.raises(ValueError, match="either output or outputs, not both"):
+        RoleConfig.from_mapping(
+            _role_mapping(output="a", outputs=["a"]),
+        )
+
+
+def test_role_config_rejects_an_empty_outputs_list() -> None:
+    """An empty list is not "every output"; leaving the field out is."""
+    with pytest.raises(ValueError, match="must name at least one output"):
+        RoleConfig.from_mapping(_role_mapping(outputs=[]))
+
+
+def test_role_config_rejects_a_repeated_output() -> None:
+    with pytest.raises(ValueError, match="names output 'a' twice"):
+        RoleConfig.from_mapping(_role_mapping(outputs=["a", "a"]))
+
+
+def test_role_config_rejects_a_non_string_output() -> None:
+    with pytest.raises(ValueError, match="output must be a non-empty string"):
+        RoleConfig.from_mapping(_role_mapping(output=""))
+
+
+def test_role_config_rejects_outputs_that_are_not_a_list() -> None:
+    with pytest.raises(TypeError, match="outputs must be an array of strings"):
+        RoleConfig.from_mapping(_role_mapping(outputs="observability-prod"))
 
 
 def test_role_config_from_mapping_parses_allow_system() -> None:

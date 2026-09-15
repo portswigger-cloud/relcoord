@@ -118,6 +118,60 @@ Rollout stages are configured against every output, so a change that generates
 into some of them keeps the configured ordering and finds the other stages with
 nothing to do.
 
+### Restricting a role to an output
+
+What a config repository declares says where it *wants* to deploy. A `[[role]]`
+says where it *may*, which is not the same question: without one, any
+authenticated repository can reach any cluster by declaring a target named after
+it.
+
+```toml
+[[role]]
+name = "grafana-resources"
+audience = "relcoord.observability-prod.portswigger.io"
+issuer = "https://token.actions.githubusercontent.com"
+claims = { repository = "example/grafana-resources", ref = "refs/heads/main" }
+output = "observability-prod"
+```
+
+`output` names one and `outputs` a list of several. The outputs a role names are
+both the ceiling and the default: a change from this role deploys
+`observability-prod` without asking, and cannot reach another cluster whatever
+its config declares. A role naming none is unrestricted, which is what every
+role was before this existed.
+
+A request may narrow within what its role permits, with an `output` or `outputs`
+field of its own, for a repository that deploys to several clusters and wants one
+of them this time:
+
+```bash
+curl -H 'content-type: application/json' \
+  -d '{"config_repo": "https://github.com/example/grafana-resources",
+       "commit": "deadbeef", "output": "observability-prod"}' \
+  http://localhost:8080/v1/change
+```
+
+Selecting an output the role does not name is refused with `output_not_allowed`
+(403), and so is selecting one at all from a role that names none: the set it
+would be choosing from was never configured, so naming one is asking for
+something the role does not have rather than for less than it has.
+
+The restriction applies before a config's own targets are read, so the two
+compose in the order they are written: the role decides which outputs exist for
+this caller, and the config's targets select among those. A config declaring a
+target for an output its role withholds is therefore refused rather than
+quietly generated for the rest — the config is right and the caller is not
+allowed to deploy it, and the message says that rather than sending whoever
+reads it looking for a typo.
+
+`/v1/diffcomment` is restricted the same way, because a diff that previews
+outputs the change cannot reach previews the wrong change.
+
+A role naming an output this deployment does not configure is a startup error,
+as is naming outputs with `manifests-repository` rather than `[[output]]`
+entries. A typo there would otherwise narrow a pipeline to nothing rather than
+fail at the request.
+
 ## Manifest validation
 
 With a `[validator]` section, every generated tree is validated by

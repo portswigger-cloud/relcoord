@@ -529,6 +529,145 @@ def test_change_processor_generates_only_the_targets_a_config_declares(
     assert by_phase["generate"].detail["target"] == "example-dev"
 
 
+def test_change_processor_deploys_only_the_outputs_its_role_permits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The role's restriction is a ceiling on what a change can reach.
+
+    This config declares no targets, so it is generated into every output it is
+    allowed to reach -- which is how the restriction, rather than the config,
+    comes to pick one. Without it both outputs would be generated.
+    """
+    calls: list[tuple[object, ...]] = []
+    outputs = [
+        OutputSettings(
+            name="example-dev",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-dev"),
+            vars={"cluster_name": "example-dev"},
+        ),
+        OutputSettings(
+            name="example-prod",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-prod"),
+            vars={"cluster_name": "example-prod"},
+        ),
+    ]
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        deploy_config = target / ".deploy"
+        deploy_config.mkdir(parents=True)
+        (deploy_config / "config.toml").write_text('[[simple]]\nname = "api"\n')
+
+    def fake_generate(
+        deploy_config: Path, output_path: Path, **kwargs: object
+    ) -> GenerationResult:
+        calls.append(("generate", output_path.name))
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified={
+                Ref(kind="Deployment", namespace="config", name="api")
+            },
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(
+        change, "_clone_repository", lambda repo, target, idcat, **kw: target.mkdir()
+    )
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *args, **kwargs: None)
+
+    result = ChangeProcessor(outputs=outputs).process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        None,
+        ".deploy",
+        False,
+        ["example-dev"],
+    )
+
+    assert result.generated_count == 1
+    assert calls == [("generate", "example-dev")]
+
+
+def test_change_processor_refuses_a_target_its_role_may_not_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A withheld output reads as a refusal, not as a missing output.
+
+    The config is right and the output is configured; this caller is simply not
+    allowed to deploy it, and the message has to say so or it sends whoever
+    reads it looking for a typo.
+    """
+    outputs = [
+        OutputSettings(
+            name="example-dev",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-dev"),
+        ),
+        OutputSettings(
+            name="example-prod",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-prod"),
+        ),
+    ]
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        deploy_config = target / ".deploy"
+        deploy_config.mkdir(parents=True)
+        (deploy_config / "config.toml").write_text(
+            'version = 2\n\n[[target]]\nname = "example-prod"\nsections = ["app"]\n'
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(
+        change, "_clone_repository", lambda repo, target, idcat, **kw: target.mkdir()
+    )
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+
+    with pytest.raises(
+        ChangeProcessingError,
+        match="target\\(s\\) example-prod, which the authenticated role is not "
+        "permitted",
+    ):
+        ChangeProcessor(outputs=outputs).process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            None,
+            ".deploy",
+            False,
+            ["example-dev"],
+        )
+
+
+def test_permitted_outputs_without_a_restriction_is_every_output() -> None:
+    assert change._permitted_outputs(ROLLOUT_OUTPUTS, ()) == tuple(ROLLOUT_OUTPUTS)
+
+
+def test_permitted_outputs_narrows_to_the_named_outputs() -> None:
+    permitted = change._permitted_outputs(
+        ROLLOUT_OUTPUTS, ["observability", "platform-dev"]
+    )
+
+    assert [output.name for output in permitted] == ["observability", "platform-dev"]
+
+
+def test_permitted_outputs_rejects_an_unconfigured_output() -> None:
+    with pytest.raises(
+        ChangeProcessingError, match="output\\(s\\) nope are not configured"
+    ):
+        change._permitted_outputs(ROLLOUT_OUTPUTS, ["nope"])
+
+
 def test_change_processor_fails_when_a_declared_target_matches_no_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
