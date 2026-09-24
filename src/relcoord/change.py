@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -158,7 +158,7 @@ class DeploymentDetector(Protocol):
         self,
         *,
         deploy_id: str,
-        created_or_modified: set[Any],
+        created_or_modified: Mapping[Any, str],
         removed: set[Any],
     ) -> None: ...
 
@@ -201,9 +201,10 @@ class OutputResult:
 
     ``created_or_modified`` and ``removed`` name the Kubernetes objects the
     commit touched, which manifest-builder reads back out of the manifests it
-    wrote, and ``deploy_id`` is the value of the noa.re/deploy-id annotation it
-    stamped on each of them. Together they are what deployment detection waits
-    for, and what a caller needs to follow the change into ``cluster``.
+    wrote, and ``deploy_id`` identifies the change as a whole. Deployment
+    detection waits for each created or modified object to carry the
+    noa.re/manifest-id manifest-builder stamped on it, and for each removed one
+    to be gone.
     """
 
     name: str
@@ -1737,7 +1738,7 @@ def _start_deployment_detection(
             "manifest-builder did not return a deploy_id; "
             "deployment detection requires git-backed generation"
         )
-    created_or_modified = set(generation_result.created_or_modified)
+    created_or_modified = dict(generation_result.manifest_ids)
     removed = set(generation_result.removed)
     logger.info(
         "starting deployment detection for manifest-builder deploy-id %s in cluster %s",
@@ -1802,7 +1803,7 @@ def _await_deployment_detection(
     try:
         active_detector.wait_for_success(
             deploy_id=deploy_id,
-            created_or_modified=set(generation_result.created_or_modified),
+            created_or_modified=dict(generation_result.manifest_ids),
             removed=set(generation_result.removed),
         )
     except Exception as exc:
@@ -1823,7 +1824,7 @@ def _await_deployment_detection(
 def _run_deployment_detection(
     *,
     deploy_id: str,
-    created_or_modified: set[Any],
+    created_or_modified: Mapping[Any, str],
     removed: set[Any],
     connection: OutputSettings | None,
     detector: DeploymentDetector | None,

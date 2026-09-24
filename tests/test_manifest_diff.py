@@ -207,6 +207,73 @@ def test_manifest_diff_keeps_a_one_off_metadata_change_in_the_diff(
     assert "app.kubernetes.io/version: v1.8.1" in result.diff
 
 
+def _with_manifest_id(manifest: str) -> str:
+    return manifest.replace("noa.re/deploy-id", "noa.re/manifest-id")
+
+
+def test_manifest_diff_filters_manifest_ids_out_of_the_diff(tmp_path: Path) -> None:
+    """Each changed object has its own manifest-id, so none repeat to summarize."""
+    repo = porcelain.init(str(tmp_path))
+    first = _commit(
+        repo,
+        {
+            "deployment.yaml": _with_manifest_id(
+                DEPLOYMENT.format(version="v1.8.0", deploy_id="old-deployment")
+            ),
+            "service.yaml": _with_manifest_id(
+                SERVICE.format(version="v1.8.0", deploy_id="old-service")
+            ),
+        },
+        "one",
+    )
+    second = _commit(
+        repo,
+        {
+            "deployment.yaml": _with_manifest_id(
+                DEPLOYMENT.format(version="v1.8.1", deploy_id="new-deployment")
+            ),
+            "service.yaml": _with_manifest_id(
+                SERVICE.format(version="v1.8.1", deploy_id="new-service")
+            ),
+        },
+        "two",
+    )
+
+    result = _diff(repo, first, second)
+
+    assert "noa.re/manifest-id" in result.diff
+    assert "noa.re/manifest-id" not in result.summary
+    assert result.filtered_diff is not None
+    assert "noa.re/manifest-id" not in result.filtered_diff
+    assert "image: example/app:v1.8.1" in result.filtered_diff
+
+
+def test_manifest_diff_drops_the_switch_from_deploy_id_to_manifest_id(
+    tmp_path: Path,
+) -> None:
+    repo = porcelain.init(str(tmp_path))
+    first = _commit(
+        repo,
+        {"deployment.yaml": DEPLOYMENT.format(version="v1.8.0", deploy_id="old")},
+        "one",
+    )
+    second = _commit(
+        repo,
+        {
+            "deployment.yaml": _with_manifest_id(
+                DEPLOYMENT.format(version="v1.8.0", deploy_id="new")
+            )
+        },
+        "two",
+    )
+
+    result = _diff(repo, first, second)
+
+    assert "noa.re/manifest-id: new" in result.diff
+    assert result.summary == ""
+    assert result.filtered_diff == ""
+
+
 def test_manifest_diff_drops_a_deploy_id_only_change(tmp_path: Path) -> None:
     repo = porcelain.init(str(tmp_path))
     first = _commit(
