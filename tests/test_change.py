@@ -3,7 +3,8 @@
 import logging
 import re
 import threading
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 
@@ -45,6 +46,7 @@ class GenerationResult:
     created_or_modified: set[Ref]
     removed: set[Ref]
     deploy_id: str | None
+    manifest_ids: dict[Ref, str] = field(default_factory=dict)
 
 
 def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
@@ -855,6 +857,7 @@ def test_change_processor_detects_deployment_when_enabled(
 ) -> None:
     calls: list[tuple[object, ...]] = []
     created = {Ref(kind="Deployment", namespace="config", name="api")}
+    manifest_ids = {ref: "api-content" for ref in created}
     removed = {Ref(kind="ConfigMap", namespace="config", name="old-api")}
 
     class Detector:
@@ -881,6 +884,7 @@ def test_change_processor_detects_deployment_when_enabled(
             written_paths={manifests_checkout / "api.yaml"},
             created_or_modified=created,
             removed=removed,
+            manifest_ids=manifest_ids,
             deploy_id="0123456789abcdef",
         )
 
@@ -918,7 +922,7 @@ def test_change_processor_detects_deployment_when_enabled(
     assert detector.called.wait(timeout=1)
     assert detector.kwargs == {
         "deploy_id": "0123456789abcdef",
-        "created_or_modified": created,
+        "created_or_modified": manifest_ids,
         "removed": removed,
     }
 
@@ -1547,6 +1551,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     created = {Ref(kind="Deployment", namespace="config", name="api")}
+    manifest_ids = {ref: "api-content" for ref in created}
     detected = threading.Event()
     observed: dict[str, object] = {}
 
@@ -1576,6 +1581,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
             written_paths={args[1] / "api.yaml"},
             created_or_modified=created,
             removed=set(),
+            manifest_ids=manifest_ids,
             deploy_id="0123456789abcdef",
         )
 
@@ -1608,7 +1614,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
     assert detected.wait(timeout=1)
     assert observed["cluster"] == "example-dev"
     assert observed["deploy_id"] == "0123456789abcdef"
-    assert observed["created_or_modified"] == created
+    assert observed["created_or_modified"] == manifest_ids
 
 
 def test_change_processor_rejects_detection_without_a_cluster(
@@ -1692,7 +1698,7 @@ def _staged_change_processor(
 
     class Detector:
         def wait_for_success(
-            self, *, deploy_id: str, created_or_modified: set, removed: set
+            self, *, deploy_id: str, created_or_modified: Mapping, removed: set
         ) -> None:
             calls.append(f"verify:{deploy_id}")
             if deploy_id in failing:

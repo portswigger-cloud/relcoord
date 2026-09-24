@@ -9,9 +9,10 @@ staging the generated output and reading ``git diff --cached``, the diff is take
 between the commit a manifests checkout was cloned at and the commit
 manifest-builder created on top of it.
 
-Every generated manifest carries a deploy-id annotation, and a change that
-touches a shared label or annotation rewrites every manifest that has it. Those
-repeated metadata-only changes drown the interesting part of a diff, so they are
+Every generated manifest carries a manifest-id annotation, which changes along
+with anything else in the manifest, and a change that touches a shared label or
+annotation rewrites every manifest that has it. Both drown the interesting part
+of a diff, so the ids are dropped and the repeated metadata-only changes are
 summarized and dropped from the diff the comment carries, while the comment
 points at the full diff that the response also returns.
 
@@ -45,7 +46,12 @@ logger = logging.getLogger(__name__)
 
 # GitHub rejects a longer issue comment body.
 MAX_COMMENT_CHARS = 65_536
-DEPLOY_ID_METADATA_PATH = ("metadata", "annotations", "noa.re/deploy-id")
+# noa.re/deploy-id is what manifest-builder stamped before noa.re/manifest-id,
+# and the first generation with the new one swaps one for the other everywhere.
+ID_ANNOTATION_PATHS = {
+    ("metadata", "annotations", "noa.re/manifest-id"),
+    ("metadata", "annotations", "noa.re/deploy-id"),
+}
 # Annotations under this prefix hash the config a workload mounts, so that the
 # workload restarts when the config changes. Their value is derived from a change
 # the same diff already shows, wherever in a manifest they sit.
@@ -196,7 +202,7 @@ def smart_manifest_diff(
         for change, count in metadata_changes.items()
         if count >= METADATA_SUMMARY_THRESHOLD
     }
-    suppress_paths = {DEPLOY_ID_METADATA_PATH, *summary_paths}
+    suppress_paths = {*ID_ANNOTATION_PATHS, *summary_paths}
     filtered_diff = filter_metadata_hunks(raw_diff, suppress_paths)
     summary = render_metadata_summary(metadata_changes)
     if filtered_diff == raw_diff and not summary:
@@ -276,7 +282,7 @@ def compare_document_metadata(
         old_values = string_mapping_value(old_metadata, section)
         new_values = string_mapping_value(new_metadata, section)
         for key in old_values.keys() | new_values.keys():
-            if ("metadata", section, key) == DEPLOY_ID_METADATA_PATH:
+            if ("metadata", section, key) in ID_ANNOTATION_PATHS:
                 continue
             if is_checksum_key(key):
                 continue

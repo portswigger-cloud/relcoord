@@ -3,11 +3,12 @@
 """Observing a change materialise in a Kubernetes cluster.
 
 manifest-builder reports which objects a change touched and stamps each of them
-with a deploy-id annotation. This module connects to the cluster those manifests
-are deployed to and waits, using watches rather than polling, until every
-changed object carries that deploy-id and every removed object is gone.
+with a manifest-id annotation, a hash of that object's content. This module
+connects to the cluster those manifests are deployed to and waits, using watches
+rather than polling, until every changed object carries its manifest-id and every
+removed object is gone.
 
-Carrying the deploy-id only says that the write landed, not that it took effect.
+Carrying the manifest-id only says that the write landed, not that it took effect.
 For the workload kinds that roll a write out — Deployments and StatefulSets — the
 wait goes further and holds until that rollout has finished; see
 ``_deployment_rollout_progress`` and ``_statefulset_rollout_progress``.
@@ -21,7 +22,7 @@ import logging
 import random
 import ssl
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -34,7 +35,7 @@ from relcoord.eks import EksTokenAuth
 
 logger = logging.getLogger(__name__)
 
-DEPLOY_ID_ANNOTATION = "noa.re/deploy-id"
+MANIFEST_ID_ANNOTATION = "noa.re/manifest-id"
 DEFAULT_TIMEOUT_SECONDS = 300.0
 # How long a single watch is allowed to stay open. The API server closes the
 # stream when it expires, and a fresh list re-establishes a resourceVersion to
@@ -267,7 +268,7 @@ class KubernetesDeploymentDetector:
         self,
         *,
         deploy_id: str,
-        created_or_modified: set[KubernetesObjectRef],
+        created_or_modified: Mapping[KubernetesObjectRef, str],
         removed: set[KubernetesObjectRef],
     ) -> None:
         deadline = time.monotonic() + self._timeout_seconds
@@ -278,7 +279,7 @@ class KubernetesDeploymentDetector:
                 ref,
                 resource,
                 deploy_id=deploy_id,
-                goal=_goal_for(resource, deploy_id),
+                goal=_goal_for(resource, created_or_modified[ref]),
                 deadline=deadline,
             )
             waited_for += 1
@@ -700,10 +701,10 @@ _REMOVAL_GOAL = Goal(
 )
 
 
-def _goal_for(resource: KubernetesResource, deploy_id: str) -> Goal:
+def _goal_for(resource: KubernetesResource, manifest_id: str) -> Goal:
     """Return what an object of this resource has to reach to count as deployed.
 
-    Every object has to carry the deploy-id, which is what says the write landed.
+    Every object has to carry its manifest-id, which is what says the write landed.
     A Deployment or a StatefulSet has to have finished rolling that write out on
     top of it.
     """
@@ -711,36 +712,36 @@ def _goal_for(resource: KubernetesResource, deploy_id: str) -> Goal:
         rollout = _ROLLOUT_PROGRESS.get(resource.name)
         if rollout is not None:
             return Goal(
-                description=f"deploy-id {deploy_id} with a complete rollout",
-                progress=lambda obj: _rollout_goal_progress(obj, deploy_id, rollout),
+                description=f"manifest-id {manifest_id} with a complete rollout",
+                progress=lambda obj: _rollout_goal_progress(obj, manifest_id, rollout),
             )
     return Goal(
-        description=f"deploy-id {deploy_id}",
-        progress=lambda obj: _deploy_id_progress(obj, deploy_id),
+        description=f"manifest-id {manifest_id}",
+        progress=lambda obj: _manifest_id_progress(obj, manifest_id),
     )
 
 
-def _deploy_id_progress(obj: dict[str, Any] | None, deploy_id: str) -> Progress:
+def _manifest_id_progress(obj: dict[str, Any] | None, manifest_id: str) -> Progress:
     if obj is None:
         return _pending("it has not appeared")
-    observed = _deploy_id_of(obj)
-    if observed != deploy_id:
-        return _pending(f"it has deploy-id {observed or '<missing>'!r}")
+    observed = _manifest_id_of(obj)
+    if observed != manifest_id:
+        return _pending(f"it has manifest-id {observed or '<missing>'!r}")
     return _complete()
 
 
 def _rollout_goal_progress(
     obj: dict[str, Any] | None,
-    deploy_id: str,
+    manifest_id: str,
     rollout: Callable[[dict[str, Any]], Progress],
 ) -> Progress:
     """Return how far an object is towards having rolled the change out.
 
     The write has to have landed before its rollout means anything, so the
-    deploy-id is checked first and the rollout only once it is the one the change
-    asked for.
+    manifest-id is checked first and the rollout only once it is the one the
+    change asked for.
     """
-    landed = _deploy_id_progress(obj, deploy_id)
+    landed = _manifest_id_progress(obj, manifest_id)
     if landed.state is not ProgressState.COMPLETE or obj is None:
         return landed
     return rollout(obj)
@@ -934,7 +935,7 @@ def _count(value: Any, default: int = 0) -> int:
     return default
 
 
-def _deploy_id_of(obj: dict[str, Any] | None) -> str | None:
+def _manifest_id_of(obj: dict[str, Any] | None) -> str | None:
     if obj is None:
         return None
     metadata = obj.get("metadata")
@@ -943,7 +944,7 @@ def _deploy_id_of(obj: dict[str, Any] | None) -> str | None:
     annotations = metadata.get("annotations")
     if not isinstance(annotations, dict):
         return None
-    value = annotations.get(DEPLOY_ID_ANNOTATION)
+    value = annotations.get(MANIFEST_ID_ANNOTATION)
     return value if isinstance(value, str) else None
 
 
