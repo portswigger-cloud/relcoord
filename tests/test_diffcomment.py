@@ -32,7 +32,6 @@ class GenerationResult:
     written_paths: set[Path]
     created_or_modified: set[object]
     removed: set[object]
-    deploy_id: str | None = None
 
 
 class Commenter:

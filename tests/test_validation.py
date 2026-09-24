@@ -80,7 +80,6 @@ class GenerationResult:
     written_paths: set[Path]
     created_or_modified: set[object]
     removed: set[object]
-    deploy_id: str | None = None
 
 
 class Validator:
@@ -164,7 +163,6 @@ def _fake_git(
             written_paths={manifest},
             created_or_modified={Ref()},
             removed=set(),
-            deploy_id="deploy-1",
         )
 
     def fake_push(repo_path: Path, remote: str, idcat) -> None:
