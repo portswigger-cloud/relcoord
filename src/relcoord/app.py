@@ -870,7 +870,6 @@ def _change_result_payload(result: object) -> dict[str, Any]:
                 "directory": str(output.directory),
                 "generated": output.generated_count,
                 "cluster": output.cluster,
-                "deploy_id": output.deploy_id,
                 "created_or_modified": object_ref_payloads(output.created_or_modified),
                 "removed": object_ref_payloads(output.removed),
                 "rollout": getattr(output, "rollout", None),

@@ -404,7 +404,7 @@ def suppressed_yaml_paths(
 
     A path is noise when it names a suppressed key, and so is a path whose every
     changed child is noise: an ``annotations:`` line a manifest only gained to
-    carry a deploy-id goes the same way the deploy-id itself does.
+    carry a manifest-id goes the same way the manifest-id itself does.
     """
     changed_paths = changed_yaml_paths(hunk)
     suppressed = {

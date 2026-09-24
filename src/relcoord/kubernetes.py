@@ -267,7 +267,6 @@ class KubernetesDeploymentDetector:
     def wait_for_success(
         self,
         *,
-        deploy_id: str,
         created_or_modified: Mapping[KubernetesObjectRef, str],
         removed: set[KubernetesObjectRef],
     ) -> None:
@@ -278,7 +277,6 @@ class KubernetesDeploymentDetector:
             self._wait_for_object(
                 ref,
                 resource,
-                deploy_id=deploy_id,
                 goal=_goal_for(resource, created_or_modified[ref]),
                 deadline=deadline,
             )
@@ -287,15 +285,12 @@ class KubernetesDeploymentDetector:
             self._wait_for_object(
                 ref,
                 self._resource_for(ref),
-                deploy_id=deploy_id,
                 goal=_REMOVAL_GOAL,
                 deadline=deadline,
             )
             waited_for += 1
         logger.info(
-            "change with deploy-id %s has materialised in cluster %s: "
-            "%d object(s) observed",
-            deploy_id,
+            "change has materialised in cluster %s: %d object(s) observed",
             self._cluster_name or "<unnamed>",
             waited_for,
         )
@@ -305,7 +300,6 @@ class KubernetesDeploymentDetector:
         ref: KubernetesObjectRef,
         resource: KubernetesResource,
         *,
-        deploy_id: str,
         goal: Goal,
         deadline: float,
     ) -> None:
@@ -322,11 +316,10 @@ class KubernetesDeploymentDetector:
                     f"{self._cluster_name or '<unnamed>'}: {progress.detail}"
                 )
             logger.info(
-                "watching %s in cluster %s for %s (deploy-id %s): %s",
+                "watching %s in cluster %s for %s: %s",
                 _format_ref(ref),
                 self._cluster_name or "<unnamed>",
                 goal.description,
-                deploy_id,
                 progress.detail,
             )
             started = time.monotonic()

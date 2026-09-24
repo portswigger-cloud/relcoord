@@ -22,7 +22,6 @@ from relcoord.kubernetes import (
 )
 
 MANIFEST_ID = "0123456789abcdef"
-DEPLOY_ID = "fedcba9876543210"
 
 DISCOVERY = {
     "/api/v1": {
@@ -240,7 +239,6 @@ def test_detector_returns_when_the_objects_are_already_in_place() -> None:
         return httpx.Response(500, json={"unexpected": path})
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID,
             Ref("Namespace", None, "production"): MANIFEST_ID,
@@ -273,7 +271,6 @@ def test_detector_waits_for_each_object_to_carry_its_own_manifest_id() -> None:
         return httpx.Response(500, json={"unexpected": path})
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref("Deployment", "default", "api", "apps/v1"): "api-content",
             Ref("Namespace", None, "production"): "namespace-content",
@@ -295,7 +292,6 @@ def test_detector_does_not_accept_another_object_s_manifest_id() -> None:
 
     with pytest.raises(DeploymentDetectionError, match="namespace-content"):
         detector(handler, timeout_seconds=0.05).wait_for_success(
-            deploy_id="other",
             created_or_modified={
                 Ref("Namespace", None, "production"): "namespace-content"
             },
@@ -328,7 +324,6 @@ def test_detector_watches_until_the_manifest_id_annotation_appears(
 
     with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={
                 Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
             },
@@ -369,7 +364,6 @@ def statefulsets_handler(listed: dict[str, Any], *watched: dict[str, Any]):
 
 def wait_for_deployment(handler, *, timeout_seconds: float = 5) -> None:
     detector(handler, timeout_seconds=timeout_seconds).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
         },
@@ -379,7 +373,6 @@ def wait_for_deployment(handler, *, timeout_seconds: float = 5) -> None:
 
 def wait_for_statefulset(handler, *, timeout_seconds: float = 5) -> None:
     detector(handler, timeout_seconds=timeout_seconds).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref("StatefulSet", "default", "db", "apps/v1"): MANIFEST_ID
         },
@@ -713,7 +706,6 @@ def test_detector_watches_until_a_removed_object_is_deleted() -> None:
         )
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={},
         removed={Ref("ConfigMap", "default", "old-api")},
     )
@@ -737,7 +729,6 @@ def test_detector_lists_again_when_a_watch_ends_without_the_change() -> None:
         return httpx.Response(200, json=listing(deployment("api", manifest_id)))
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
         },
@@ -758,7 +749,6 @@ def test_detector_times_out_reporting_the_observed_annotation() -> None:
 
     with pytest.raises(DeploymentDetectionError) as excinfo:
         detector(handler, timeout_seconds=0).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={
                 Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
             },
@@ -780,7 +770,6 @@ def test_detector_reports_a_kind_the_cluster_does_not_serve() -> None:
 
     with pytest.raises(DeploymentDetectionError, match="no namespaced resource"):
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={Ref("Widget", "default", "api"): MANIFEST_ID},
             removed=set(),
         )
@@ -831,7 +820,6 @@ def test_detector_resolves_a_shared_kind_through_the_refs_group(group: str) -> N
         return httpx.Response(500, json={"unexpected": path})
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={Ref("Role", "default", "api", f"{group}/v1"): MANIFEST_ID},
         removed=set(),
     )
@@ -852,7 +840,6 @@ def test_detector_resolves_a_shared_kind_whose_ref_names_another_version() -> No
         return httpx.Response(200, json=listing(annotated("api", MANIFEST_ID)))
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref("Role", "default", "api", "iam.aws.m.upbound.io/v1beta1"): MANIFEST_ID,
         },
@@ -873,7 +860,6 @@ def test_detector_reports_a_kind_no_group_the_cluster_serves_defines() -> None:
 
     with pytest.raises(DeploymentDetectionError) as excinfo:
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={
                 Ref(
                     "Role", "default", "api", "iam.aws.m.upbound.io/v1beta1"
@@ -898,7 +884,6 @@ def test_detector_reports_a_shared_kind_a_ref_carries_no_api_version_for() -> No
 
     with pytest.raises(DeploymentDetectionError) as excinfo:
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={Ref("Role", "default", "api", ""): MANIFEST_ID},
             removed=set(),
         )
@@ -915,7 +900,6 @@ def test_detector_reports_a_failing_api_server() -> None:
 
     with pytest.raises(DeploymentDetectionError, match="status 403"):
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={
                 Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
             },
@@ -934,7 +918,6 @@ def test_detector_reports_a_watch_that_the_api_server_rejects() -> None:
 
     with pytest.raises(DeploymentDetectionError, match="watch of .* status 500"):
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={
                 Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
             },
@@ -977,7 +960,6 @@ def test_detector_retries_a_throttled_list_and_honours_the_retry_after_header(
     slept: list[float] = []
     with caplog.at_level(logging.WARNING, logger="relcoord.kubernetes"):
         detector(handler, sleep=slept.append).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={
                 Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
             },
@@ -1007,7 +989,6 @@ def test_detector_uses_the_bodys_retry_after_when_no_header_is_sent() -> None:
 
     slept: list[float] = []
     detector(handler, sleep=slept.append).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
         },
@@ -1036,7 +1017,6 @@ def test_detector_backs_off_exponentially_when_no_retry_after_is_given() -> None
             throttle_initial_delay_seconds=1.0,
             sleep=slept.append,
         ).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={
                 Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
             },
@@ -1067,7 +1047,6 @@ def test_detector_re_lists_when_a_watch_is_throttled_rather_than_failing() -> No
 
     slept: list[float] = []
     detector(handler, sleep=slept.append).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
         },
@@ -1101,7 +1080,6 @@ def test_detector_jitters_the_honoured_delay_before_sleeping() -> None:
         return delay + 0.5
 
     detector(handler, sleep=slept.append, jitter=record_jitter).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
         },
@@ -1261,7 +1239,6 @@ def test_detector_finds_a_kind_a_non_preferred_group_version_serves() -> None:
         return httpx.Response(200, json=listing(annotated("canary", MANIFEST_ID)))
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref(
                 "TeleportRoleV8",
@@ -1293,7 +1270,6 @@ def test_detector_keeps_a_kind_several_versions_share_unambiguous() -> None:
         return httpx.Response(200, json=listing(annotated("sso-user", MANIFEST_ID)))
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref(
                 "TeleportRole",

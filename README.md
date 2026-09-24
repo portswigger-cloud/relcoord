@@ -287,8 +287,8 @@ The stream carries four kinds of event:
 
 Every event carries a `message` written to be read on its own, so a client can
 print the stream as it arrives without knowing any payload shape. What a message
-leaves out is in `detail`: the temporary workspace, the full commit hashes, the
-deploy-id, every changed object where the message named the first few. A step
+leaves out is in `detail`: the temporary workspace, the full commit hashes,
+every changed object where the message named the first few. A step
 whose only interest is to whoever debugs relcoord — the temporary directory it
 works in, the manifests commit named by the push lines either side of it — is
 logged rather than streamed, which is why there is no `workspace` or `commit`
@@ -440,11 +440,10 @@ change has actually materialised there, and logs it when it has.
 What it waits for comes from `manifest-builder`, which reports the Kubernetes
 objects each commit touched — kind, namespace where the object has one, and
 name — and stamps every manifest it wrote with a `noa.re/manifest-id`
-annotation, a hash of that object's content. relcoord reports the objects, and a
-deploy-id identifying the change as a whole, in the `changed-objects` progress
-event and in the `outputs` of the change response, and then waits for each
-created or modified object to carry its manifest-id and each removed object to
-be gone. Objects are waited for with a list narrowed to the object's name
+annotation, a hash of that object's content. relcoord reports the objects in the
+`changed-objects` progress event and in the `outputs` of the change response,
+and then waits for each created or modified object to carry its manifest-id and
+each removed object to be gone. Objects are waited for with a list narrowed to the object's name
 followed by a watch, so a rollout is observed as it happens rather than polled
 for.
 
