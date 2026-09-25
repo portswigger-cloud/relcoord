@@ -16,7 +16,7 @@ dependencies = [
   "dulwich[merge]",
   "httpx",
   "hypercorn",
-  "manifest-builder>=0.7.13",
+  "manifest-builder==0.7.14",
   "pyjwt[crypto]",
   "pyyaml",
   "starlette",
