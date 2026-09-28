@@ -716,8 +716,8 @@ def test_change_reports_a_stopped_rollout_without_traceback(
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise RolloutStageError(
-                "deployment of manifest-builder deploy-id feedface was not "
-                "observed: timed out after 300s waiting for Deployment/api"
+                "deployment in cluster platform-dev was not observed: timed out "
+                "after 300s waiting for Deployment/api"
             )
 
     client = TestClient(
@@ -741,8 +741,8 @@ def test_change_reports_a_stopped_rollout_without_traceback(
     assert response.json() == {
         "error": "rollout_stage_failed",
         "message": (
-            "deployment of manifest-builder deploy-id feedface was not observed: "
-            "timed out after 300s waiting for Deployment/api"
+            "deployment in cluster platform-dev was not observed: timed out "
+            "after 300s waiting for Deployment/api"
         ),
     }
     assert (

@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -157,8 +157,7 @@ class DeploymentDetector(Protocol):
     def wait_for_success(
         self,
         *,
-        deploy_id: str,
-        created_or_modified: set[Any],
+        created_or_modified: Mapping[Any, str],
         removed: set[Any],
     ) -> None: ...
 
@@ -191,7 +190,6 @@ class ChangeResult:
     deploy_config: Path
     manifests_checkout: Path
     generated_count: int
-    deploy_id: str | None = None
     outputs: tuple[OutputResult, ...] = ()
 
 
@@ -201,9 +199,9 @@ class OutputResult:
 
     ``created_or_modified`` and ``removed`` name the Kubernetes objects the
     commit touched, which manifest-builder reads back out of the manifests it
-    wrote, and ``deploy_id`` is the value of the noa.re/deploy-id annotation it
-    stamped on each of them. Together they are what deployment detection waits
-    for, and what a caller needs to follow the change into ``cluster``.
+    wrote. Deployment detection waits for each created or modified object to
+    carry the noa.re/manifest-id manifest-builder stamped on it, and for each
+    removed one to be gone.
     """
 
     name: str
@@ -211,7 +209,6 @@ class OutputResult:
     directory: Path
     manifests_checkout: Path
     generated_count: int
-    deploy_id: str | None = None
     cluster: str | None = None
     created_or_modified: tuple[KubernetesObjectRef, ...] = ()
     removed: tuple[KubernetesObjectRef, ...] = ()
@@ -400,7 +397,6 @@ class ChangeProcessor:
                 deploy_config=deploy_config,
                 manifests_checkout=output_results[0].manifests_checkout,
                 generated_count=total_generated,
-                deploy_id=output_results[0].deploy_id,
                 outputs=tuple(output_results),
             )
         except ChangeProcessingError:
@@ -516,12 +512,6 @@ class ChangeProcessor:
             **selection,
         )
         generated = _written_paths(generation_result)
-        deploy_id = _deploy_id(generation_result)
-        if self.detect_deployment and deploy_id is None:
-            raise DeploymentDetectionError(
-                "manifest-builder did not return a deploy_id; "
-                "deployment detection requires git-backed generation"
-            )
         created_or_modified = _sorted_refs(generation_result.created_or_modified)
         removed_refs = _sorted_refs(generation_result.removed)
         logger.info(
@@ -542,13 +532,12 @@ class ChangeProcessor:
         )
         if created_or_modified or removed_refs:
             logger.info(
-                "change step 5/7: output %s in cluster %s changed %s (deploy-id %s)",
+                "change step 5/7: output %s in cluster %s changed %s",
                 output.name,
                 _cluster_name(output) or "<none>",
                 ", ".join(
                     _format_ref(ref) for ref in (*created_or_modified, *removed_refs)
                 ),
-                deploy_id or "<none>",
             )
             report(
                 "changed-objects",
@@ -556,7 +545,6 @@ class ChangeProcessor:
                 output=output.name,
                 repository=output.repository,
                 cluster=_cluster_name(output),
-                deploy_id=deploy_id,
                 created_or_modified=object_ref_payloads(created_or_modified),
                 removed=object_ref_payloads(removed_refs),
             )
@@ -567,7 +555,6 @@ class ChangeProcessor:
                 directory=output.directory,
                 manifests_checkout=manifests_checkout,
                 generated_count=len(generated),
-                deploy_id=deploy_id,
                 cluster=_cluster_name(output),
                 created_or_modified=created_or_modified,
                 removed=removed_refs,
@@ -649,19 +636,17 @@ class ChangeProcessor:
         ]
         observed: list[tuple[str, float]] = []
         for output, generation_result in deployed:
-            deploy_id = _deploy_id(generation_result)
             connection = self._connection_for(output)
             report(
                 "deployment-detection",
                 f"waiting for {output.name} to pick up the change",
-                deploy_id=deploy_id,
                 output=output.name,
                 cluster=output.name,
             )
             if stage.rollout is None:
                 _start_deployment_detection(
                     generation_result,
-                    deploy_id,
+                    output.name,
                     connection,
                     self.deployment_detector,
                 )
@@ -669,7 +654,7 @@ class ChangeProcessor:
             started = time.monotonic()
             _await_deployment_detection(
                 generation_result,
-                deploy_id,
+                output.name,
                 connection,
                 self.deployment_detector,
             )
@@ -747,7 +732,7 @@ class DiffCommentProcessor:
     The work is the same as :class:`ChangeProcessor` up to and including the
     manifest commit, and then stops: nothing is pushed. The commit is still made,
     in the throwaway checkout, because that is what makes the diff the one a
-    change would produce, cleanups and deploy-id annotations included.
+    change would produce, cleanups and manifest-id annotations included.
 
     Every configured output is generated, because which of them a commit affects
     is not something the commit says: it is what generating shows. The comment
@@ -1378,11 +1363,6 @@ def _written_paths(generation_result: object) -> set[Path]:
     return cast(set[Path], written_paths)
 
 
-def _deploy_id(generation_result: object) -> str | None:
-    deploy_id = getattr(generation_result, "deploy_id", None)
-    return deploy_id if isinstance(deploy_id, str) else None
-
-
 def _checkout_paths_by_repository(
     workdir: Path, outputs: Sequence[OutputSettings]
 ) -> dict[str, Path]:
@@ -1728,29 +1708,18 @@ def _cluster_name(output: OutputSettings) -> str | None:
 
 def _start_deployment_detection(
     generation_result: GenerationResult,
-    deploy_id: str | None,
+    cluster: str,
     connection: OutputSettings | None,
     detector: DeploymentDetector | None,
 ) -> None:
-    if deploy_id is None:
-        raise DeploymentDetectionError(
-            "manifest-builder did not return a deploy_id; "
-            "deployment detection requires git-backed generation"
-        )
-    created_or_modified = set(generation_result.created_or_modified)
-    removed = set(generation_result.removed)
-    logger.info(
-        "starting deployment detection for manifest-builder deploy-id %s in cluster %s",
-        deploy_id,
-        connection.name if connection is not None else "<injected detector>",
-    )
+    logger.info("starting deployment detection in cluster %s", cluster)
     thread = threading.Thread(
         target=_run_deployment_detection,
-        name=f"relcoord-deployment-detection-{deploy_id}",
+        name=f"relcoord-deployment-detection-{cluster}",
         kwargs={
-            "deploy_id": deploy_id,
-            "created_or_modified": created_or_modified,
-            "removed": removed,
+            "created_or_modified": dict(generation_result.manifest_ids),
+            "removed": set(generation_result.removed),
+            "cluster": cluster,
             "connection": connection,
             "detector": detector,
         },
@@ -1761,7 +1730,7 @@ def _start_deployment_detection(
 
 def _await_deployment_detection(
     generation_result: GenerationResult,
-    deploy_id: str | None,
+    cluster: str,
     connection: OutputSettings | None,
     detector: DeploymentDetector | None,
 ) -> None:
@@ -1771,11 +1740,6 @@ def _await_deployment_detection(
     detection of a change without one, a failure is reported to the caller: it
     is what stops the stages after this one from being pushed.
     """
-    if deploy_id is None:
-        raise DeploymentDetectionError(
-            "manifest-builder did not return a deploy_id; "
-            "deployment detection requires git-backed generation"
-        )
     owned_detector: KubernetesDeploymentDetector | None = None
     active_detector: DeploymentDetector
     if detector is not None:
@@ -1783,38 +1747,29 @@ def _await_deployment_detection(
     else:
         if connection is None:
             raise DeploymentDetectionError(
-                f"deployment detection for manifest-builder deploy-id {deploy_id} "
-                "has no cluster and no detector to observe it with"
+                f"deployment detection for {cluster} has no cluster connection "
+                "and no detector to observe it with"
             )
         try:
             owned_detector = KubernetesDeploymentDetector.for_output(connection)
         except Exception as exc:
             raise RolloutStageError(
                 f"could not connect to cluster {connection.name} to detect the "
-                f"deployment of manifest-builder deploy-id {deploy_id}: {exc}"
+                f"deployment: {exc}"
             ) from exc
         active_detector = owned_detector
-    logger.info(
-        "waiting for deployment of manifest-builder deploy-id %s in cluster %s",
-        deploy_id,
-        connection.name if connection is not None else "<injected detector>",
-    )
+    logger.info("waiting for deployment in cluster %s", cluster)
     try:
         active_detector.wait_for_success(
-            deploy_id=deploy_id,
-            created_or_modified=set(generation_result.created_or_modified),
+            created_or_modified=dict(generation_result.manifest_ids),
             removed=set(generation_result.removed),
         )
     except Exception as exc:
         raise RolloutStageError(
-            f"deployment of manifest-builder deploy-id {deploy_id} was not "
-            f"observed: {exc}"
+            f"deployment in cluster {cluster} was not observed: {exc}"
         ) from exc
     else:
-        logger.info(
-            "deployment detected for manifest-builder deploy-id %s",
-            deploy_id,
-        )
+        logger.info("deployment detected in cluster %s", cluster)
     finally:
         if owned_detector is not None:
             owned_detector.close()
@@ -1822,9 +1777,9 @@ def _await_deployment_detection(
 
 def _run_deployment_detection(
     *,
-    deploy_id: str,
-    created_or_modified: set[Any],
+    created_or_modified: Mapping[Any, str],
     removed: set[Any],
+    cluster: str,
     connection: OutputSettings | None,
     detector: DeploymentDetector | None,
 ) -> None:
@@ -1832,47 +1787,34 @@ def _run_deployment_detection(
     if detector is None:
         if connection is None:
             logger.error(
-                "deployment detection failed for manifest-builder deploy-id %s: "
-                "no cluster and no detector to observe it with",
-                deploy_id,
+                "deployment detection failed for %s: no cluster connection and "
+                "no detector to observe it with",
+                cluster,
             )
             return
         try:
             owned_detector = KubernetesDeploymentDetector.for_output(connection)
         except Exception:
             logger.exception(
-                "deployment detection failed for manifest-builder deploy-id %s: "
-                "could not connect to cluster %s",
-                deploy_id,
-                connection.name,
+                "deployment detection failed: could not connect to cluster %s",
+                cluster,
             )
             return
     active_detector: DeploymentDetector | None = (
         owned_detector if owned_detector is not None else detector
     )
     if active_detector is None:
-        logger.error(
-            "deployment detection failed for manifest-builder deploy-id %s: "
-            "no detector",
-            deploy_id,
-        )
+        logger.error("deployment detection failed in cluster %s: no detector", cluster)
         return
     try:
         active_detector.wait_for_success(
-            deploy_id=deploy_id,
             created_or_modified=created_or_modified,
             removed=removed,
         )
     except Exception:
-        logger.exception(
-            "deployment detection failed for manifest-builder deploy-id %s",
-            deploy_id,
-        )
+        logger.exception("deployment detection failed in cluster %s", cluster)
     else:
-        logger.info(
-            "deployment detected for manifest-builder deploy-id %s",
-            deploy_id,
-        )
+        logger.info("deployment detected in cluster %s", cluster)
     finally:
         if owned_detector is not None:
             owned_detector.close()

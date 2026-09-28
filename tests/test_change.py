@@ -3,7 +3,8 @@
 import logging
 import re
 import threading
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 
@@ -44,7 +45,7 @@ class GenerationResult:
     written_paths: set[Path]
     created_or_modified: set[Ref]
     removed: set[Ref]
-    deploy_id: str | None
+    manifest_ids: dict[Ref, str] = field(default_factory=dict)
 
 
 def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
@@ -92,7 +93,6 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
                 Ref(kind="Deployment", namespace="config", name="api")
             },
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     def fake_head_commit(repo_path: Path) -> str:
@@ -197,7 +197,6 @@ def test_change_processor_reports_progress_for_each_step(
                 Ref(kind="Deployment", namespace="config", name="api")
             },
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     monkeypatch.setattr(
@@ -237,7 +236,6 @@ def test_change_processor_reports_progress_for_each_step(
         "output": "manifests",
         "repository": "https://github.com/acme/manifests.git",
         "cluster": None,
-        "deploy_id": "0123456789abcdef",
         "created_or_modified": [
             {"kind": "Deployment", "namespace": "config", "name": "api"}
         ],
@@ -290,7 +288,6 @@ def test_change_processor_reports_no_changes_progress(
             written_paths=set(),
             created_or_modified=set(),
             removed=set(),
-            deploy_id=None,
         )
 
     monkeypatch.setattr(
@@ -374,7 +371,6 @@ def test_change_processor_generates_configured_outputs_with_vars(
                 Ref(kind="Deployment", namespace="config", name="api")
             },
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     def fake_head_commit(repo_path: Path) -> str:
@@ -499,7 +495,6 @@ def test_change_processor_generates_only_the_targets_a_config_declares(
                 Ref(kind="Deployment", namespace="config", name="api")
             },
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     monkeypatch.setattr(
@@ -569,7 +564,6 @@ def test_change_processor_deploys_only_the_outputs_its_role_permits(
                 Ref(kind="Deployment", namespace="config", name="api")
             },
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     monkeypatch.setattr(
@@ -737,7 +731,6 @@ def test_change_processor_generates_every_output_in_system_mode(
             written_paths={output_path / "api.yaml"},
             created_or_modified=set(),
             removed=set(),
-            deploy_id=None,
         )
 
     monkeypatch.setattr(
@@ -775,7 +768,6 @@ def test_change_processor_skips_commit_and_push_when_no_changes(
             written_paths={manifests_checkout / "api.yaml"},
             created_or_modified=set(),
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     def fake_head_commit(repo_path: Path) -> str:
@@ -828,7 +820,6 @@ def test_change_processor_skips_detection_when_no_changes(
             written_paths={manifests_checkout / "api.yaml"},
             created_or_modified=set(),
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     monkeypatch.setattr(
@@ -855,6 +846,7 @@ def test_change_processor_detects_deployment_when_enabled(
 ) -> None:
     calls: list[tuple[object, ...]] = []
     created = {Ref(kind="Deployment", namespace="config", name="api")}
+    manifest_ids = {ref: "api-content" for ref in created}
     removed = {Ref(kind="ConfigMap", namespace="config", name="old-api")}
 
     class Detector:
@@ -881,7 +873,7 @@ def test_change_processor_detects_deployment_when_enabled(
             written_paths={manifests_checkout / "api.yaml"},
             created_or_modified=created,
             removed=removed,
-            deploy_id="0123456789abcdef",
+            manifest_ids=manifest_ids,
         )
 
     def fake_head_commit(repo_path: Path) -> str:
@@ -908,7 +900,6 @@ def test_change_processor_detects_deployment_when_enabled(
     ).process("https://github.com/acme/config.git", "deadbeef", None)
 
     assert result.generated_count == 1
-    assert result.deploy_id == "0123456789abcdef"
     assert calls[-1] == (
         "push",
         "manifests",
@@ -917,50 +908,9 @@ def test_change_processor_detects_deployment_when_enabled(
     )
     assert detector.called.wait(timeout=1)
     assert detector.kwargs == {
-        "deploy_id": "0123456789abcdef",
-        "created_or_modified": created,
+        "created_or_modified": manifest_ids,
         "removed": removed,
     }
-
-
-def test_change_processor_requires_deploy_id_for_deployment_detection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[str] = []
-
-    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
-        (target / ".deploy").mkdir(parents=True)
-
-    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
-        target.mkdir(parents=True)
-
-    def fake_generate(*args, **kwargs) -> GenerationResult:
-        manifests_checkout = args[1]
-        return GenerationResult(
-            written_paths={manifests_checkout / "api.yaml"},
-            created_or_modified=set(),
-            removed=set(),
-            deploy_id=None,
-        )
-
-    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
-        calls.append("push")
-
-    monkeypatch.setattr(
-        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
-    )
-    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
-    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
-    monkeypatch.setattr(change, "generate", fake_generate)
-    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
-
-    with pytest.raises(DeploymentDetectionError, match="did not return a deploy_id"):
-        ChangeProcessor(
-            "https://github.com/acme/manifests.git",
-            detect_deployment=True,
-        ).process("https://github.com/acme/config.git", "deadbeef", None)
-
-    assert calls == []
 
 
 def test_change_processor_requires_top_level_deploy_directory(
@@ -1007,7 +957,6 @@ def test_change_processor_uses_custom_config_path(
                 Ref(kind="Deployment", namespace="system", name="api")
             },
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     def fake_head_commit(repo_path: Path) -> str:
@@ -1066,7 +1015,6 @@ def test_change_processor_system_mode_uses_root_and_no_namespace(
             written_paths={output_path / "api.yaml"},
             created_or_modified={Ref(kind="Namespace", namespace=None, name="argo")},
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     def fake_head_commit(repo_path: Path) -> str:
@@ -1131,7 +1079,6 @@ def _system_repository_change_fakes(
             written_paths={output_path / "api.yaml"},
             created_or_modified={Ref(kind="Deployment", namespace="c", name="api")},
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     monkeypatch.setattr(
@@ -1505,7 +1452,6 @@ def test_change_processor_reports_the_objects_a_change_touched(
             written_paths={args[1] / "api.yaml"},
             created_or_modified=created,
             removed=removed,
-            deploy_id="0123456789abcdef",
         )
 
     monkeypatch.setattr(
@@ -1532,7 +1478,6 @@ def test_change_processor_reports_the_objects_a_change_touched(
 
     output = result.outputs[0]
     assert output.cluster == "example-dev"
-    assert output.deploy_id == "0123456789abcdef"
     # Sorted by kind, then namespace, then name, so the report is stable.
     assert output.created_or_modified == (
         Ref(kind="Deployment", namespace="config", name="api"),
@@ -1547,6 +1492,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     created = {Ref(kind="Deployment", namespace="config", name="api")}
+    manifest_ids = {ref: "api-content" for ref in created}
     detected = threading.Event()
     observed: dict[str, object] = {}
 
@@ -1576,7 +1522,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
             written_paths={args[1] / "api.yaml"},
             created_or_modified=created,
             removed=set(),
-            deploy_id="0123456789abcdef",
+            manifest_ids=manifest_ids,
         )
 
     monkeypatch.setattr(
@@ -1607,8 +1553,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
 
     assert detected.wait(timeout=1)
     assert observed["cluster"] == "example-dev"
-    assert observed["deploy_id"] == "0123456789abcdef"
-    assert observed["created_or_modified"] == created
+    assert observed["created_or_modified"] == manifest_ids
 
 
 def test_change_processor_rejects_detection_without_a_cluster(
@@ -1625,7 +1570,6 @@ def test_change_processor_rejects_detection_without_a_cluster(
             written_paths={args[1] / "api.yaml"},
             created_or_modified={Ref(kind="Deployment", namespace="c", name="api")},
             removed=set(),
-            deploy_id="0123456789abcdef",
         )
 
     monkeypatch.setattr(
@@ -1685,18 +1629,19 @@ def _staged_change_processor(
 
     The recorded calls are what a rollout is about: which outputs were generated
     and pushed, and in what order that interleaved with waiting for the
-    deployments to be observed. Each output's deploy-id names it, so a wait says
-    which output it was waiting for.
+    deployments to be observed. Each output changes an object named after it, so
+    a wait says which output it was waiting for.
     """
     calls: list[str] = []
 
     class Detector:
         def wait_for_success(
-            self, *, deploy_id: str, created_or_modified: set, removed: set
+            self, *, created_or_modified: Mapping, removed: set
         ) -> None:
-            calls.append(f"verify:{deploy_id}")
-            if deploy_id in failing:
-                raise RuntimeError(f"{deploy_id} never reached the cluster")
+            (name,) = {ref.name for ref in created_or_modified}
+            calls.append(f"verify:{name}")
+            if name in failing:
+                raise RuntimeError(f"{name} never reached the cluster")
 
     def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
         (target / ".deploy").mkdir(parents=True)
@@ -1710,15 +1655,16 @@ def _staged_change_processor(
     ) -> GenerationResult:
         name = output_path.name
         calls.append(f"generate:{name}")
+        created = (
+            {Ref(kind="Deployment", namespace="config", name=name)}
+            if name in changed
+            else set()
+        )
         return GenerationResult(
             written_paths={output_path / "api.yaml"},
-            created_or_modified=(
-                {Ref(kind="Deployment", namespace="config", name=name)}
-                if name in changed
-                else set()
-            ),
+            created_or_modified=created,
             removed=set(),
-            deploy_id=f"deploy-{name}",
+            manifest_ids={ref: f"{name}-content" for ref in created},
         )
 
     def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
@@ -1757,12 +1703,12 @@ def test_rollout_waits_for_each_stage_before_deploying_the_next(
         "clone",
         "generate:platform-dev",
         "push",
-        "verify:deploy-platform-dev",
+        "verify:platform-dev",
         "generate:platform-prod",
         "generate:observability",
         "push",
-        "verify:deploy-platform-prod",
-        "verify:deploy-observability",
+        "verify:platform-prod",
+        "verify:observability",
     ]
     assert [
         (output.name, output.rollout, output.stage) for output in result.outputs
@@ -1793,7 +1739,7 @@ def test_rollout_skips_a_stage_whose_outputs_the_change_does_not_affect(
         "generate:platform-prod",
         "generate:observability",
         "push",
-        "verify:deploy-observability",
+        "verify:observability",
     ]
 
 
@@ -1804,13 +1750,13 @@ def test_rollout_stops_at_a_stage_whose_deployment_is_not_observed(
         tmp_path,
         monkeypatch,
         changed={"platform-dev", "platform-prod", "observability"},
-        failing=frozenset({"deploy-platform-dev"}),
+        failing=frozenset({"platform-dev"}),
     )
 
     with pytest.raises(
         RolloutStageError,
-        match="deployment of manifest-builder deploy-id deploy-platform-dev "
-        "was not observed: deploy-platform-dev never reached the cluster",
+        match="deployment in cluster platform-dev was not observed: "
+        "platform-dev never reached the cluster",
     ):
         processor.process("https://github.com/acme/config.git", "deadbeef", None)
 
@@ -1818,7 +1764,7 @@ def test_rollout_stops_at_a_stage_whose_deployment_is_not_observed(
         "clone",
         "generate:platform-dev",
         "push",
-        "verify:deploy-platform-dev",
+        "verify:platform-dev",
     ]
 
 

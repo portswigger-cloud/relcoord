@@ -83,10 +83,10 @@ The `200` response body reports the diff and the comment:
 }
 ```
 
-Every generated manifest carries a deploy-id annotation, and a change to a shared
-label or annotation rewrites every manifest that has it, so the comment
-summarizes those repeated metadata-only changes and leaves them out of the diff it
-shows. `diffs[].diff` is always the unabridged diff, which is where the comment
+Every generated manifest carries a manifest-id annotation that changes whenever
+the manifest does, and a change to a shared label or annotation rewrites every
+manifest that has it, so the comment leaves the ids out of the diff it shows and
+summarizes those repeated metadata-only changes instead of showing them. `diffs[].diff` is always the unabridged diff, which is where the comment
 points a reader who needs the part it left out.
 
 `Accept: text/event-stream` works here too, with the same event shapes as
@@ -287,8 +287,8 @@ The stream carries four kinds of event:
 
 Every event carries a `message` written to be read on its own, so a client can
 print the stream as it arrives without knowing any payload shape. What a message
-leaves out is in `detail`: the temporary workspace, the full commit hashes, the
-deploy-id, every changed object where the message named the first few. A step
+leaves out is in `detail`: the temporary workspace, the full commit hashes,
+every changed object where the message named the first few. A step
 whose only interest is to whoever debugs relcoord — the temporary directory it
 works in, the manifests commit named by the push lines either side of it — is
 logged rather than streamed, which is why there is no `workspace` or `commit`
@@ -439,15 +439,15 @@ change has actually materialised there, and logs it when it has.
 
 What it waits for comes from `manifest-builder`, which reports the Kubernetes
 objects each commit touched — kind, namespace where the object has one, and
-name — and stamps every manifest it wrote with a `noa.re/deploy-id` annotation
-identifying that generation. relcoord reports both in the `changed-objects`
-progress event and in the `outputs` of the change response, and then waits for
-each created or modified object to carry that deploy-id and each removed object
-to be gone. Objects are waited for with a list narrowed to the object's name
+name — and stamps every manifest it wrote with a `noa.re/manifest-id`
+annotation, a hash of that object's content. relcoord reports the objects in the
+`changed-objects` progress event and in the `outputs` of the change response,
+and then waits for each created or modified object to carry its manifest-id and
+each removed object to be gone. Objects are waited for with a list narrowed to the object's name
 followed by a watch, so a rollout is observed as it happens rather than polled
 for.
 
-Carrying the deploy-id says the write landed, not that it took effect, so for the
+Carrying the manifest-id says the write landed, not that it took effect, so for the
 kinds that roll a write out to pods the wait goes further. A Deployment has to
 have had its new generation observed, its new ReplicaSet scaled up, the old ones
 drained and the new pods become available; a StatefulSet has to have had its new

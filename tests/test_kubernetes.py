@@ -14,14 +14,14 @@ import pytest
 from relcoord.config import OutputSettings
 from relcoord.eks import TOKEN_PREFIX, EksTokenAuth
 from relcoord.kubernetes import (
-    DEPLOY_ID_ANNOTATION,
+    MANIFEST_ID_ANNOTATION,
     DeploymentDetectionError,
     KubernetesDeploymentDetector,
     _symmetric_jitter,
     cluster_client,
 )
 
-DEPLOY_ID = "0123456789abcdef"
+MANIFEST_ID = "0123456789abcdef"
 
 DISCOVERY = {
     "/api/v1": {
@@ -94,14 +94,14 @@ class Ref:
     api_version: str = "v1"
 
 
-def annotated(name: str, deploy_id: str | None) -> dict[str, object]:
-    annotations = {} if deploy_id is None else {DEPLOY_ID_ANNOTATION: deploy_id}
+def annotated(name: str, manifest_id: str | None) -> dict[str, object]:
+    annotations = {} if manifest_id is None else {MANIFEST_ID_ANNOTATION: manifest_id}
     return {"metadata": {"name": name, "annotations": annotations}}
 
 
 def deployment(
     name: str,
-    deploy_id: str | None,
+    manifest_id: str | None,
     *,
     generation: int = 1,
     observed_generation: int | None = None,
@@ -113,7 +113,7 @@ def deployment(
     conditions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """A Deployment that has finished rolling out, unless told otherwise."""
-    annotations = {} if deploy_id is None else {DEPLOY_ID_ANNOTATION: deploy_id}
+    annotations = {} if manifest_id is None else {MANIFEST_ID_ANNOTATION: manifest_id}
     return {
         "metadata": {
             "name": name,
@@ -139,7 +139,7 @@ def deployment(
 
 def statefulset(
     name: str,
-    deploy_id: str | None,
+    manifest_id: str | None,
     *,
     generation: int = 1,
     observed_generation: int | None = None,
@@ -152,7 +152,7 @@ def statefulset(
     update_revision: str | None = None,
 ) -> dict[str, Any]:
     """A StatefulSet that has finished rolling out, unless told otherwise."""
-    annotations = {} if deploy_id is None else {DEPLOY_ID_ANNOTATION: deploy_id}
+    annotations = {} if manifest_id is None else {MANIFEST_ID_ANNOTATION: manifest_id}
     strategy: dict[str, Any] = {"type": update_strategy}
     if partition is not None:
         strategy["rollingUpdate"] = {"partition": partition}
@@ -229,18 +229,19 @@ def test_detector_returns_when_the_objects_are_already_in_place() -> None:
         if path in DISCOVERY:
             return httpx.Response(200, json=DISCOVERY[path])
         if path == "/apis/apps/v1/namespaces/default/deployments":
-            return httpx.Response(200, json=listing(deployment("api", DEPLOY_ID)))
+            return httpx.Response(200, json=listing(deployment("api", MANIFEST_ID)))
         if path == "/api/v1/namespaces":
-            return httpx.Response(200, json=listing(annotated("production", DEPLOY_ID)))
+            return httpx.Response(
+                200, json=listing(annotated("production", MANIFEST_ID))
+            )
         if path == "/api/v1/namespaces/default/configmaps":
             return httpx.Response(200, json=listing())
         return httpx.Response(500, json={"unexpected": path})
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
-            Ref("Deployment", "default", "api", "apps/v1"),
-            Ref("Namespace", None, "production"),
+            Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID,
+            Ref("Namespace", None, "production"): MANIFEST_ID,
         },
         removed={Ref("ConfigMap", "default", "old-api")},
     )
@@ -256,7 +257,49 @@ def test_detector_returns_when_the_objects_are_already_in_place() -> None:
     assert all("watch" not in url.params for url in requests)
 
 
-def test_detector_watches_until_the_deploy_id_annotation_appears(
+def test_detector_waits_for_each_object_to_carry_its_own_manifest_id() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[path])
+        if path == "/apis/apps/v1/namespaces/default/deployments":
+            return httpx.Response(200, json=listing(deployment("api", "api-content")))
+        if path == "/api/v1/namespaces":
+            return httpx.Response(
+                200, json=listing(annotated("production", "namespace-content"))
+            )
+        return httpx.Response(500, json={"unexpected": path})
+
+    detector(handler).wait_for_success(
+        created_or_modified={
+            Ref("Deployment", "default", "api", "apps/v1"): "api-content",
+            Ref("Namespace", None, "production"): "namespace-content",
+        },
+        removed=set(),
+    )
+
+
+def test_detector_does_not_accept_another_object_s_manifest_id() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[path])
+        if path == "/api/v1/namespaces" and "watch" in request.url.params:
+            return httpx.Response(200, content=watch_stream())
+        if path == "/api/v1/namespaces":
+            return httpx.Response(200, json=listing(annotated("production", "other")))
+        return httpx.Response(500, json={"unexpected": path})
+
+    with pytest.raises(DeploymentDetectionError, match="namespace-content"):
+        detector(handler, timeout_seconds=0.05).wait_for_success(
+            created_or_modified={
+                Ref("Namespace", None, "production"): "namespace-content"
+            },
+            removed=set(),
+        )
+
+
+def test_detector_watches_until_the_manifest_id_annotation_appears(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     watches = 0
@@ -275,14 +318,15 @@ def test_detector_watches_until_the_deploy_id_annotation_appears(
             200,
             content=watch_stream(
                 ("MODIFIED", deployment("api", "stale")),
-                ("MODIFIED", deployment("api", DEPLOY_ID)),
+                ("MODIFIED", deployment("api", MANIFEST_ID)),
             ),
         )
 
     with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+            created_or_modified={
+                Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+            },
             removed=set(),
         )
 
@@ -320,16 +364,18 @@ def statefulsets_handler(listed: dict[str, Any], *watched: dict[str, Any]):
 
 def wait_for_deployment(handler, *, timeout_seconds: float = 5) -> None:
     detector(handler, timeout_seconds=timeout_seconds).wait_for_success(
-        deploy_id=DEPLOY_ID,
-        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+        created_or_modified={
+            Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+        },
         removed=set(),
     )
 
 
 def wait_for_statefulset(handler, *, timeout_seconds: float = 5) -> None:
     detector(handler, timeout_seconds=timeout_seconds).wait_for_success(
-        deploy_id=DEPLOY_ID,
-        created_or_modified={Ref("StatefulSet", "default", "db", "apps/v1")},
+        created_or_modified={
+            Ref("StatefulSet", "default", "db", "apps/v1"): MANIFEST_ID
+        },
         removed=set(),
     )
 
@@ -341,16 +387,16 @@ def test_detector_waits_for_a_new_replica_set_to_replace_the_old_one(
         # The new ReplicaSet is one pod in, and the old one still has both.
         deployment(
             "api",
-            DEPLOY_ID,
+            MANIFEST_ID,
             updated_replicas=1,
             status_replicas=3,
             available_replicas=2,
         ),
         # Scaled up, but the old ReplicaSet has a pod left.
-        deployment("api", DEPLOY_ID, status_replicas=3, available_replicas=2),
+        deployment("api", MANIFEST_ID, status_replicas=3, available_replicas=2),
         # Nothing but the new ReplicaSet, whose second pod is not ready yet.
-        deployment("api", DEPLOY_ID, available_replicas=1),
-        deployment("api", DEPLOY_ID),
+        deployment("api", MANIFEST_ID, available_replicas=1),
+        deployment("api", MANIFEST_ID),
     )
 
     with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
@@ -366,8 +412,8 @@ def test_detector_waits_for_the_controller_to_observe_a_change_it_need_not_roll(
     # A change that leaves the pod template alone: every replica is already
     # updated and available, so the wait is only for the controller to catch up.
     handler = deployments_handler(
-        deployment("api", DEPLOY_ID, generation=4, observed_generation=3),
-        deployment("api", DEPLOY_ID, generation=4),
+        deployment("api", MANIFEST_ID, generation=4, observed_generation=3),
+        deployment("api", MANIFEST_ID, generation=4),
     )
 
     with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
@@ -383,21 +429,21 @@ def test_detector_logs_what_it_observed_of_a_rollout_it_never_waited_for(
     # A Deployment already in the state the change asked for is waited for by
     # doing nothing, so this line is the only evidence the rollout was checked.
     handler = deployments_handler(
-        deployment("api", DEPLOY_ID, generation=7, replicas=3)
+        deployment("api", MANIFEST_ID, generation=7, replicas=3)
     )
 
     with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
         wait_for_deployment(handler)
 
     assert (
-        "reaching deploy-id 0123456789abcdef with a complete rollout after 0.0s: "
+        "reaching manifest-id 0123456789abcdef with a complete rollout after 0.0s: "
         "generation 7 observed, 3 of 3 replicas updated and available"
     ) in caplog.text
 
 
 def test_detector_times_out_reporting_where_a_rollout_got_to() -> None:
     handler = deployments_handler(
-        deployment("api", DEPLOY_ID, replicas=3, updated_replicas=1)
+        deployment("api", MANIFEST_ID, replicas=3, updated_replicas=1)
     )
 
     with pytest.raises(DeploymentDetectionError) as excinfo:
@@ -412,7 +458,7 @@ def test_detector_reports_a_rollout_that_exceeded_its_progress_deadline() -> Non
     handler = deployments_handler(
         deployment(
             "api",
-            DEPLOY_ID,
+            MANIFEST_ID,
             updated_replicas=1,
             conditions=[
                 {
@@ -437,7 +483,7 @@ def test_detector_reports_a_rollout_that_exceeded_its_progress_deadline() -> Non
 
 def test_detector_reports_a_paused_deployment_rather_than_waiting_for_it() -> None:
     handler = deployments_handler(
-        deployment("api", DEPLOY_ID, updated_replicas=0, paused=True)
+        deployment("api", MANIFEST_ID, updated_replicas=0, paused=True)
     )
 
     with pytest.raises(DeploymentDetectionError) as excinfo:
@@ -452,7 +498,7 @@ def test_detector_reports_why_a_replica_set_cannot_create_pods() -> None:
     handler = deployments_handler(
         deployment(
             "api",
-            DEPLOY_ID,
+            MANIFEST_ID,
             updated_replicas=0,
             conditions=[
                 {
@@ -482,16 +528,16 @@ def test_detector_waits_for_a_statefulset_to_replace_its_pods(
         # The first pod has been taken down for its replacement.
         statefulset(
             "db",
-            DEPLOY_ID,
+            MANIFEST_ID,
             ready_replicas=1,
             updated_replicas=0,
             update_revision="db-9c1",
         ),
         # Back up at the new revision, and the second pod not yet updated.
-        statefulset("db", DEPLOY_ID, updated_replicas=1, update_revision="db-9c1"),
+        statefulset("db", MANIFEST_ID, updated_replicas=1, update_revision="db-9c1"),
         # Both updated, and the controller has yet to make the revision current.
-        statefulset("db", DEPLOY_ID, update_revision="db-9c1"),
-        statefulset("db", DEPLOY_ID, current_revision="db-9c1"),
+        statefulset("db", MANIFEST_ID, update_revision="db-9c1"),
+        statefulset("db", MANIFEST_ID, current_revision="db-9c1"),
     )
 
     with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
@@ -507,8 +553,8 @@ def test_detector_waits_for_a_statefulset_change_that_rolls_no_pods(
     # A change that leaves the pod template alone: every replica is already
     # updated and ready, so the wait is only for the controller to catch up.
     handler = statefulsets_handler(
-        statefulset("db", DEPLOY_ID, generation=4, observed_generation=3),
-        statefulset("db", DEPLOY_ID, generation=4),
+        statefulset("db", MANIFEST_ID, generation=4, observed_generation=3),
+        statefulset("db", MANIFEST_ID, generation=4),
     )
 
     with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
@@ -522,14 +568,14 @@ def test_detector_logs_what_it_observed_of_a_statefulset_rollout(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     handler = statefulsets_handler(
-        statefulset("db", DEPLOY_ID, generation=7, replicas=3)
+        statefulset("db", MANIFEST_ID, generation=7, replicas=3)
     )
 
     with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
         wait_for_statefulset(handler)
 
     assert (
-        "reaching deploy-id 0123456789abcdef with a complete rollout after 0.0s: "
+        "reaching manifest-id 0123456789abcdef with a complete rollout after 0.0s: "
         "generation 7 observed, 3 of 3 replicas updated and ready"
     ) in caplog.text
 
@@ -537,7 +583,7 @@ def test_detector_logs_what_it_observed_of_a_statefulset_rollout(
 def test_detector_times_out_reporting_where_a_statefulset_rollout_got_to() -> None:
     handler = statefulsets_handler(
         statefulset(
-            "db", DEPLOY_ID, replicas=3, updated_replicas=1, update_revision="db-9c1"
+            "db", MANIFEST_ID, replicas=3, updated_replicas=1, update_revision="db-9c1"
         )
     )
 
@@ -558,7 +604,7 @@ def test_detector_waits_only_for_the_replicas_a_partition_covers(
     handler = statefulsets_handler(
         statefulset(
             "db",
-            DEPLOY_ID,
+            MANIFEST_ID,
             replicas=3,
             updated_replicas=0,
             partition=2,
@@ -566,7 +612,7 @@ def test_detector_waits_only_for_the_replicas_a_partition_covers(
         ),
         statefulset(
             "db",
-            DEPLOY_ID,
+            MANIFEST_ID,
             replicas=3,
             updated_replicas=1,
             partition=2,
@@ -592,7 +638,7 @@ def test_detector_waits_for_a_statefulset_a_partition_holds_entirely_back(
     handler = statefulsets_handler(
         statefulset(
             "db",
-            DEPLOY_ID,
+            MANIFEST_ID,
             replicas=2,
             updated_replicas=0,
             partition=2,
@@ -614,7 +660,7 @@ def test_detector_does_not_wait_for_pods_an_on_delete_statefulset_keeps(
     handler = statefulsets_handler(
         statefulset(
             "db",
-            DEPLOY_ID,
+            MANIFEST_ID,
             update_strategy="OnDelete",
             updated_replicas=0,
             update_revision="db-9c1",
@@ -633,7 +679,7 @@ def test_detector_waits_for_an_on_delete_statefulset_to_be_observed() -> None:
     handler = statefulsets_handler(
         statefulset(
             "db",
-            DEPLOY_ID,
+            MANIFEST_ID,
             update_strategy="OnDelete",
             generation=4,
             observed_generation=3,
@@ -654,14 +700,13 @@ def test_detector_watches_until_a_removed_object_is_deleted() -> None:
         if path != "/api/v1/namespaces/default/configmaps":
             return httpx.Response(500, json={"unexpected": path})
         if "watch" not in request.url.params:
-            return httpx.Response(200, json=listing(annotated("old-api", DEPLOY_ID)))
+            return httpx.Response(200, json=listing(annotated("old-api", MANIFEST_ID)))
         return httpx.Response(
-            200, content=watch_stream(("DELETED", annotated("old-api", DEPLOY_ID)))
+            200, content=watch_stream(("DELETED", annotated("old-api", MANIFEST_ID)))
         )
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
-        created_or_modified=set(),
+        created_or_modified={},
         removed={Ref("ConfigMap", "default", "old-api")},
     )
 
@@ -680,12 +725,13 @@ def test_detector_lists_again_when_a_watch_ends_without_the_change() -> None:
             # An expired watch closes without having reported the change.
             return httpx.Response(200, content=b"")
         lists += 1
-        deploy_id = DEPLOY_ID if lists > 2 else "stale"
-        return httpx.Response(200, json=listing(deployment("api", deploy_id)))
+        manifest_id = MANIFEST_ID if lists > 2 else "stale"
+        return httpx.Response(200, json=listing(deployment("api", manifest_id)))
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
-        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+        created_or_modified={
+            Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+        },
         removed=set(),
     )
 
@@ -703,8 +749,9 @@ def test_detector_times_out_reporting_the_observed_annotation() -> None:
 
     with pytest.raises(DeploymentDetectionError) as excinfo:
         detector(handler, timeout_seconds=0).wait_for_success(
-            deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+            created_or_modified={
+                Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+            },
             removed=set(),
         )
 
@@ -723,8 +770,7 @@ def test_detector_reports_a_kind_the_cluster_does_not_serve() -> None:
 
     with pytest.raises(DeploymentDetectionError, match="no namespaced resource"):
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Widget", "default", "api")},
+            created_or_modified={Ref("Widget", "default", "api"): MANIFEST_ID},
             removed=set(),
         )
 
@@ -770,12 +816,11 @@ def test_detector_resolves_a_shared_kind_through_the_refs_group(group: str) -> N
             return httpx.Response(200, json=discovery[path])
         if path.startswith("/apis/") and path.endswith("/namespaces/default/roles"):
             listed.append(path)
-            return httpx.Response(200, json=listing(annotated("api", DEPLOY_ID)))
+            return httpx.Response(200, json=listing(annotated("api", MANIFEST_ID)))
         return httpx.Response(500, json={"unexpected": path})
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
-        created_or_modified={Ref("Role", "default", "api", f"{group}/v1")},
+        created_or_modified={Ref("Role", "default", "api", f"{group}/v1"): MANIFEST_ID},
         removed=set(),
     )
 
@@ -792,12 +837,11 @@ def test_detector_resolves_a_shared_kind_whose_ref_names_another_version() -> No
         if path in discovery:
             return httpx.Response(200, json=discovery[path])
         listed.append(path)
-        return httpx.Response(200, json=listing(annotated("api", DEPLOY_ID)))
+        return httpx.Response(200, json=listing(annotated("api", MANIFEST_ID)))
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
-            Ref("Role", "default", "api", "iam.aws.m.upbound.io/v1beta1")
+            Ref("Role", "default", "api", "iam.aws.m.upbound.io/v1beta1"): MANIFEST_ID,
         },
         removed=set(),
     )
@@ -816,9 +860,10 @@ def test_detector_reports_a_kind_no_group_the_cluster_serves_defines() -> None:
 
     with pytest.raises(DeploymentDetectionError) as excinfo:
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
             created_or_modified={
-                Ref("Role", "default", "api", "iam.aws.m.upbound.io/v1beta1")
+                Ref(
+                    "Role", "default", "api", "iam.aws.m.upbound.io/v1beta1"
+                ): MANIFEST_ID,
             },
             removed=set(),
         )
@@ -839,8 +884,7 @@ def test_detector_reports_a_shared_kind_a_ref_carries_no_api_version_for() -> No
 
     with pytest.raises(DeploymentDetectionError) as excinfo:
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Role", "default", "api", "")},
+            created_or_modified={Ref("Role", "default", "api", ""): MANIFEST_ID},
             removed=set(),
         )
 
@@ -856,8 +900,9 @@ def test_detector_reports_a_failing_api_server() -> None:
 
     with pytest.raises(DeploymentDetectionError, match="status 403"):
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+            created_or_modified={
+                Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+            },
             removed=set(),
         )
 
@@ -873,8 +918,9 @@ def test_detector_reports_a_watch_that_the_api_server_rejects() -> None:
 
     with pytest.raises(DeploymentDetectionError, match="watch of .* status 500"):
         detector(handler).wait_for_success(
-            deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+            created_or_modified={
+                Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+            },
             removed=set(),
         )
 
@@ -909,13 +955,14 @@ def test_detector_retries_a_throttled_list_and_honours_the_retry_after_header(
         lists += 1
         if lists == 1:
             return throttled(retry_after_seconds=1, header="3")
-        return httpx.Response(200, json=listing(deployment("api", DEPLOY_ID)))
+        return httpx.Response(200, json=listing(deployment("api", MANIFEST_ID)))
 
     slept: list[float] = []
     with caplog.at_level(logging.WARNING, logger="relcoord.kubernetes"):
         detector(handler, sleep=slept.append).wait_for_success(
-            deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+            created_or_modified={
+                Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+            },
             removed=set(),
         )
 
@@ -938,12 +985,13 @@ def test_detector_uses_the_bodys_retry_after_when_no_header_is_sent() -> None:
         lists += 1
         if lists == 1:
             return throttled(retry_after_seconds=2)
-        return httpx.Response(200, json=listing(deployment("api", DEPLOY_ID)))
+        return httpx.Response(200, json=listing(deployment("api", MANIFEST_ID)))
 
     slept: list[float] = []
     detector(handler, sleep=slept.append).wait_for_success(
-        deploy_id=DEPLOY_ID,
-        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+        created_or_modified={
+            Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+        },
         removed=set(),
     )
 
@@ -969,8 +1017,9 @@ def test_detector_backs_off_exponentially_when_no_retry_after_is_given() -> None
             throttle_initial_delay_seconds=1.0,
             sleep=slept.append,
         ).wait_for_success(
-            deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+            created_or_modified={
+                Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+            },
             removed=set(),
         )
 
@@ -991,15 +1040,16 @@ def test_detector_re_lists_when_a_watch_is_throttled_rather_than_failing() -> No
         if "watch" not in request.url.params:
             # Stale until the watch has been throttled once and the loop lists
             # afresh, which is what a 429 on the watch has to fall back to.
-            deploy_id = "stale" if watches == 0 else DEPLOY_ID
-            return httpx.Response(200, json=listing(deployment("api", deploy_id)))
+            manifest_id = "stale" if watches == 0 else MANIFEST_ID
+            return httpx.Response(200, json=listing(deployment("api", manifest_id)))
         watches += 1
         return throttled(retry_after_seconds=1, header="1")
 
     slept: list[float] = []
     detector(handler, sleep=slept.append).wait_for_success(
-        deploy_id=DEPLOY_ID,
-        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+        created_or_modified={
+            Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+        },
         removed=set(),
     )
 
@@ -1020,7 +1070,7 @@ def test_detector_jitters_the_honoured_delay_before_sleeping() -> None:
         lists += 1
         if lists == 1:
             return throttled(retry_after_seconds=4)
-        return httpx.Response(200, json=listing(deployment("api", DEPLOY_ID)))
+        return httpx.Response(200, json=listing(deployment("api", MANIFEST_ID)))
 
     jittered: list[float] = []
     slept: list[float] = []
@@ -1030,8 +1080,9 @@ def test_detector_jitters_the_honoured_delay_before_sleeping() -> None:
         return delay + 0.5
 
     detector(handler, sleep=slept.append, jitter=record_jitter).wait_for_success(
-        deploy_id=DEPLOY_ID,
-        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+        created_or_modified={
+            Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+        },
         removed=set(),
     )
 
@@ -1185,17 +1236,16 @@ def test_detector_finds_a_kind_a_non_preferred_group_version_serves() -> None:
         if path in discovery:
             return httpx.Response(200, json=discovery[path])
         listed.append(path)
-        return httpx.Response(200, json=listing(annotated("canary", DEPLOY_ID)))
+        return httpx.Response(200, json=listing(annotated("canary", MANIFEST_ID)))
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref(
                 "TeleportRoleV8",
                 "teleport-permissions",
                 "canary",
                 "resources.teleport.dev/v1",
-            )
+            ): MANIFEST_ID,
         },
         removed=set(),
     )
@@ -1217,17 +1267,16 @@ def test_detector_keeps_a_kind_several_versions_share_unambiguous() -> None:
         if path in discovery:
             return httpx.Response(200, json=discovery[path])
         listed.append(path)
-        return httpx.Response(200, json=listing(annotated("sso-user", DEPLOY_ID)))
+        return httpx.Response(200, json=listing(annotated("sso-user", MANIFEST_ID)))
 
     detector(handler).wait_for_success(
-        deploy_id=DEPLOY_ID,
         created_or_modified={
             Ref(
                 "TeleportRole",
                 "teleport-permissions",
                 "sso-user",
                 "resources.teleport.dev/v5",
-            )
+            ): MANIFEST_ID,
         },
         removed=set(),
     )
