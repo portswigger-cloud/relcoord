@@ -250,3 +250,21 @@ def test_validate_ignores_a_verdict_key_it_no_longer_reads() -> None:
 
     assert not validation.passed
     assert [f.rule_id for f in validation.failing_findings] == ["RBAC-1"]
+
+
+def test_validate_reads_how_long_each_check_took() -> None:
+    timed = {
+        "passed": True,
+        "digest": TREE_DIGEST,
+        "verdicts": [
+            {"passed": True, "tool": "kics", "duration_seconds": 4.213},
+            {"passed": True, "tool": "structural"},
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(("result", json.dumps(timed))))
+
+    validation = _validator(handler).validate(TREE)
+
+    assert [v.duration_seconds for v in validation.verdicts] == [4.213, None]

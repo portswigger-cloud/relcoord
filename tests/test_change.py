@@ -3,7 +3,7 @@
 import logging
 import re
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -172,7 +172,9 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
 
 
 def test_change_processor_reports_progress_for_each_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ticking_clock: Callable[[], float],
 ) -> None:
     def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
         (target / ".deploy").mkdir(parents=True)
@@ -211,7 +213,9 @@ def test_change_processor_reports_progress_for_each_step(
     )
 
     events: list[ChangeProgress] = []
-    ChangeProcessor("https://github.com/acme/manifests.git").process(
+    ChangeProcessor(
+        "https://github.com/acme/manifests.git", clock=ticking_clock
+    ).process(
         "https://github.com/acme/config.git",
         "deadbeef",
         "registry.example.com/team/api:1.2.3",
@@ -223,13 +227,16 @@ def test_change_processor_reports_progress_for_each_step(
     # other is named by the push lines either side of it.
     assert [event.phase for event in events] == [
         "source-checkout",
+        "source-checked-out",
         "deploy-config",
         "manifests-checkout",
+        "manifests-checked-out",
         "generate",
         "generated",
         "changed-objects",
         "push",
         "pushed",
+        "timings",
     ]
     by_phase = {event.phase: event for event in events}
     assert by_phase["changed-objects"].detail == {
@@ -256,7 +263,25 @@ def test_change_processor_reports_progress_for_each_step(
     )
     assert by_phase["generated"].detail["generated"] == 1
     assert "paths" not in by_phase["generated"].detail
-    assert by_phase["generated"].message == "manifests: 1 of 1 manifests changed"
+    assert by_phase["source-checked-out"].message == (
+        "checked out acme/config at deadbee (1.0s)"
+    )
+    assert by_phase["manifests-checked-out"].message == (
+        "checked out acme/manifests (1.0s)"
+    )
+    assert by_phase["generated"].message == "manifests: 1 of 1 manifests changed (1.0s)"
+    assert by_phase["generated"].detail["seconds"] == 1.0
+    assert by_phase["pushed"].message == "pushed feedfac to acme/manifests (1.0s)"
+    # Every phase reads the clock twice and the summary once more, so the
+    # clock's own readings are the time no phase accounts for.
+    assert by_phase["timings"].message == (
+        "took 11.0s: checkout 2.0s, generate 1.0s, push 1.0s, cleanup 1.0s, other 6.0s"
+    )
+    assert by_phase["timings"].detail == {
+        "total_seconds": 11.0,
+        "phases": {"checkout": 2.0, "generate": 1.0, "push": 1.0, "cleanup": 1.0},
+        "generate_by_output": {"manifests": 1.0},
+    }
     assert by_phase["push"].detail == {
         "repository": "https://github.com/acme/manifests.git",
         "manifest_commit": "feedface",
@@ -305,8 +330,8 @@ def test_change_processor_reports_no_changes_progress(
         progress=events.append,
     )
 
-    assert [event.phase for event in events][-1] == "no-changes"
-    assert events[-1].message == "no changes for acme/manifests"
+    assert [event.phase for event in events][-2:] == ["no-changes", "timings"]
+    assert events[-2].message == "no changes for acme/manifests"
 
 
 def test_change_processor_generates_configured_outputs_with_vars(
@@ -1782,9 +1807,11 @@ def test_rollout_reports_progress_for_each_stage(
 
     assert [event.phase for event in events] == [
         "source-checkout",
+        "source-checked-out",
         "deploy-config",
         "rollout-stage",
         "manifests-checkout",
+        "manifests-checked-out",
         "generate",
         "generated",
         "changed-objects",
@@ -1802,6 +1829,7 @@ def test_rollout_reports_progress_for_each_stage(
         "pushed",
         "deployment-detection",
         "rollout-stage-verified",
+        "timings",
     ]
     stages = [event for event in events if event.phase == "rollout-stage"]
     assert [event.detail for event in stages] == [
