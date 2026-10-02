@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from manifest_builder import ExternalPlugins
 
 from relcoord import change
 from relcoord.change import (
+    ChangeProcessingError,
     ChangeProgress,
     CommentPostError,
     CredentialError,
@@ -192,7 +194,9 @@ def test_diff_generates_commits_and_diffs_without_pushing(
 
 
 def test_diff_reports_progress_for_each_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ticking_clock: Callable[[], float],
 ) -> None:
     _fake_git(
         monkeypatch,
@@ -204,18 +208,23 @@ def test_diff_reports_progress_for_each_step(
 
     events: list[ChangeProgress] = []
     DiffCommentProcessor(
-        manifests_repository=MANIFESTS_REPO, commenter=Commenter()
+        manifests_repository=MANIFESTS_REPO,
+        commenter=Commenter(),
+        clock=ticking_clock,
     ).diff(CONFIG_REPO, "deadbeef", pull_request=7, progress=events.append)
 
     assert [event.phase for event in events] == [
         "source-checkout",
+        "source-checked-out",
         "deploy-config",
         "manifests-checkout",
+        "manifests-checked-out",
         "generate",
         "generated",
         "diff",
         "comment",
         "commented",
+        "timings",
     ]
     by_phase = {event.phase: event for event in events}
     assert by_phase["source-checkout"].detail == {
@@ -225,7 +234,15 @@ def test_diff_reports_progress_for_each_step(
     assert by_phase["source-checkout"].message == "checking out acme/config at deadbee"
     assert by_phase["diff"].detail == {"repository": MANIFESTS_REPO, "changed": 1}
     assert by_phase["diff"].message == "acme/manifests: 1 file changed"
-    assert by_phase["commented"].message == "commented on acme/config pull request #7"
+    assert by_phase["commented"].message == (
+        "commented on acme/config pull request #7 (1.0s)"
+    )
+    assert by_phase["timings"].detail["phases"] == {
+        "checkout": 2.0,
+        "generate": 1.0,
+        "comment": 1.0,
+        "cleanup": 1.0,
+    }
     assert by_phase["commented"].detail["pull_request"] == 7
     assert by_phase["commented"].detail["url"] == (
         "https://github.com/acme/config/pull/7#c1"
@@ -273,7 +290,7 @@ def test_diff_without_a_pull_request_returns_the_body_without_posting(
         "The generated output is the same before and after this change"
         in result.comment.body
     )
-    assert [event.phase for event in events][-1] == "no-comment"
+    assert [event.phase for event in events][-2:] == ["no-comment", "timings"]
 
 
 def test_diff_reports_no_changes_when_manifest_builder_changed_nothing(
@@ -687,3 +704,23 @@ def test_diff_marks_its_comment_so_a_later_diff_can_update_it(
     assert commenter.markers == [marker]
     assert marker in commenter.calls[0][2]
     assert result.comment.updated
+
+
+def test_a_failed_diff_still_says_where_the_time_went(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(monkeypatch, tmp_path)
+
+    def broken_generate(*args, **kwargs):
+        raise RuntimeError("manifest-builder fell over")
+
+    monkeypatch.setattr(change, "generate", broken_generate)
+    events: list[ChangeProgress] = []
+
+    with pytest.raises(ChangeProcessingError):
+        DiffCommentProcessor(
+            manifests_repository=MANIFESTS_REPO, commenter=Commenter()
+        ).diff(CONFIG_REPO, "deadbeef", progress=events.append)
+
+    assert events[-1].phase == "timings"
+    assert set(events[-1].detail["phases"]) == {"checkout", "generate", "cleanup"}

@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -423,3 +423,28 @@ def test_a_diff_shows_a_finding_that_was_not_accepted(
         "| acme-dev | high | RBAC Wildcard In Rule | acme-dev/rbac.yaml "
         "| wildcard rule |"
     ) in body
+
+
+def test_a_diff_reports_how_long_each_validation_took(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ticking_clock: Callable[[], float],
+) -> None:
+    _fake_git(monkeypatch, tmp_path)
+    events: list[ChangeProgress] = []
+
+    DiffCommentProcessor(
+        outputs=[DEV, PROD],
+        commenter=Commenter(),
+        validator=Validator(),
+        clock=ticking_clock,
+    ).diff(CONFIG_REPO, "deadbeef", progress=events.append)
+
+    validated = [event for event in events if event.phase == "validated"]
+    assert [event.message for event in validated] == [
+        "acme-dev: passed (1.0s)",
+        "acme-prod: passed (1.0s)",
+    ]
+    assert events[-1].phase == "timings"
+    assert events[-1].detail["phases"]["validate"] == 2.0
+    assert "; slowest outputs: acme-dev 1.0s, acme-prod 1.0s" in events[-1].message

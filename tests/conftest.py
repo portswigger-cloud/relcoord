@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
+import itertools
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -44,3 +45,10 @@ def clear_installation_token_cache() -> Iterator[None]:
     installation_token_cache.clear()
     yield
     installation_token_cache.clear()
+
+
+@pytest.fixture
+def ticking_clock() -> Callable[[], float]:
+    """A clock one second further on each time it is read, so every phase takes 1s."""
+    readings = itertools.count()
+    return lambda: float(next(readings))

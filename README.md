@@ -90,10 +90,11 @@ summarizes those repeated metadata-only changes instead of showing them. `diffs[
 points a reader who needs the part it left out.
 
 `Accept: text/event-stream` works here too, with the same event shapes as
-`/v1/change` and phases `source-checkout`, `deploy-config`, `system-checkout`,
-`manifests-checkout`, `generate`, `generated`, `validate`, `running`,
+`/v1/change` and phases `source-checkout`, `source-checked-out`,
+`deploy-config`, `system-checkout`, `manifests-checkout`,
+`manifests-checked-out`, `generate`, `generated`, `validate`, `running`,
 `validated`, `validation-failed`, `validation-error`, `no-validation`, `diff`,
-`no-changes`, `comment`, `commented` and `no-comment`.
+`no-changes`, `comment`, `commented`, `no-comment` and `timings`.
 
 ## Selecting outputs
 
@@ -274,9 +275,10 @@ The stream carries four kinds of event:
   `registered` image version, so the client can render something before any git
   work starts.
 - `progress` — one per step, with a stable `phase` (`source-checkout`,
-  `deploy-config`, `system-checkout`, `rollout-stage`, `manifests-checkout`,
-  `generate`, `generated`, `changed-objects`, `no-changes`, `push`,
-  `pushed`, `deployment-detection`, `rollout-stage-verified`),
+  `source-checked-out`, `deploy-config`, `system-checkout`, `rollout-stage`,
+  `manifests-checkout`, `manifests-checked-out`, `generate`, `generated`,
+  `changed-objects`, `no-changes`, `push`, `pushed`, `deployment-detection`,
+  `rollout-stage-verified`, `timings`),
   a human readable `message`, and a `detail` object with specifics of the step.
   The validation phases (`validate`, `running`, `validated`, `validation-failed`,
   `validation-error`, `no-validation`) come back with validation on a change.
@@ -293,6 +295,13 @@ whose only interest is to whoever debugs relcoord — the temporary directory it
 works in, the manifests commit named by the push lines either side of it — is
 logged rather than streamed, which is why there is no `workspace` or `commit`
 phase.
+
+A step that took time says how long in its message, as in `checked out
+acme/manifests (18.0s)`, and in `detail.seconds`. The last `progress` event,
+sent whether the work succeeded or failed, is `timings`: how long the whole
+request took and how that splits across `checkout`, `generate`, `validate`,
+`push`, `comment`, `deploy` and `cleanup`, plus the slowest outputs to generate.
+Its `detail` has `total_seconds`, `phases` and `generate_by_output`.
 
 Comment lines (`: keep-alive`) are sent while a step is slow, so intermediate
 proxies do not treat the connection as dead.

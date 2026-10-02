@@ -41,6 +41,7 @@ from relcoord.manifest_diff import (
     manifest_diff,
     render_validation_summary,
 )
+from relcoord.timing import Lap, PhaseTimer
 from relcoord.validator import (
     Finding,
     OutputValidation,
@@ -253,6 +254,7 @@ class ChangeProcessor:
     """Detector to use for every output, in place of connecting to its cluster."""
     validator: TreeValidator | None = None
     """Validator every generated tree is gated on, absent without [validator]."""
+    clock: Callable[[], float] = time.monotonic
 
     def process(
         self,
@@ -268,6 +270,7 @@ class ChangeProcessor:
         def report(phase: str, message: str, **detail: Any) -> None:
             progress(ChangeProgress(phase=phase, message=message, detail=detail))
 
+        timer = PhaseTimer(self.clock)
         workdir = Path(tempfile.mkdtemp(prefix="relcoord-change-"))
         try:
             source_checkout = workdir / "source"
@@ -295,7 +298,9 @@ class ChangeProcessor:
                 repo=repo,
                 commit=commit,
             )
-            _checkout_commit(repo, commit, source_checkout, self.idcat)
+            with timer.measure("checkout") as lap:
+                _checkout_commit(repo, commit, source_checkout, self.idcat)
+            _report_source_checked_out(repo, commit, lap, report)
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
@@ -325,6 +330,7 @@ class ChangeProcessor:
                 system,
                 self.idcat,
                 report,
+                timer,
                 step="change step 3/7",
             )
 
@@ -341,7 +347,9 @@ class ChangeProcessor:
                 for repository, stage_outputs in _outputs_by_repository(stage.outputs):
                     manifests_checkout = checkout_by_repository[repository]
                     if repository not in cloned:
-                        self._clone_manifests(repository, manifests_checkout, report)
+                        self._clone_manifests(
+                            repository, manifests_checkout, report, timer
+                        )
                         cloned.add(repository)
                     generation_results: list[GenerationResult] = []
 
@@ -356,6 +364,7 @@ class ChangeProcessor:
                             namespace=namespace,
                             plugins=plugins,
                             report=report,
+                            timer=timer,
                         )
                         output_results.append(output_result)
                         generation_results.append(generation_result)
@@ -367,7 +376,7 @@ class ChangeProcessor:
                         # diffcomment path still validates. Restore this line
                         # (and validator= in make_change_processor) to bring it
                         # back.
-                        # self._validate(output, manifests_checkout, report)
+                        # self._validate(output, manifests_checkout, report, timer)
 
                     if not any(
                         result.created_or_modified or result.removed
@@ -386,11 +395,11 @@ class ChangeProcessor:
                         continue
 
                     self._push_manifests(
-                        repository, manifests_checkout, repo, commit, report
+                        repository, manifests_checkout, repo, commit, report, timer
                     )
 
                 if self.detect_deployment:
-                    self._detect_stage_deployments(stage, stage_results, report)
+                    self._detect_stage_deployments(stage, stage_results, report, timer)
             return ChangeResult(
                 repo=repo,
                 commit=commit,
@@ -404,7 +413,7 @@ class ChangeProcessor:
         except Exception as exc:
             raise ChangeProcessingError(str(exc)) from exc
         finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+            _clean_up(workdir, timer, report)
 
     def _configured_outputs(self) -> tuple[OutputSettings, ...]:
         return _resolve_output_settings(self.outputs, self.manifests_repository)
@@ -414,6 +423,7 @@ class ChangeProcessor:
         output: OutputSettings,
         manifests_checkout: Path,
         report: Callable[..., None],
+        timer: PhaseTimer,
     ) -> None:
         """Gate one output's generated tree on manifest-validator's verdict.
 
@@ -425,7 +435,7 @@ class ChangeProcessor:
         if self.validator is None:
             return
         result = _validate_generated_output(
-            self.validator, output, manifests_checkout, report
+            self.validator, output, manifests_checkout, report, timer
         )
         if result.failed:
             raise ManifestValidationError(_validation_failure_message([result]))
@@ -435,6 +445,7 @@ class ChangeProcessor:
         repository: str,
         manifests_checkout: Path,
         report: Callable[..., None],
+        timer: PhaseTimer,
     ) -> None:
         """Check out a manifests repository, once per change.
 
@@ -451,13 +462,15 @@ class ChangeProcessor:
             f"checking out {short_repo(repository)}",
             repository=repository,
         )
-        _clone_repository(
-            repository,
-            manifests_checkout,
-            self.idcat,
-            purpose=f"cloning manifests repo {repository}",
-            depth="1",
-        )
+        with timer.measure("checkout") as lap:
+            _clone_repository(
+                repository,
+                manifests_checkout,
+                self.idcat,
+                purpose=f"cloning manifests repo {repository}",
+                depth="1",
+            )
+        _report_manifests_checked_out(repository, lap, report)
 
     def _generate_output(
         self,
@@ -471,6 +484,7 @@ class ChangeProcessor:
         namespace: str | None,
         plugins: ExternalPlugins | None,
         report: Callable[..., None],
+        timer: PhaseTimer,
     ) -> tuple[OutputResult, GenerationResult]:
         """Let manifest-builder write one output into the manifests checkout."""
         repo_root = Path("/")
@@ -501,16 +515,17 @@ class ChangeProcessor:
             directory=str(output.directory),
             **_selection_detail(selection),
         )
-        generation_result = generate(
-            deploy_config,
-            output_path,
-            repo_root=repo_root,
-            create_commit=create_commit,
-            image=image,
-            namespace=namespace,
-            plugins=plugins,
-            **selection,
-        )
+        with timer.measure("generate", output=output.name) as lap:
+            generation_result = generate(
+                deploy_config,
+                output_path,
+                repo_root=repo_root,
+                create_commit=create_commit,
+                image=image,
+                namespace=namespace,
+                plugins=plugins,
+                **selection,
+            )
         generated = _written_paths(generation_result)
         created_or_modified = _sorted_refs(generation_result.created_or_modified)
         removed_refs = _sorted_refs(generation_result.removed)
@@ -523,12 +538,14 @@ class ChangeProcessor:
             "generated",
             _generated_message(
                 output, len(generated), created_or_modified, removed_refs
-            ),
+            )
+            + f" {lap.took}",
             output=output.name,
             repository=output.repository,
             generated=len(generated),
             changed=len(created_or_modified),
             removed=len(removed_refs),
+            seconds=round(lap.seconds, 3),
         )
         if created_or_modified or removed_refs:
             logger.info(
@@ -571,6 +588,7 @@ class ChangeProcessor:
         repo: str,
         commit: str,
         report: Callable[..., None],
+        timer: PhaseTimer,
     ) -> None:
         """Push what manifest-builder committed for one stage of one repository."""
         manifest_commit = _head_commit(manifests_checkout)
@@ -593,11 +611,12 @@ class ChangeProcessor:
             repository=repository,
             manifest_commit=manifest_commit,
         )
-        _push_repository(
-            manifests_checkout,
-            repository,
-            self.idcat,
-        )
+        with timer.measure("push") as lap:
+            _push_repository(
+                manifests_checkout,
+                repository,
+                self.idcat,
+            )
         logger.info(
             "change complete: pushed manifests commit %s for source repo %s "
             "at commit %s",
@@ -607,9 +626,10 @@ class ChangeProcessor:
         )
         report(
             "pushed",
-            f"pushed {short} to {target}",
+            f"pushed {short} to {target} {lap.took}",
             repository=repository,
             manifest_commit=manifest_commit,
+            seconds=round(lap.seconds, 3),
         )
 
     def _detect_stage_deployments(
@@ -617,6 +637,7 @@ class ChangeProcessor:
         stage: ChangeStage,
         results: Sequence[tuple[OutputSettings, GenerationResult]],
         report: Callable[..., None],
+        timer: PhaseTimer,
     ) -> None:
         """Follow a stage's pushes into the clusters they were pushed to.
 
@@ -651,14 +672,14 @@ class ChangeProcessor:
                     self.deployment_detector,
                 )
                 continue
-            started = time.monotonic()
-            _await_deployment_detection(
-                generation_result,
-                output.name,
-                connection,
-                self.deployment_detector,
-            )
-            observed.append((output.name, time.monotonic() - started))
+            with timer.measure("deploy") as lap:
+                _await_deployment_detection(
+                    generation_result,
+                    output.name,
+                    connection,
+                    self.deployment_detector,
+                )
+            observed.append((output.name, lap.seconds))
         if stage.rollout is None:
             return
         message = _stage_verified_message(stage, observed)
@@ -754,6 +775,7 @@ class DiffCommentProcessor:
     into an error: what a reviewer needs is to see it before the merge that
     would be refused by :class:`ChangeProcessor`.
     """
+    clock: Callable[[], float] = time.monotonic
 
     def diff(
         self,
@@ -769,6 +791,7 @@ class DiffCommentProcessor:
         def report(phase: str, message: str, **detail: Any) -> None:
             progress(ChangeProgress(phase=phase, message=message, detail=detail))
 
+        timer = PhaseTimer(self.clock)
         workdir = Path(tempfile.mkdtemp(prefix="relcoord-diff-"))
         try:
             source_checkout = workdir / "source"
@@ -797,9 +820,13 @@ class DiffCommentProcessor:
                 commit=commit,
             )
             try:
-                _checkout_rebased_commit(repo, commit, source_checkout, self.idcat)
+                with timer.measure("checkout") as lap:
+                    _checkout_rebased_commit(repo, commit, source_checkout, self.idcat)
             except RebaseConflictError as exc:
-                return self._rebase_required(repo, commit, pull_request, report, exc)
+                return self._rebase_required(
+                    repo, commit, pull_request, report, timer, exc
+                )
+            _report_source_checked_out(repo, commit, lap, report)
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
@@ -829,6 +856,7 @@ class DiffCommentProcessor:
                 system,
                 self.idcat,
                 report,
+                timer,
                 step="diff step 3/6",
             )
 
@@ -848,13 +876,15 @@ class DiffCommentProcessor:
                     f"checking out {short_repo(repository)}",
                     repository=repository,
                 )
-                _clone_repository(
-                    repository,
-                    manifests_checkout,
-                    self.idcat,
-                    purpose=f"cloning manifests repo {repository}",
-                    depth="1",
-                )
+                with timer.measure("checkout") as lap:
+                    _clone_repository(
+                        repository,
+                        manifests_checkout,
+                        self.idcat,
+                        purpose=f"cloning manifests repo {repository}",
+                        depth="1",
+                    )
+                _report_manifests_checked_out(repository, lap, report)
                 base_commit = _head_commit(manifests_checkout)
 
                 for output in _outputs_for_repository(selected_outputs, repository):
@@ -880,16 +910,17 @@ class DiffCommentProcessor:
                         directory=str(output.directory),
                         **_selection_detail(selection),
                     )
-                    generation_result = generate(
-                        deploy_config,
-                        output_path,
-                        repo_root=Path("/"),
-                        create_commit=True,
-                        image=None,
-                        namespace=namespace,
-                        plugins=plugins,
-                        **selection,
-                    )
+                    with timer.measure("generate", output=output.name) as lap:
+                        generation_result = generate(
+                            deploy_config,
+                            output_path,
+                            repo_root=Path("/"),
+                            create_commit=True,
+                            image=None,
+                            namespace=namespace,
+                            plugins=plugins,
+                            **selection,
+                        )
                     generated = _written_paths(generation_result)
                     logger.info(
                         "diff step 5/6: manifest-builder generated %d file(s) "
@@ -904,10 +935,12 @@ class DiffCommentProcessor:
                             len(generated),
                             _sorted_refs(generation_result.created_or_modified),
                             _sorted_refs(generation_result.removed),
-                        ),
+                        )
+                        + f" {lap.took}",
                         output=output.name,
                         repository=repository,
                         generated=len(generated),
+                        seconds=round(lap.seconds, 3),
                     )
                     output_diffs.append(
                         OutputDiff(
@@ -921,7 +954,11 @@ class DiffCommentProcessor:
                     if self.validator is not None:
                         validations.append(
                             _validate_generated_output(
-                                self.validator, output, manifests_checkout, report
+                                self.validator,
+                                output,
+                                manifests_checkout,
+                                report,
+                                timer,
                             )
                         )
 
@@ -962,7 +999,7 @@ class DiffCommentProcessor:
                 validation=render_validation_summary(validations),
             )
             comment = self._comment(
-                repo, pull_request, comment_body.body, marker, report
+                repo, pull_request, comment_body.body, marker, report, timer
             )
             return DiffResult(
                 repo=repo,
@@ -979,7 +1016,7 @@ class DiffCommentProcessor:
         except Exception as exc:
             raise ChangeProcessingError(str(exc)) from exc
         finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+            _clean_up(workdir, timer, report)
 
     def _comment(
         self,
@@ -988,6 +1025,7 @@ class DiffCommentProcessor:
         body: str,
         marker: str,
         report: Callable[..., None],
+        timer: PhaseTimer,
     ) -> DiffComment:
         if pull_request is None:
             logger.info(
@@ -1019,7 +1057,8 @@ class DiffCommentProcessor:
             pull_request=pull_request,
         )
         try:
-            posted = commenter.post_comment(repo, pull_request, body, marker=marker)
+            with timer.measure("comment") as lap:
+                posted = commenter.post_comment(repo, pull_request, body, marker=marker)
         except GitCredentialError as exc:
             raise CredentialError(
                 "failed to obtain git credentials while posting a manifest diff "
@@ -1037,11 +1076,12 @@ class DiffCommentProcessor:
         )
         report(
             "commented",
-            f"commented on {short_repo(repo)} pull request #{pull_request}",
+            f"commented on {short_repo(repo)} pull request #{pull_request} {lap.took}",
             repo=repo,
             pull_request=pull_request,
             url=posted.url,
             updated=posted.updated,
+            seconds=round(lap.seconds, 3),
         )
         return DiffComment(
             body=body, posted=True, url=posted.url, updated=posted.updated
@@ -1053,6 +1093,7 @@ class DiffCommentProcessor:
         commit: str,
         pull_request: int | None,
         report: Callable[..., None],
+        timer: PhaseTimer,
         exc: RebaseConflictError,
     ) -> DiffResult:
         """Ask for a manual rebase instead of publishing a misleading diff.
@@ -1076,7 +1117,7 @@ class DiffCommentProcessor:
         )
         marker = comment_marker()
         body = build_rebase_required_comment(marker=marker)
-        comment = self._comment(repo, pull_request, body, marker, report)
+        comment = self._comment(repo, pull_request, body, marker, report, timer)
         return DiffResult(
             repo=repo,
             commit=commit,
@@ -1093,6 +1134,7 @@ def _validate_generated_output(
     output: OutputSettings,
     manifests_checkout: Path,
     report: Callable[..., None],
+    timer: PhaseTimer,
 ) -> OutputValidation:
     """Have manifest-validator judge what one output generated.
 
@@ -1131,7 +1173,8 @@ def _validate_generated_output(
         report(phase, f"{output.name}: {message}", output=output.name)
 
     try:
-        validation = validator.validate(tree, output.checks, progress=forward)
+        with timer.measure("validate") as lap:
+            validation = validator.validate(tree, output.checks, progress=forward)
     except ValidationError as exc:
         logger.warning("validation of output %s did not happen: %s", output.name, exc)
         report(
@@ -1154,8 +1197,9 @@ def _validate_generated_output(
     )
     report(
         "validated" if validation.passed else "validation-failed",
-        _validated_message(output, validation.passed, validation),
+        f"{_validated_message(output, validation.passed, validation)} {lap.took}",
         output=output.name,
+        seconds=round(lap.seconds, 3),
         passed=validation.passed,
         digest=validation.digest,
         cached=validation.cached,
@@ -1174,6 +1218,7 @@ def validation_payloads(validation: Validation) -> list[dict[str, Any]]:
             "tool": verdict.tool,
             "tool_version": verdict.tool_version,
             "ruleset_digest": verdict.ruleset_digest,
+            "duration_seconds": verdict.duration_seconds,
             "findings": [
                 {
                     "rule_id": finding.rule_id,
@@ -1876,12 +1921,45 @@ def _rebase_onto(target: Path, upstream: str) -> None:
         _dulwich_checkout(target, rebased[-1].decode("ascii"))
 
 
+def _report_source_checked_out(
+    repo: str, commit: str, lap: Lap, report: Callable[..., None]
+) -> None:
+    report(
+        "source-checked-out",
+        f"checked out {short_repo(repo)} at {short_commit(commit)} {lap.took}",
+        repo=repo,
+        commit=commit,
+        seconds=round(lap.seconds, 3),
+    )
+
+
+def _report_manifests_checked_out(
+    repository: str, lap: Lap, report: Callable[..., None]
+) -> None:
+    report(
+        "manifests-checked-out",
+        f"checked out {short_repo(repository)} {lap.took}",
+        repository=repository,
+        seconds=round(lap.seconds, 3),
+    )
+
+
+def _clean_up(workdir: Path, timer: PhaseTimer, report: Callable[..., None]) -> None:
+    """Remove the workspace, then say where the time went, failed or not."""
+    with timer.measure("cleanup"):
+        shutil.rmtree(workdir, ignore_errors=True)
+    message, detail = timer.summary()
+    logger.info("timings: %s", message)
+    report("timings", message, **detail)
+
+
 def _system_plugins(
     system_repository: str | None,
     workdir: Path,
     system: bool,
     idcat: IdcatSettings | None,
     report: Callable[..., None],
+    timer: PhaseTimer,
     *,
     step: str,
 ) -> ExternalPlugins | None:
@@ -1893,15 +1971,17 @@ def _system_plugins(
     """
     if system_repository is None or system:
         return None
-    plugins = _checkout_system_plugins(system_repository, workdir / "system", idcat)
+    with timer.measure("checkout") as lap:
+        plugins = _checkout_system_plugins(system_repository, workdir / "system", idcat)
     logger.info("%s: checked out plugins from %s", step, plugins.source)
     _, _, plugins_commit = plugins.source.rpartition("@")
     report(
         "system-checkout",
         f"using plugins from {short_repo(system_repository)} "
-        f"at {short_commit(plugins_commit)}",
+        f"at {short_commit(plugins_commit)} {lap.took}",
         repository=system_repository,
         source=plugins.source,
+        seconds=round(lap.seconds, 3),
     )
     return plugins
 

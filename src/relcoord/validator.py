@@ -76,6 +76,8 @@ class Verdict:
     tool_version: str = ""
     ruleset_digest: str = ""
     findings: tuple[Finding, ...] = ()
+    duration_seconds: float | None = None
+    """How long the check took when it ran, absent from older validators."""
 
     @property
     def failing_findings(self) -> tuple[Finding, ...]:
@@ -347,6 +349,7 @@ def _verdict_from_payload(payload: Mapping[str, Any]) -> Verdict:
         tool=_string(payload, "tool"),
         tool_version=_string(payload, "tool_version"),
         ruleset_digest=_string(payload, "ruleset_digest"),
+        duration_seconds=_optional_number(payload, "duration_seconds"),
         findings=tuple(
             _finding_from_payload(entry)
             for entry in findings
@@ -370,6 +373,13 @@ def _finding_from_payload(payload: Mapping[str, Any]) -> Finding:
 def _string(payload: Mapping[str, Any], key: str) -> str:
     value = payload.get(key)
     return value if isinstance(value, str) else ""
+
+
+def _optional_number(payload: Mapping[str, Any], key: str) -> float | None:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
