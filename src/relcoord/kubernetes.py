@@ -44,6 +44,8 @@ WATCH_TIMEOUT_SECONDS = 300.0
 # How long to wait before opening a watch that the API server just closed
 # straight away, so a cluster refusing watches does not spin.
 WATCH_RETRY_SECONDS = 1.0
+# How long to wait between discovery rounds while a kind is not served yet.
+DISCOVERY_RETRY_SECONDS = 2.0
 CONNECT_TIMEOUT_SECONDS = 10.0
 # A 429 is the API server asking to slow down — most often because its storage
 # layer is briefly (re)initialising — rather than a request that will never
@@ -273,7 +275,7 @@ class KubernetesDeploymentDetector:
         deadline = time.monotonic() + self._timeout_seconds
         waited_for = 0
         for ref in sorted(created_or_modified, key=_object_ref_sort_key):
-            resource = self._resource_for(ref)
+            resource = self._resource_for(ref, deadline)
             self._wait_for_object(
                 ref,
                 resource,
@@ -284,7 +286,7 @@ class KubernetesDeploymentDetector:
         for ref in sorted(removed, key=_object_ref_sort_key):
             self._wait_for_object(
                 ref,
-                self._resource_for(ref),
+                self._resource_for(ref, deadline),
                 goal=_REMOVAL_GOAL,
                 deadline=deadline,
             )
@@ -466,17 +468,37 @@ class KubernetesDeploymentDetector:
                 f"watch of {_format_ref(ref)} failed: {exc}"
             ) from exc
 
-    def _resource_for(self, ref: KubernetesObjectRef) -> KubernetesResource:
+    def _resource_for(
+        self, ref: KubernetesObjectRef, deadline: float
+    ) -> KubernetesResource:
+        """Resolve a ref's resource, waiting for the cluster to start serving it.
+
+        A change that creates a CRD together with an object of that kind, or one
+        whose CRD comes from a provider package that is still installing, has
+        nothing to find at first. The kind not being served is therefore treated
+        as pending until the deadline rather than as a failure.
+        """
         resources = self._matching_resources(ref)
-        if not resources:
+        began = time.monotonic()
+        while not resources:
             self._resources_by_kind = self._discover_resources()
             resources = self._matching_resources(ref)
-        if not resources:
-            scope = "namespaced" if ref.namespace is not None else "cluster-scoped"
-            raise DeploymentDetectionError(
-                f"cluster {self._cluster_name or '<unnamed>'} serves no "
-                f"{scope} resource of kind {ref.kind}{_of_api_version(ref)}"
+            if resources:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                scope = "namespaced" if ref.namespace is not None else "cluster-scoped"
+                raise DeploymentDetectionError(
+                    f"cluster {self._cluster_name or '<unnamed>'} serves no "
+                    f"{scope} resource of kind {ref.kind}{_of_api_version(ref)}"
+                    f" (waited {time.monotonic() - began:.0f}s)"
+                )
+            logger.info(
+                "cluster %s does not serve %s yet; discovering again",
+                self._cluster_name or "<unnamed>",
+                _format_ref(ref),
             )
+            self._sleep(min(DISCOVERY_RETRY_SECONDS, remaining))
         if len(resources) > 1:
             served = ", ".join(
                 f"{resource.path_prefix}/{resource.name}" for resource in resources
