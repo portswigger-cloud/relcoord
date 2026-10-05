@@ -859,7 +859,7 @@ def test_detector_reports_a_kind_no_group_the_cluster_serves_defines() -> None:
         return httpx.Response(500, json={"unexpected": path})
 
     with pytest.raises(DeploymentDetectionError) as excinfo:
-        detector(handler).wait_for_success(
+        detector(handler, timeout_seconds=0).wait_for_success(
             created_or_modified={
                 Ref(
                     "Role", "default", "api", "iam.aws.m.upbound.io/v1beta1"
@@ -871,6 +871,34 @@ def test_detector_reports_a_kind_no_group_the_cluster_serves_defines() -> None:
     message = str(excinfo.value)
     assert "serves no namespaced resource of kind Role" in message
     assert "in iam.aws.m.upbound.io/v1beta1" in message
+
+
+def test_detector_waits_for_a_kind_the_cluster_starts_serving_later() -> None:
+    discovery = shared_role_discovery("iam.aws.m.upbound.io")
+    rounds = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal rounds
+        path = request.url.path
+        if path == "/api/v1":
+            rounds += 1
+        if path == "/apis" and rounds <= 2:
+            # The CRD is not established yet.
+            return httpx.Response(200, json=DISCOVERY["/apis"])
+        if path in discovery:
+            return httpx.Response(200, json=discovery[path])
+        return httpx.Response(200, json=listing(annotated("api", MANIFEST_ID)))
+
+    detector(handler, sleep=sleeps.append).wait_for_success(
+        created_or_modified={
+            Ref("Role", "default", "api", "iam.aws.m.upbound.io/v1beta1"): MANIFEST_ID,
+        },
+        removed=set(),
+    )
+
+    assert rounds >= 3
+    assert len(sleeps) >= 1
 
 
 def test_detector_reports_a_shared_kind_a_ref_carries_no_api_version_for() -> None:
