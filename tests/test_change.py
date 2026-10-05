@@ -1488,6 +1488,46 @@ def test_change_processor_reports_the_objects_a_change_touched(
     )
 
 
+def test_change_processor_does_not_treat_an_object_moved_between_files_as_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    namespace = Ref(kind="Namespace", namespace=None, name="crossplane-system")
+    stale = Ref(kind="ConfigMap", namespace="config", name="old-api")
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(*args, **kwargs) -> GenerationResult:
+        # The Namespace file moved: manifest-builder sees it deleted at the old
+        # path and added at the new one.
+        return GenerationResult(
+            written_paths={args[1] / "cluster" / "namespace.yaml"},
+            created_or_modified={namespace},
+            removed={namespace, stale},
+            manifest_ids={namespace: "ns-content"},
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *a, **k: None)
+
+    result = ChangeProcessor("https://github.com/acme/manifests.git").process(
+        "https://github.com/acme/config.git", "deadbeef", None
+    )
+
+    output = result.outputs[0]
+    assert output.created_or_modified == (namespace,)
+    assert output.removed == (stale,)
+
+
 def test_change_processor_detects_deployment_in_the_output_cluster(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
