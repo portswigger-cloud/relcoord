@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -511,6 +511,7 @@ class ChangeProcessor:
             plugins=plugins,
             **selection,
         )
+        generation_result = _discount_moved_objects(generation_result)
         generated = _written_paths(generation_result)
         created_or_modified = _sorted_refs(generation_result.created_or_modified)
         removed_refs = _sorted_refs(generation_result.removed)
@@ -890,6 +891,7 @@ class DiffCommentProcessor:
                         plugins=plugins,
                         **selection,
                     )
+                    generation_result = _discount_moved_objects(generation_result)
                     generated = _written_paths(generation_result)
                     logger.info(
                         "diff step 5/6: manifest-builder generated %d file(s) "
@@ -1353,6 +1355,21 @@ def _diff_sections(diffs: Sequence[RepositoryDiff]) -> tuple[DiffSection, ...]:
     return tuple(
         DiffSection(heading=entry.repository, diff=entry.manifest_diff)
         for entry in changed
+    )
+
+
+def _discount_moved_objects(generation_result: GenerationResult) -> GenerationResult:
+    """Stop treating an object that changed file as one that was removed.
+
+    manifest-builder reads removals from deleted files and creations from added
+    ones, so an object whose definition moved between files appears as both.
+    The object still exists, so waiting for it to disappear can only time out;
+    it is a creation or modification and nothing else.
+    """
+    return replace(
+        generation_result,
+        removed=set(generation_result.removed)
+        - set(generation_result.created_or_modified),
     )
 
 
