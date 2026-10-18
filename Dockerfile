@@ -1,6 +1,6 @@
 FROM cleanstart/helm:4.3.0 AS helm
 
-FROM astral/uv:trixie-slim AS builder
+FROM astral/uv:trixie AS builder
 
 WORKDIR /build
 
