@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import asyncio
 import logging
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -122,7 +122,7 @@ def test_configure_logging_uses_configured_log_level() -> None:
 
 
 @contextmanager
-def restored_log_levels() -> Iterator[None]:
+def restored_log_levels() -> Generator[None]:
     loggers = [
         logging.getLogger(),
         *(logging.getLogger(n) for n in HTTP_CLIENT_LOGGERS),
