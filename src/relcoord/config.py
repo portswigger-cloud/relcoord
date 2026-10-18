@@ -308,12 +308,7 @@ class Settings:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
         except tomllib.TOMLDecodeError as exc:
-            raise ValueError(
-                f"Invalid TOML in {path}: {exc}. "
-                "Python tomllib parses TOML 1.0.0, where inline tables must be "
-                "written on one line; for multiline idmouse settings, use a "
-                "[persistence.idmouse] table."
-            ) from exc
+            raise ValueError(f"Invalid TOML in {path}: {exc}") from exc
         persistence = data.get("persistence")
         if persistence is not None and not isinstance(persistence, dict):
             raise ValueError("persistence must be a table")
