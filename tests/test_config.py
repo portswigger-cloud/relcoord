@@ -56,6 +56,35 @@ def test_settings_listen_option(tmp_path: Path) -> None:
     assert settings.listen == "127.0.0.1"
 
 
+def test_settings_parse_tls_paths(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('tls_cert_path = "/tls/crt"\ntls_key_path = "/tls/key"\n')
+
+    settings = Settings.from_toml(config)
+
+    assert settings.tls_cert_path == "/tls/crt"
+    assert settings.tls_key_path == "/tls/key"
+
+
+def test_settings_tls_defaults_to_disabled(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("")
+
+    settings = Settings.from_toml(config)
+
+    assert settings.tls_cert_path is None
+    assert settings.tls_key_path is None
+
+
+@pytest.mark.parametrize("key", ["tls_cert_path", "tls_key_path"])
+def test_settings_rejects_only_one_tls_path(tmp_path: Path, key: str) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(f'{key} = "/tls/file"\n')
+
+    with pytest.raises(ValueError, match="must be set together"):
+        Settings.from_toml(config)
+
+
 def test_settings_host_option_is_deprecated(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

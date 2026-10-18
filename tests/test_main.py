@@ -17,6 +17,7 @@ from relcoord.main import (
     configure_logging,
     make_change_processor,
     make_diff_processor,
+    make_server_config,
     make_store,
 )
 from relcoord.retrying_store import RetryingImageInfoStore
@@ -160,3 +161,19 @@ def test_configure_logging_does_not_make_the_http_clients_louder() -> None:
         # WARNING here would out-shout a root logger set to ERROR, since a
         # logger with a level of its own is judged by that rather than the root.
         assert logging.getLogger("httpx").level == logging.ERROR
+
+
+def test_server_config_is_plain_http_without_tls() -> None:
+    config = make_server_config(Settings())
+
+    assert config.certfile is None
+    assert config.keyfile is None
+
+
+def test_server_config_uses_tls_files() -> None:
+    config = make_server_config(
+        Settings(tls_cert_path="/tls/crt", tls_key_path="/tls/key")
+    )
+
+    assert config.certfile == "/tls/crt"
+    assert config.keyfile == "/tls/key"

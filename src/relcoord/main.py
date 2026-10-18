@@ -36,9 +36,21 @@ HTTP_CLIENT_LOGGERS = ("httpx", "httpcore")
 logger = logging.getLogger(__name__)
 
 
-async def run(settings: Settings, disable_auth: bool) -> None:
+def make_server_config(settings: Settings) -> HypercornConfig:
     config = HypercornConfig()
     config.bind = [f"{settings.listen}:{settings.port}"]
+    if settings.tls_cert_path is not None and settings.tls_key_path is not None:
+        # With TLS, ALPN lets clients negotiate HTTP/2.
+        config.certfile = settings.tls_cert_path
+        config.keyfile = settings.tls_key_path
+        logger.info("serving https using certificate %s", settings.tls_cert_path)
+    else:
+        logger.warning("no tls_cert_path configured; serving plain http")
+    return config
+
+
+async def run(settings: Settings, disable_auth: bool) -> None:
+    config = make_server_config(settings)
     token_validator = _build_token_validator(settings, disable_auth)
     change_processor = make_change_processor(settings)
     diff_processor = make_diff_processor(settings)
