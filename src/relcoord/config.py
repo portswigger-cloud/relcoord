@@ -289,6 +289,8 @@ class RolloutSettings:
 class Settings:
     listen: str = "0.0.0.0"
     port: int = 8000
+    tls_cert_path: str | None = None
+    tls_key_path: str | None = None
     log_level: str = "INFO"
     manifests_repository: str | None = None
     system_repository: str | None = None
@@ -375,9 +377,15 @@ class Settings:
                 "The 'host' config option is deprecated; use 'listen' instead"
             )
         listen = data.get("listen", data.get("host", cls.listen))
+        tls_cert_path = _optional_string(data, "tls_cert_path")
+        tls_key_path = _optional_string(data, "tls_key_path")
+        if (tls_cert_path is None) != (tls_key_path is None):
+            raise ValueError("tls_cert_path and tls_key_path must be set together")
         return cls(
             listen=listen,
             port=data.get("port", cls.port),
+            tls_cert_path=tls_cert_path,
+            tls_key_path=tls_key_path,
             log_level=_log_level_or_default(data, "log-level", cls.log_level),
             manifests_repository=manifests_repository,
             system_repository=_optional_string(data, "system-repository"),

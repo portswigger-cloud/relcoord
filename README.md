@@ -2,6 +2,21 @@
 
 Small HTTP service for registering image versions and resolving the latest known version per image.
 
+## TLS
+
+By default relcoord listens for plain HTTP. Setting `tls_cert_path` and
+`tls_key_path` to PEM files holding the certificate (chain) and private key
+makes it listen for HTTPS instead, which lets clients use HTTP/2. Either both
+are set or neither is; setting only one is a startup error.
+
+```toml
+tls_cert_path = "/etc/relcoord/tls.crt"
+tls_key_path = "/etc/relcoord/tls.key"
+```
+
+Prefer this over HTTP/1.1 where you can: HTTP/1.1 request framing is open to
+desync attacks, which HTTP/2 avoids. See <https://http1mustdie.com>.
+
 ## Manifest diff comments
 
 `POST /v1/diffcomment` reports what a config commit *would* do to the manifests

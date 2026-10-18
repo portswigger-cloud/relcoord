@@ -2,6 +2,9 @@
 
 listen = "0.0.0.0"
 port = 8080
+# Serve https (and so HTTP/2) instead of http. PEM files; set both or neither.
+# tls_cert_path = "/etc/relcoord/tls.crt"
+# tls_key_path = "/etc/relcoord/tls.key"
 log-level = "INFO"
 detect-deployment = false
 
