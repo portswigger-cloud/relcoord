@@ -49,6 +49,7 @@ from relcoord.git import (
 )
 from relcoord.service import ImageVersionService
 from relcoord.store import ImageInfoStore
+from relcoord.tracing import mark_error, set_attributes, span
 
 logger = logging.getLogger(__name__)
 
@@ -178,8 +179,10 @@ def create_app(
     def _require_auth(request: Request) -> tuple[Response | None, object | None]:
         try:
             header = request.headers.get("authorization")
-            principal = token_validator.validate(header)
+            with span("authenticate"):
+                principal = token_validator.validate(header)
         except AuthError as exc:
+            mark_error("unauthorized")
             logger.warning(
                 "Unauthorized request %s %s: %s",
                 request.method,
@@ -194,7 +197,8 @@ def create_app(
 
     async def health(request: Request) -> Response:
         try:
-            await store.health_check()
+            with span("store.health_check"):
+                await store.health_check()
         except PersistenceUnavailableError as exc:
             logger.warning(
                 "Health check failed for persistence operation %s",
@@ -326,7 +330,8 @@ def create_app(
         # work starts, so a streaming response only ever has to report failures
         # that the change processor itself raises.
         try:
-            plan = await _plan_change(request, principal)
+            with span("plan change"):
+                plan = await _plan_change(request, principal)
         except ValidationError as exc:
             return _bad_request(request, error=exc.error, message=exc.message)
         except _SystemNotAllowedError:
@@ -356,6 +361,13 @@ def create_app(
             plan.repo,
             plan.commit,
             plan.manifest_image,
+        )
+        set_attributes(
+            **{
+                "relcoord.repo": plan.repo,
+                "relcoord.commit": plan.commit,
+                "relcoord.system": plan.system,
+            }
         )
         if _wants_event_stream(request):
             return StreamingResponse(
@@ -417,6 +429,14 @@ def create_app(
             plan.repo,
             plan.commit,
             plan.pull_request,
+        )
+        set_attributes(
+            **{
+                "relcoord.repo": plan.repo,
+                "relcoord.commit": plan.commit,
+                "relcoord.system": plan.system,
+                "relcoord.pull_request": plan.pull_request,
+            }
         )
         if _wants_event_stream(request):
             return StreamingResponse(

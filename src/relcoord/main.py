@@ -8,6 +8,7 @@ import logging
 import click
 from hypercorn.asyncio import serve
 from hypercorn.config import Config as HypercornConfig
+from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
 
 from relcoord.app import (
     BearerTokenValidator,
@@ -25,6 +26,7 @@ from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.retrying_store import RetryingImageInfoStore
 from relcoord.store import ImageInfoStore
 from relcoord.surreal_store import SurrealImageInfoStore
+from relcoord.tracing import configure_tracing
 from relcoord.validator import HttpTreeValidator
 from relcoord.version import version_summary
 
@@ -55,6 +57,7 @@ async def run(settings: Settings, disable_auth: bool) -> None:
     change_processor = make_change_processor(settings)
     diff_processor = make_diff_processor(settings)
     store = await make_store(settings)
+    tracer_provider = configure_tracing(settings.tracing)
     try:
         # This has been raised upstream: https://github.com/pgjones/hypercorn/issues/353
         # noinspection PyTypeChecker
@@ -64,8 +67,15 @@ async def run(settings: Settings, disable_auth: bool) -> None:
             change_processor=change_processor,
             diff_processor=diff_processor,
         )
+        if tracer_provider is not None:
+            # Outermost, so a trace covers authentication and logging too and
+            # continues a trace the caller propagated in traceparent.
+            app = OpenTelemetryMiddleware(app, tracer_provider=tracer_provider)
         await serve(app, config)  # ty: ignore[invalid-argument-type]
     finally:
+        if tracer_provider is not None:
+            # Flush spans still queued for export.
+            tracer_provider.shutdown()
         close = getattr(store, "close", None)
         if close is not None:
             await close()

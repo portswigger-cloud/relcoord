@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from relcoord.errors import ValidationError
 from relcoord.models import RegisterResult
 from relcoord.store import ImageInfoStore
+from relcoord.tracing import span
 
 
 class ImageVersionService:
@@ -25,9 +26,10 @@ class ImageVersionService:
         validated_image = self._validate_image(image)
         validated_version = self._validate_version(version)
         validated_timestamp = self._validate_timestamp(timestamp)
-        return await self._store.register(
-            validated_image, validated_version, validated_timestamp
-        )
+        with span("store.register", image=validated_image, version=validated_version):
+            return await self._store.register(
+                validated_image, validated_version, validated_timestamp
+            )
 
     async def latest_versions(self, images: list[str]) -> dict[str, str | None]:
         if not isinstance(images, list):
@@ -37,7 +39,8 @@ class ImageVersionService:
             )
 
         validated_images = [self._validate_image(image) for image in images]
-        return await self._store.latest_for_images(validated_images)
+        with span("store.latest_for_images", images=len(validated_images)):
+            return await self._store.latest_for_images(validated_images)
 
     def _validate_image(self, image: str) -> str:
         if not isinstance(image, str) or not image.strip():

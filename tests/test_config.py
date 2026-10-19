@@ -1295,3 +1295,33 @@ def test_settings_reject_checks_that_are_not_a_list_of_names(
 
     with pytest.raises(ValueError, match="output.checks must be a non-empty array"):
         Settings.from_toml(config)
+
+
+def test_settings_parse_tracing_endpoint(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [tracing]
+        endpoint = "http://tempo.tempo.svc:4317"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.tracing is not None
+    assert settings.tracing.endpoint == "http://tempo.tempo.svc:4317"
+
+
+def test_settings_tracing_is_off_by_default(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("")
+
+    assert Settings.from_toml(config).tracing is None
+
+
+def test_settings_reject_tracing_without_endpoint(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("[tracing]\n")
+
+    with pytest.raises(ValueError, match="tracing.endpoint"):
+        Settings.from_toml(config)

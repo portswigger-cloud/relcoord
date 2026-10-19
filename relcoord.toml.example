@@ -119,6 +119,12 @@ url = "http://manifest-validator.platform.svc:8080"
 # How long a scan may take. A cold kics run over a large tree is the slow case.
 timeout-seconds = 900
 
+# OpenTelemetry tracing. With this section every HTTP request becomes a trace,
+# with spans for the steps it goes through, exported over OTLP/gRPC (for
+# example to Tempo). Without it nothing is traced.
+# [tracing]
+# endpoint = "http://tempo.tempo.svc:4317"
+
 [persistence]
 backend = "surrealdb"
 uri = "ws://localhost:8000"

@@ -167,6 +167,20 @@ class ValidatorSettings:
 
 
 @dataclass(frozen=True)
+class TracingSettings:
+    """Where to send traces. Without a [tracing] section nothing is exported."""
+
+    endpoint: str
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> TracingSettings:
+        endpoint = data.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            raise ValueError("tracing.endpoint must be a non-empty string")
+        return cls(endpoint=endpoint)
+
+
+@dataclass(frozen=True)
 class OutputSettings:
     """One manifests destination, and what manifest-builder generates into it.
 
@@ -300,6 +314,7 @@ class Settings:
     persistence: PersistenceSettings | None = None
     idcat: IdcatSettings | None = None
     validator: ValidatorSettings | None = None
+    tracing: TracingSettings | None = None
     roles: list[RoleConfig] = field(default_factory=list)
 
     @classmethod
@@ -318,6 +333,9 @@ class Settings:
         validator_data = data.get("validator")
         if validator_data is not None and not isinstance(validator_data, dict):
             raise ValueError("validator must be a table")
+        tracing_data = data.get("tracing")
+        if tracing_data is not None and not isinstance(tracing_data, dict):
+            raise ValueError("tracing must be a table")
         raw_roles = data.get("role", [])
         if not isinstance(raw_roles, list):
             raise TypeError("role must be an array of tables")
@@ -392,6 +410,11 @@ class Settings:
             ),
             idcat=IdcatSettings.from_mapping(idcat) if idcat else None,
             validator=validator,
+            tracing=(
+                TracingSettings.from_mapping(tracing_data)
+                if tracing_data is not None
+                else None
+            ),
             roles=roles,
         )
 

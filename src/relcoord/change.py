@@ -41,6 +41,7 @@ from relcoord.manifest_diff import (
     manifest_diff,
     render_validation_summary,
 )
+from relcoord.tracing import span
 from relcoord.validator import (
     Finding,
     OutputValidation,
@@ -265,6 +266,28 @@ class ChangeProcessor:
         *,
         progress: ProgressSink = ignore_progress,
     ) -> ChangeResult:
+        with span(
+            "change.process",
+            **{
+                "relcoord.repo": repo,
+                "relcoord.commit": commit,
+                "relcoord.image": image,
+            },
+        ):
+            return self._process(
+                repo, commit, image, config_path, system, outputs, progress
+            )
+
+    def _process(
+        self,
+        repo: str,
+        commit: str,
+        image: str | None,
+        config_path: str,
+        system: bool,
+        outputs: Sequence[str],
+        progress: ProgressSink,
+    ) -> ChangeResult:
         def report(phase: str, message: str, **detail: Any) -> None:
             progress(ChangeProgress(phase=phase, message=message, detail=detail))
 
@@ -295,15 +318,17 @@ class ChangeProcessor:
                 repo=repo,
                 commit=commit,
             )
-            _checkout_commit(repo, commit, source_checkout, self.idcat)
-            deploy_config, namespace = _deploy_config_and_namespace(
-                source_checkout, repo, commit, config_path, system
-            )
-            declared = declared_targets(deploy_config)
-            declares_targets = declared is not None
-            selected_outputs = _selected_outputs(
-                permitted, declared, system, configured=output_settings
-            )
+            with span("checkout source", **{"relcoord.repo": repo}):
+                _checkout_commit(repo, commit, source_checkout, self.idcat)
+            with span("load deploy config"):
+                deploy_config, namespace = _deploy_config_and_namespace(
+                    source_checkout, repo, commit, config_path, system
+                )
+                declared = declared_targets(deploy_config)
+                declares_targets = declared is not None
+                selected_outputs = _selected_outputs(
+                    permitted, declared, system, configured=output_settings
+                )
             logger.info(
                 "change step 3/7: found deploy config at %s (system mode: %s, "
                 "targets: %s)",
@@ -319,14 +344,15 @@ class ChangeProcessor:
                 namespace=namespace,
                 targets=declares_targets,
             )
-            plugins = _system_plugins(
-                self.system_repository,
-                workdir,
-                system,
-                self.idcat,
-                report,
-                step="change step 3/7",
-            )
+            with span("fetch system plugins"):
+                plugins = _system_plugins(
+                    self.system_repository,
+                    workdir,
+                    system,
+                    self.idcat,
+                    report,
+                    step="change step 3/7",
+                )
 
             output_results: list[OutputResult] = []
             total_generated = 0
@@ -451,13 +477,14 @@ class ChangeProcessor:
             f"checking out {short_repo(repository)}",
             repository=repository,
         )
-        _clone_repository(
-            repository,
-            manifests_checkout,
-            self.idcat,
-            purpose=f"cloning manifests repo {repository}",
-            depth="1",
-        )
+        with span("clone manifests", **{"relcoord.repository": repository}):
+            _clone_repository(
+                repository,
+                manifests_checkout,
+                self.idcat,
+                purpose=f"cloning manifests repo {repository}",
+                depth="1",
+            )
 
     def _generate_output(
         self,
@@ -501,16 +528,17 @@ class ChangeProcessor:
             directory=str(output.directory),
             **_selection_detail(selection),
         )
-        generation_result = generate(
-            deploy_config,
-            output_path,
-            repo_root=repo_root,
-            create_commit=create_commit,
-            image=image,
-            namespace=namespace,
-            plugins=plugins,
-            **selection,
-        )
+        with span("generate manifests", **{"relcoord.output": output.name}):
+            generation_result = generate(
+                deploy_config,
+                output_path,
+                repo_root=repo_root,
+                create_commit=create_commit,
+                image=image,
+                namespace=namespace,
+                plugins=plugins,
+                **selection,
+            )
         generation_result = _discount_moved_objects(generation_result)
         generated = _written_paths(generation_result)
         created_or_modified = _sorted_refs(generation_result.created_or_modified)
@@ -594,11 +622,18 @@ class ChangeProcessor:
             repository=repository,
             manifest_commit=manifest_commit,
         )
-        _push_repository(
-            manifests_checkout,
-            repository,
-            self.idcat,
-        )
+        with span(
+            "push manifests",
+            **{
+                "relcoord.repository": repository,
+                "relcoord.manifest_commit": manifest_commit,
+            },
+        ):
+            _push_repository(
+                manifests_checkout,
+                repository,
+                self.idcat,
+            )
         logger.info(
             "change complete: pushed manifests commit %s for source repo %s "
             "at commit %s",
@@ -645,20 +680,31 @@ class ChangeProcessor:
                 cluster=output.name,
             )
             if stage.rollout is None:
-                _start_deployment_detection(
+                with span(
+                    "start deployment detection", **{"relcoord.output": output.name}
+                ):
+                    _start_deployment_detection(
+                        generation_result,
+                        output.name,
+                        connection,
+                        self.deployment_detector,
+                    )
+                continue
+            started = time.monotonic()
+            with span(
+                "await deployment",
+                **{
+                    "relcoord.output": output.name,
+                    "relcoord.rollout": stage.rollout,
+                    "relcoord.stage": stage.index,
+                },
+            ):
+                _await_deployment_detection(
                     generation_result,
                     output.name,
                     connection,
                     self.deployment_detector,
                 )
-                continue
-            started = time.monotonic()
-            _await_deployment_detection(
-                generation_result,
-                output.name,
-                connection,
-                self.deployment_detector,
-            )
             observed.append((output.name, time.monotonic() - started))
         if stage.rollout is None:
             return
@@ -767,6 +813,28 @@ class DiffCommentProcessor:
         pull_request: int | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> DiffResult:
+        with span(
+            "diff.process",
+            **{
+                "relcoord.repo": repo,
+                "relcoord.commit": commit,
+                "relcoord.pull_request": pull_request,
+            },
+        ):
+            return self._diff(
+                repo, commit, config_path, system, outputs, pull_request, progress
+            )
+
+    def _diff(
+        self,
+        repo: str,
+        commit: str,
+        config_path: str,
+        system: bool,
+        outputs: Sequence[str],
+        pull_request: int | None,
+        progress: ProgressSink,
+    ) -> DiffResult:
         def report(phase: str, message: str, **detail: Any) -> None:
             progress(ChangeProgress(phase=phase, message=message, detail=detail))
 
@@ -798,17 +866,19 @@ class DiffCommentProcessor:
                 commit=commit,
             )
             try:
-                _checkout_rebased_commit(repo, commit, source_checkout, self.idcat)
+                with span("checkout source", **{"relcoord.repo": repo}):
+                    _checkout_rebased_commit(repo, commit, source_checkout, self.idcat)
             except RebaseConflictError as exc:
                 return self._rebase_required(repo, commit, pull_request, report, exc)
-            deploy_config, namespace = _deploy_config_and_namespace(
-                source_checkout, repo, commit, config_path, system
-            )
-            declared = declared_targets(deploy_config)
-            declares_targets = declared is not None
-            selected_outputs = _selected_outputs(
-                permitted, declared, system, configured=output_settings
-            )
+            with span("load deploy config"):
+                deploy_config, namespace = _deploy_config_and_namespace(
+                    source_checkout, repo, commit, config_path, system
+                )
+                declared = declared_targets(deploy_config)
+                declares_targets = declared is not None
+                selected_outputs = _selected_outputs(
+                    permitted, declared, system, configured=output_settings
+                )
             logger.info(
                 "diff step 3/6: found deploy config at %s (system mode: %s, "
                 "targets: %s)",
@@ -824,14 +894,15 @@ class DiffCommentProcessor:
                 namespace=namespace,
                 targets=declares_targets,
             )
-            plugins = _system_plugins(
-                self.system_repository,
-                workdir,
-                system,
-                self.idcat,
-                report,
-                step="diff step 3/6",
-            )
+            with span("fetch system plugins"):
+                plugins = _system_plugins(
+                    self.system_repository,
+                    workdir,
+                    system,
+                    self.idcat,
+                    report,
+                    step="diff step 3/6",
+                )
 
             output_diffs: list[OutputDiff] = []
             repository_diffs: list[RepositoryDiff] = []
@@ -849,13 +920,14 @@ class DiffCommentProcessor:
                     f"checking out {short_repo(repository)}",
                     repository=repository,
                 )
-                _clone_repository(
-                    repository,
-                    manifests_checkout,
-                    self.idcat,
-                    purpose=f"cloning manifests repo {repository}",
-                    depth="1",
-                )
+                with span("clone manifests", **{"relcoord.repository": repository}):
+                    _clone_repository(
+                        repository,
+                        manifests_checkout,
+                        self.idcat,
+                        purpose=f"cloning manifests repo {repository}",
+                        depth="1",
+                    )
                 base_commit = _head_commit(manifests_checkout)
 
                 for output in _outputs_for_repository(selected_outputs, repository):
@@ -881,16 +953,17 @@ class DiffCommentProcessor:
                         directory=str(output.directory),
                         **_selection_detail(selection),
                     )
-                    generation_result = generate(
-                        deploy_config,
-                        output_path,
-                        repo_root=Path("/"),
-                        create_commit=True,
-                        image=None,
-                        namespace=namespace,
-                        plugins=plugins,
-                        **selection,
-                    )
+                    with span("generate manifests", **{"relcoord.output": output.name}):
+                        generation_result = generate(
+                            deploy_config,
+                            output_path,
+                            repo_root=Path("/"),
+                            create_commit=True,
+                            image=None,
+                            namespace=namespace,
+                            plugins=plugins,
+                            **selection,
+                        )
                     generation_result = _discount_moved_objects(generation_result)
                     generated = _written_paths(generation_result)
                     logger.info(
@@ -921,11 +994,14 @@ class DiffCommentProcessor:
                     )
                     total_generated += len(generated)
                     if self.validator is not None:
-                        validations.append(
-                            _validate_generated_output(
-                                self.validator, output, manifests_checkout, report
+                        with span(
+                            "validate manifests", **{"relcoord.output": output.name}
+                        ):
+                            validations.append(
+                                _validate_generated_output(
+                                    self.validator, output, manifests_checkout, report
+                                )
                             )
-                        )
 
                 repository_diff = _manifests_diff(manifests_checkout, base_commit)
                 repository_diffs.append(
@@ -963,9 +1039,10 @@ class DiffCommentProcessor:
                 marker=marker,
                 validation=render_validation_summary(validations),
             )
-            comment = self._comment(
-                repo, pull_request, comment_body.body, marker, report
-            )
+            with span("post diff comment", **{"relcoord.pull_request": pull_request}):
+                comment = self._comment(
+                    repo, pull_request, comment_body.body, marker, report
+                )
             return DiffResult(
                 repo=repo,
                 commit=commit,
