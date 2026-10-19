@@ -528,7 +528,9 @@ class ChangeProcessor:
             directory=str(output.directory),
             **_selection_detail(selection),
         )
-        with span("generate manifests", **{"relcoord.output": output.name}):
+        with span(
+            f"generate manifests {output.name}", **{"relcoord.output": output.name}
+        ):
             generation_result = generate(
                 deploy_config,
                 output_path,
@@ -953,7 +955,10 @@ class DiffCommentProcessor:
                         directory=str(output.directory),
                         **_selection_detail(selection),
                     )
-                    with span("generate manifests", **{"relcoord.output": output.name}):
+                    with span(
+                        f"generate manifests {output.name}",
+                        **{"relcoord.output": output.name},
+                    ):
                         generation_result = generate(
                             deploy_config,
                             output_path,

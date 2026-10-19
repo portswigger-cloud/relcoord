@@ -81,3 +81,27 @@ def configure_tracing(settings: TracingSettings | None) -> TracerProvider | None
     HTTPXClientInstrumentor().instrument(tracer_provider=provider)
     logger.info("exporting traces to %s", settings.endpoint)
     return provider
+
+
+def annotate_asgi_span(span: Span, scope: dict[str, Any], message: Any) -> None:
+    """Record where a request went on the ASGI receive and send spans.
+
+    Those internal spans carry only the ASGI event type by default, which says
+    nothing about which request they belong to once a trace is opened on its
+    own. The query string is left out of the URL.
+    """
+    if not span.is_recording():
+        return
+    host = next(
+        (
+            value.decode("latin-1")
+            for name, value in scope.get("headers", ())
+            if name == b"host"
+        ),
+        None,
+    )
+    path = scope.get("path")
+    span.set_attribute("url.path", path or "")
+    if host is not None:
+        span.set_attribute("server.address", host)
+        span.set_attribute("url.full", f"{scope.get('scheme', 'http')}://{host}{path}")

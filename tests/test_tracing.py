@@ -66,3 +66,23 @@ def test_configure_tracing_builds_provider() -> None:
     finally:
         if provider is not None:
             provider.shutdown()
+
+
+def test_annotate_asgi_span_records_host_and_path(
+    exporter: InMemorySpanExporter,
+) -> None:
+    scope = {
+        "scheme": "https",
+        "path": "/v1/change",
+        "query_string": b"secret=1",
+        "headers": [(b"host", b"relcoord.example.com")],
+    }
+    with tracing.span("POST /v1/change http receive") as current:
+        tracing.annotate_asgi_span(current, scope, {})
+
+    (finished,) = exporter.get_finished_spans()
+    assert dict(finished.attributes or {}) == {
+        "url.path": "/v1/change",
+        "server.address": "relcoord.example.com",
+        "url.full": "https://relcoord.example.com/v1/change",
+    }
