@@ -26,7 +26,7 @@ from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.retrying_store import RetryingImageInfoStore
 from relcoord.store import ImageInfoStore
 from relcoord.surreal_store import SurrealImageInfoStore
-from relcoord.tracing import configure_tracing
+from relcoord.tracing import annotate_asgi_span, configure_tracing
 from relcoord.validator import HttpTreeValidator
 from relcoord.version import version_summary
 
@@ -70,7 +70,12 @@ async def run(settings: Settings, disable_auth: bool) -> None:
         if tracer_provider is not None:
             # Outermost, so a trace covers authentication and logging too and
             # continues a trace the caller propagated in traceparent.
-            app = OpenTelemetryMiddleware(app, tracer_provider=tracer_provider)
+            app = OpenTelemetryMiddleware(
+                app,
+                tracer_provider=tracer_provider,
+                client_request_hook=annotate_asgi_span,
+                client_response_hook=annotate_asgi_span,
+            )
         await serve(app, config)  # ty: ignore[invalid-argument-type]
     finally:
         if tracer_provider is not None:
