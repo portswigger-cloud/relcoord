@@ -8,6 +8,11 @@ COPY pyproject.toml uv.lock README.md ./
 # Interestingly, uv build and uv install will look at VIRTUAL_ENV but not uv venv
 ENV VIRTUAL_ENV=/deps-venv
 ENV UV_PYTHON_INSTALL_DIR=/python
+# Pinned to 3.14 until PyYAML publishes 3.15 wheels. Without one, PyYAML is built
+# from source, and the final image has no libyaml for its C extension, so it
+# silently falls back to pure-Python YAML, which makes manifest generation
+# about five times slower.
+ENV UV_PYTHON=3.14
 # Install dependencies in a separate layer (cached when lock file unchanged)
 RUN uv venv /deps-venv && uv sync --frozen --no-install-project --no-dev --active
 
