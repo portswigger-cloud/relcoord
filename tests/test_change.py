@@ -2087,3 +2087,95 @@ def test_stage_verified_message_reports_every_cluster_that_picked_it_up() -> Non
         "stage 2 of 2 verified: picked up by platform-prod after 27.9s "
         "and observability after 3.1s"
     )
+
+
+TWO_REPOSITORY_OUTPUTS = [
+    OutputSettings(
+        name="example-dev",
+        repository="https://github.com/acme/dev-manifests.git",
+        directory=Path("example-dev"),
+    ),
+    OutputSettings(
+        name="example-prod",
+        repository="https://github.com/acme/prod-manifests.git",
+        directory=Path("example-prod"),
+    ),
+]
+
+
+def _two_repository_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before_generate,
+) -> list[str]:
+    """Fake a change to two outputs in two manifests repositories."""
+    pushed: list[str] = []
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(deploy_config: Path, output_path: Path, **kwargs) -> object:
+        before_generate(output_path.name)
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified={Ref(kind="Deployment", namespace="ns", name="api")},
+            removed=set(),
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(
+        change,
+        "_push_repository",
+        lambda repo_path, remote, idcat: pushed.append(remote),
+    )
+    return pushed
+
+
+def test_change_generates_repositories_concurrently_and_pushes_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Neither generation gets past the barrier until the other has reached it,
+    # which only happens if they run at the same time.
+    both_generating = threading.Barrier(2, timeout=5)
+    pushed = _two_repository_change(
+        tmp_path, monkeypatch, lambda output: both_generating.wait()
+    )
+
+    result = ChangeProcessor(outputs=TWO_REPOSITORY_OUTPUTS).process(
+        "https://github.com/acme/config.git", "deadbeef", None
+    )
+
+    assert [output.name for output in result.outputs] == [
+        "example-dev",
+        "example-prod",
+    ]
+    assert pushed == [
+        "https://github.com/acme/dev-manifests.git",
+        "https://github.com/acme/prod-manifests.git",
+    ]
+
+
+def test_change_pushes_nothing_when_a_repository_of_the_stage_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_prod(output: str) -> None:
+        if output == "example-prod":
+            raise RuntimeError("prod failed")
+
+    pushed = _two_repository_change(tmp_path, monkeypatch, fail_prod)
+
+    with pytest.raises(ChangeProcessingError, match="prod failed"):
+        ChangeProcessor(outputs=TWO_REPOSITORY_OUTPUTS).process(
+            "https://github.com/acme/config.git", "deadbeef", None
+        )
+
+    assert pushed == []

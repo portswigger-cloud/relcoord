@@ -299,6 +299,12 @@ class RolloutSettings:
         return tuple(name for stage in self.stages for name in stage.outputs)
 
 
+# How many manifests repositories a change or diff works on at once, and how
+# many validator requests a diff keeps in flight. manifest-builder runs its own
+# pool of helm renders inside each generation, so this multiplies with that.
+DEFAULT_MAX_CONCURRENCY = 4
+
+
 @dataclass(frozen=True)
 class Settings:
     listen: str = "0.0.0.0"
@@ -311,6 +317,7 @@ class Settings:
     outputs: list[OutputSettings] = field(default_factory=list)
     rollouts: list[RolloutSettings] = field(default_factory=list)
     detect_deployment: bool = False
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     persistence: PersistenceSettings | None = None
     idcat: IdcatSettings | None = None
     validator: ValidatorSettings | None = None
@@ -405,6 +412,9 @@ class Settings:
             outputs=outputs,
             rollouts=rollouts,
             detect_deployment=detect_deployment,
+            max_concurrency=_positive_int_or_default(
+                data, "max-concurrency", cls.max_concurrency
+            ),
             persistence=(
                 PersistenceSettings.from_mapping(persistence) if persistence else None
             ),
@@ -439,6 +449,15 @@ def _bool_or_default(data: dict[str, Any], key: str, default: bool) -> bool:
     value = data.get(key, default)
     if not isinstance(value, bool):
         raise TypeError(f"{key} must be a boolean")
+    return value
+
+
+def _positive_int_or_default(data: dict[str, Any], key: str, default: int) -> int:
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{key} must be an integer")
+    if value < 1:
+        raise ValueError(f"{key} must be at least 1")
     return value
 
 

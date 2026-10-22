@@ -57,6 +57,16 @@ def test_processors_use_system_repository() -> None:
     assert diff_processor.system_repository == "https://github.com/acme/system.git"
 
 
+def test_processors_use_max_concurrency() -> None:
+    settings = Settings(
+        manifests_repository="https://github.com/acme/manifests.git",
+        max_concurrency=2,
+    )
+
+    assert make_change_processor(settings).max_concurrency == 2
+    assert make_diff_processor(settings).max_concurrency == 2
+
+
 def test_make_change_processor_uses_outputs() -> None:
     processor = make_change_processor(
         Settings(

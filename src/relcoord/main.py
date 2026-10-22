@@ -125,6 +125,7 @@ def make_change_processor(
         rollouts=settings.rollouts,
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
+        max_concurrency=settings.max_concurrency,
         # Left unset while validation on a change is disabled; see
         # ChangeProcessor.process.
         # validator=make_validator(settings),
@@ -139,6 +140,7 @@ def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
         idcat=settings.idcat,
         commenter=GithubIssueCommenter(idcat=settings.idcat),
         validator=make_validator(settings),
+        max_concurrency=settings.max_concurrency,
     )
 
 
