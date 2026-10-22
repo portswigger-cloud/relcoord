@@ -321,6 +321,38 @@ regular status code and JSON body, whatever the client accepts.
 Disconnecting does not cancel a change in progress; the server finishes the work
 and logs the outcome.
 
+## Concurrency
+
+Manifests repositories are independent of one another, so a change and a diff
+work on several of them at once: each is cloned, generated into and then
+pushed or diffed on a thread of its own. `max-concurrency` (default 4) caps how
+many run together. Outputs that share a manifests repository still generate one
+after another, because each commits on top of the one before it in the same
+checkout.
+
+```toml
+max-concurrency = 4
+```
+
+A change generates every repository of a rollout stage before it pushes any of
+them, and then pushes them in configured order. A generation that fails anywhere
+in the stage therefore pushes nothing, where before it would have left the
+repositories ahead of it pushed. When several fail, the error reported is that
+of the first in configured order, not of whichever failed first.
+
+A diff sends each output's tree to the validator as soon as that output is
+generated, on a pool of up to `max-concurrency` requests, and goes on to the
+next output while the verdict is pending.
+
+Progress events from different repositories interleave on the stream in the
+order the work happens. Every event of a repository's work names its
+`repository` or `output` in `detail`, and the response lists outputs and diffs
+in configured order.
+
+manifest-builder renders the helm charts of a single generation on a pool of
+its own, so the number of helm processes a request can run is a multiple of
+`max-concurrency`.
+
 ## Versions
 
 `--version` reports the running release and the manifest-builder it generates

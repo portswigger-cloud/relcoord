@@ -443,6 +443,38 @@ def test_settings_defaults_detect_deployment_to_false(tmp_path: Path) -> None:
     assert settings.detect_deployment is False
 
 
+def test_settings_parses_max_concurrency(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("max-concurrency = 8\n")
+
+    assert Settings.from_toml(config).max_concurrency == 8
+
+
+def test_settings_defaults_max_concurrency(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("")
+
+    assert Settings.from_toml(config).max_concurrency == 4
+
+
+@pytest.mark.parametrize(
+    ("value", "error", "message"),
+    [
+        ("0", ValueError, "max-concurrency must be at least 1"),
+        ("true", TypeError, "max-concurrency must be an integer"),
+        ('"4"', TypeError, "max-concurrency must be an integer"),
+    ],
+)
+def test_settings_rejects_invalid_max_concurrency(
+    tmp_path: Path, value: str, error: type[Exception], message: str
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(f"max-concurrency = {value}\n")
+
+    with pytest.raises(error, match=message):
+        Settings.from_toml(config)
+
+
 def test_settings_defaults_log_level_to_info(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text("")

@@ -7,6 +7,9 @@ port = 8080
 # tls_key_path = "/etc/relcoord/tls.key"
 log-level = "INFO"
 detect-deployment = false
+# How many manifests repositories a change or diff works on at once, and how
+# many validator requests a diff keeps in flight.
+max-concurrency = 4
 
 # Shared system repository. For non-system requests, its "plugins" subdirectory
 # is passed to manifest-builder alongside the config directory's own plugins.

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
+import threading
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,7 +11,7 @@ import pytest
 from dulwich import porcelain
 from manifest_builder import ExternalPlugins
 
-from relcoord import change
+from relcoord import change, tracing
 from relcoord.change import (
     ChangeProgress,
     CommentPostError,
@@ -21,6 +23,7 @@ from relcoord.config import OutputSettings
 from relcoord.git import GitCredentialError
 from relcoord.github import GithubCommentError, PostedComment
 from relcoord.manifest_diff import ManifestDiff, comment_marker
+from relcoord.validator import Validation
 
 CONFIG_REPO = "https://github.com/acme/config.git"
 MANIFESTS_REPO = "https://github.com/acme/manifests.git"
@@ -75,6 +78,7 @@ def _fake_git(
     diffs: dict[str, ManifestDiff] | None = None,
     written: int = 1,
     targets: bool = False,
+    before_generate: Callable[[Path], object] | None = None,
 ) -> None:
     """Replace the git and manifest-builder work with recorded fakes.
 
@@ -82,7 +86,8 @@ def _fake_git(
     config directory, for which manifest-builder takes a target rather than
     template variables. ``diff`` is what every manifests checkout diffs to, and
     ``diffs`` says it per checkout directory name, for a change that reaches
-    some of the configured repositories and not others.
+    some of the configured repositories and not others. ``before_generate`` is
+    called with each output directory as its generation starts.
     """
     recorded = calls if calls is not None else []
 
@@ -113,6 +118,8 @@ def _fake_git(
         target: str | None = None,
         plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
+        if before_generate is not None:
+            before_generate(output_path)
         if captured is not None:
             captured["plugins"] = plugins
         recorded.append(
@@ -687,3 +694,178 @@ def test_diff_marks_its_comment_so_a_later_diff_can_update_it(
     assert commenter.markers == [marker]
     assert marker in commenter.calls[0][2]
     assert result.comment.updated
+
+
+OTHER_MANIFESTS_REPO = "https://github.com/acme/other-manifests.git"
+
+TWO_REPOSITORIES = [
+    OutputSettings(name="dev", repository=MANIFESTS_REPO, directory=Path("dev")),
+    OutputSettings(
+        name="prod", repository=OTHER_MANIFESTS_REPO, directory=Path("prod")
+    ),
+]
+
+
+def test_diff_generates_repositories_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Neither generation gets past the barrier until the other has reached it,
+    # which only happens if they run at the same time.
+    both_generating = threading.Barrier(2, timeout=5)
+    _fake_git(
+        monkeypatch,
+        tmp_path,
+        before_generate=lambda output_path: both_generating.wait(),
+    )
+
+    result = DiffCommentProcessor(outputs=TWO_REPOSITORIES, commenter=Commenter()).diff(
+        CONFIG_REPO, "deadbeef"
+    )
+
+    assert [entry.repository for entry in result.diffs] == [
+        MANIFESTS_REPO,
+        OTHER_MANIFESTS_REPO,
+    ]
+    assert [output.name for output in result.outputs] == ["dev", "prod"]
+
+
+def test_diff_with_one_worker_generates_repositories_in_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    _fake_git(monkeypatch, tmp_path, calls=calls)
+
+    DiffCommentProcessor(
+        outputs=TWO_REPOSITORIES, commenter=Commenter(), max_concurrency=1
+    ).diff(CONFIG_REPO, "deadbeef")
+
+    assert [call[0] for call in calls if call[0] != "checkout"] == [
+        "clone",
+        "generate",
+        "diff",
+        "clone",
+        "generate",
+        "diff",
+    ]
+
+
+class BlockingValidator:
+    """Holds each verdict back until ``release`` is set."""
+
+    def __init__(self, release: threading.Event) -> None:
+        self.release = release
+        self.trees: list[Mapping[str, bytes]] = []
+
+    def validate(
+        self,
+        files: Mapping[str, bytes],
+        checks: Sequence[str] = (),
+        *,
+        progress: Callable[[str, str], None] = lambda phase, message: None,
+    ) -> Validation:
+        self.trees.append(files)
+        assert self.release.wait(timeout=5), "validation was never released"
+        return Validation(passed=True, digest="sha256:tree")
+
+
+def test_diff_generates_the_next_output_while_the_last_is_validated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    second_generating = threading.Event()
+
+    def write_manifest(output_path: Path) -> None:
+        (output_path / "api.yaml").write_text(f"name: {output_path.name}\n")
+        if output_path.name == "prod":
+            second_generating.set()
+
+    _fake_git(monkeypatch, tmp_path, before_generate=write_manifest)
+    validator = BlockingValidator(release=second_generating)
+    outputs = [
+        OutputSettings(name="dev", repository=MANIFESTS_REPO, directory=Path("dev")),
+        OutputSettings(name="prod", repository=MANIFESTS_REPO, directory=Path("prod")),
+    ]
+
+    result = DiffCommentProcessor(
+        outputs=outputs, commenter=Commenter(), validator=validator
+    ).diff(CONFIG_REPO, "deadbeef")
+
+    assert [validation.output for validation in result.validations] == [
+        "dev",
+        "prod",
+    ]
+    assert not any(validation.failed for validation in result.validations)
+    assert validator.trees == [
+        {"api.yaml": b"name: dev\n"},
+        {"api.yaml": b"name: prod\n"},
+    ]
+
+
+def test_diff_reports_the_first_failing_repository_in_configured_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prod_failed = threading.Event()
+
+    def fail(output_path: Path) -> None:
+        if output_path.name == "prod":
+            prod_failed.set()
+            raise RuntimeError("prod failed")
+        # dev fails after prod, but is configured first, so it is reported.
+        assert prod_failed.wait(timeout=5)
+        raise RuntimeError("dev failed")
+
+    _fake_git(monkeypatch, tmp_path, before_generate=fail)
+
+    with pytest.raises(change.ChangeProcessingError, match="^dev failed$"):
+        DiffCommentProcessor(outputs=TWO_REPOSITORIES, commenter=Commenter()).diff(
+            CONFIG_REPO, "deadbeef"
+        )
+
+
+def test_diff_traces_concurrent_work_under_the_request_span(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tracing, "_tracer", provider.get_tracer("test"))
+    _fake_git(
+        monkeypatch,
+        tmp_path,
+        before_generate=lambda output_path: (output_path / "api.yaml").write_text(
+            "kind: Pod\n"
+        ),
+    )
+    release = threading.Event()
+    release.set()
+
+    DiffCommentProcessor(
+        outputs=TWO_REPOSITORIES,
+        commenter=Commenter(),
+        validator=BlockingValidator(release),
+    ).diff(CONFIG_REPO, "deadbeef")
+    provider.shutdown()
+
+    spans = exporter.get_finished_spans()
+    (request,) = [span for span in spans if span.name == "diff.process"]
+    pooled = [
+        span
+        for span in spans
+        if span.name.startswith(("clone manifests", "generate manifests", "validate"))
+    ]
+    assert sorted(span.name for span in pooled) == [
+        "clone manifests",
+        "clone manifests",
+        "generate manifests dev",
+        "generate manifests prod",
+        "validate manifests",
+        "validate manifests",
+    ]
+    for span in pooled:
+        assert span.parent is not None
+        assert span.parent.span_id == request.context.span_id
