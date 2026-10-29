@@ -15,8 +15,11 @@ from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol, cast
+from urllib.parse import quote
 
 from dulwich import porcelain
+from dulwich.diff_tree import tree_changes
+from dulwich.object_store import iter_tree_contents, tree_lookup_path
 from dulwich.objects import Commit, ObjectID
 from dulwich.repo import Repo
 from manifest_builder import (
@@ -53,6 +56,7 @@ from relcoord.tracing import span
 from relcoord.validator import (
     Finding,
     OutputValidation,
+    SourceFiles,
     TreeValidator,
     Validation,
     ValidationError,
@@ -1162,6 +1166,7 @@ class DiffCommentProcessor:
                             output,
                             read_tree(output_path),
                             report,
+                            _source_files(output, manifests_checkout, base_commit),
                         ),
                     )
                 )
@@ -1359,6 +1364,7 @@ def _validate_output_tree(
     output: OutputSettings,
     tree: Mapping[str, bytes],
     report: Callable[..., None],
+    files: SourceFiles | None = None,
 ) -> OutputValidation:
     """Have manifest-validator judge a tree already read from an output.
 
@@ -1421,7 +1427,7 @@ def _validate_output_tree(
         verdicts=validation_payloads(validation),
     )
     return OutputValidation(
-        output=output.name, checks=output.checks, validation=validation
+        output=output.name, checks=output.checks, validation=validation, files=files
     )
 
 
@@ -2305,6 +2311,78 @@ def _head_commit(repo_path: Path) -> str:
         return repo.head().decode("ascii")
     finally:
         repo.close()
+
+
+def _source_files(
+    output: OutputSettings, checkout: Path, base_commit: str
+) -> SourceFiles | None:
+    """Which of an output's generated files a change leaves as they were.
+
+    The output has just been generated and committed in the checkout, on top of
+    ``base_commit``, so comparing its directory between the two commits says
+    which files this change wrote. Every other file reads at ``base_commit``
+    exactly as generated, and a finding in it can link to its line there. Only a
+    GitHub repository has such a page.
+
+    The links are a convenience: if working them out fails, the diff goes on
+    without them rather than failing over it.
+    """
+    web = output.repository.removesuffix(".git")
+    if not web.startswith("https://github.com/"):
+        return None
+    directory = output.directory.as_posix().strip("/")
+    if directory == ".":
+        directory = ""
+    try:
+        repo = Repo(checkout)
+        try:
+            generated_tree = _directory_tree(repo, repo.head(), directory)
+            if generated_tree is None:
+                return None
+            base_tree = _directory_tree(
+                repo, ObjectID(base_commit.encode("ascii")), directory
+            )
+            written = {
+                entry.path
+                for change in tree_changes(repo.object_store, base_tree, generated_tree)
+                for entry in (change.old, change.new)
+                if entry is not None and entry.path is not None
+            }
+            generated = {
+                entry.path
+                for entry in iter_tree_contents(repo.object_store, generated_tree)
+            }
+        finally:
+            repo.close()
+    except Exception:
+        logger.warning(
+            "could not tell which files output %s left unchanged; "
+            "its findings will not link to them",
+            output.name,
+            exc_info=True,
+        )
+        return None
+    location = f"/{quote(directory)}" if directory else ""
+    return SourceFiles(
+        base_url=f"{web}/blob/{base_commit}{location}",
+        unchanged=frozenset(
+            path.decode("utf-8") for path in generated - written if path is not None
+        ),
+    )
+
+
+def _directory_tree(repo: Repo, commit: ObjectID, directory: str) -> ObjectID | None:
+    """The tree of ``directory`` at ``commit``, or None where it does not exist."""
+    root = _commit_tree(repo, commit)
+    if not directory:
+        return root
+    try:
+        _mode, sha = tree_lookup_path(
+            repo.object_store.__getitem__, root, directory.encode("utf-8")
+        )
+    except KeyError:
+        return None
+    return ObjectID(sha)
 
 
 def _push_repository(

@@ -40,7 +40,7 @@ from dulwich.patch import write_tree_diff
 from dulwich.repo import Repo
 from manifest_builder import __version__ as MANIFEST_BUILDER_VERSION
 
-from relcoord.validator import Finding, OutputValidation
+from relcoord.validator import Finding, OutputValidation, SourceFiles
 
 logger = logging.getLogger(__name__)
 
@@ -587,9 +587,9 @@ def _verdict_line(validations: Sequence[OutputValidation]) -> str:
 
 def _collected_findings(
     validations: Sequence[OutputValidation],
-) -> list[tuple[str, Finding]]:
+) -> list[tuple[OutputValidation, Finding]]:
     return [
-        (result.output, finding)
+        (result, finding)
         for result in validations
         if result.validation is not None
         for finding in result.validation.failing_findings
@@ -613,20 +613,16 @@ def _validation_line(result: OutputValidation) -> str:
     return f"- `{result.output}` — **failed**{ran}: {count}{tolerated}"
 
 
-def _findings_table(findings: Sequence[tuple[str, Finding]]) -> list[str]:
+def _findings_table(
+    findings: Sequence[tuple[OutputValidation, Finding]],
+) -> list[str]:
     shown = findings[:MAX_VALIDATION_FINDINGS]
     rows = [
         "| Output | Severity | Rule | File | Message |",
         "| --- | --- | --- | --- | --- |",
         *(
-            "| {} | {} | {} | {} | {} |".format(
-                output,
-                finding.severity,
-                _rule_cell(finding),
-                _table_cell(finding.file or ""),
-                _table_cell(finding.message),
-            )
-            for output, finding in shown
+            f"| {result.output} | {finding.severity} | {_rule_cell(finding)} | {_file_cell(finding, result.files)} | {_table_cell(finding.message)} |"
+            for result, finding in shown
         ),
     ]
     remaining = len(findings) - len(shown)
@@ -651,11 +647,28 @@ def _rule_cell(finding: Finding) -> str:
     A bare KICS query id says nothing about what tripped it; the link is what
     lets a reviewer decide between a fix and an exception from the comment.
     """
-    rule = _table_cell(finding.rule_id)
-    if finding.url is None or not _LINKABLE_URL.fullmatch(finding.url):
-        return rule
-    text = rule.replace("[", "\\[").replace("]", "\\]")
-    return f"[{text}]({finding.url})"
+    return _link(_table_cell(finding.rule_id), finding.url)
+
+
+def _file_cell(finding: Finding, files: SourceFiles | None) -> str:
+    """The file and line, linked to that line in the manifests repository.
+
+    Only for a file the change leaves as it was: one the change writes has lines
+    the repository does not have yet, and is in the diff above instead.
+    """
+    if finding.file is None:
+        return ""
+    path = finding.file.removeprefix("./")
+    where = path if finding.line is None else f"{path}:{finding.line}"
+    url = files.link(path, finding.line) if files is not None else None
+    return _link(_table_cell(where), url)
+
+
+def _link(text: str, url: str | None) -> str:
+    if url is None or not _LINKABLE_URL.fullmatch(url):
+        return text
+    escaped = text.replace("[", "\\[").replace("]", "\\]")
+    return f"[{escaped}]({url})"
 
 
 DIFF_HEADING = "Manifest diff"

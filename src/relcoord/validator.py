@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import quote
 
 import httpx
 
@@ -57,6 +58,8 @@ class Finding:
     severity: str
     message: str
     file: str | None = None
+    line: int | None = None
+    """The 1-based line in ``file`` the finding points at, when the tool says."""
     resource: str | None = None
     similarity_id: str | None = None
     url: str | None = None
@@ -363,6 +366,7 @@ def _finding_from_payload(payload: Mapping[str, Any]) -> Finding:
         severity=_string(payload, "severity"),
         message=_string(payload, "message"),
         file=_optional_string(payload, "file"),
+        line=_optional_line(payload, "line"),
         resource=_optional_string(payload, "resource"),
         similarity_id=_optional_string(payload, "similarity_id"),
         url=_optional_string(payload, "url"),
@@ -380,6 +384,35 @@ def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _optional_line(payload: Mapping[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    # bool is an int too, and no line is numbered True.
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+@dataclass(frozen=True)
+class SourceFiles:
+    """Where an output's generated files can be read as they were before a change.
+
+    A finding in a file the change leaves as it was can link to its very line in
+    the manifests repository. A file the change writes exists only in the diff,
+    with lines the repository does not have yet, so it gets no link.
+    """
+
+    base_url: str
+    """The output's directory in the manifests repository, at the base commit."""
+    unchanged: frozenset[str]
+    """Generated paths, relative to the output's directory, the change leaves alone."""
+
+    def link(self, path: str, line: int | None) -> str | None:
+        if path not in self.unchanged:
+            return None
+        anchor = f"#L{line}" if line is not None else ""
+        return f"{self.base_url}/{quote(path)}{anchor}"
+
+
 @dataclass(frozen=True)
 class OutputValidation:
     """What validating one configured output came to.
@@ -393,6 +426,8 @@ class OutputValidation:
     checks: tuple[str, ...] = ()
     validation: Validation | None = None
     error: str | None = None
+    files: SourceFiles | None = None
+    """Where its findings' files can be linked to, when a diff knows."""
 
     @property
     def failed(self) -> bool:
