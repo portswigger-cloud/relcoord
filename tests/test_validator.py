@@ -43,6 +43,7 @@ VERDICT = {
                     "resource": "Service/api",
                     "message": "wildcard rule",
                     "similarity_id": "ff7c",
+                    "url": "https://docs.kics.io/latest/queries/kubernetes-queries/RBAC-1/",
                     "accepted": None,
                 },
                 {
@@ -160,6 +161,19 @@ def test_validate_reports_the_verdict_and_its_findings() -> None:
     assert [verdict.tool_version for verdict in validation.verdicts] == ["v2.1.16"]
     assert [finding.rule_id for finding in validation.failing_findings] == ["RBAC-1"]
     assert validation.accepted_count == 1
+
+
+def test_validate_reads_where_a_rule_is_documented_when_there_is_a_link() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(("result", json.dumps(VERDICT))))
+
+    [verdict] = _validator(handler).validate(TREE, ["kics"]).verdicts
+
+    # A validator from before the field sends none, which reads as no link.
+    assert [finding.url for finding in verdict.findings] == [
+        "https://docs.kics.io/latest/queries/kubernetes-queries/RBAC-1/",
+        None,
+    ]
 
 
 def test_validate_forwards_the_validators_phases_as_progress() -> None:
