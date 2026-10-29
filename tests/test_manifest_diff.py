@@ -704,6 +704,47 @@ def test_validation_summary_tables_findings_and_points_at_the_response() -> None
     assert "_2 more in the response._" in summary
 
 
+def _rule_cell_of(finding: Finding) -> str:
+    summary = render_validation_summary(
+        [
+            OutputValidation(
+                output="prod",
+                validation=Validation(
+                    passed=False,
+                    digest="sha256:bad",
+                    verdicts=(Verdict(passed=False, tool="kics", findings=(finding,)),),
+                ),
+            )
+        ]
+    )
+    [row] = [line for line in summary.splitlines() if line.startswith("| prod |")]
+    return row.split(" | ")[2]
+
+
+def test_a_findings_rule_links_to_where_it_is_documented() -> None:
+    url = "https://docs.kics.io/latest/queries/kubernetes-queries/487f4be7/"
+    finding = Finding(rule_id="487f4be7", severity="high", message="m", url=url)
+
+    assert _rule_cell_of(finding) == f"[487f4be7]({url})"
+
+
+def test_a_findings_rule_stays_text_without_a_link() -> None:
+    finding = Finding(rule_id="RULE-1", severity="high", message="m")
+
+    assert _rule_cell_of(finding) == "RULE-1"
+
+
+def test_a_link_that_could_carry_markup_leaves_the_rule_as_text() -> None:
+    for url in (
+        "javascript:alert(1)",
+        "http://docs.kics.io/plain-http",
+        "https://example.com/a) [b](https://evil.example",
+        "https://example.com/a|b",
+    ):
+        finding = Finding(rule_id="RULE-1", severity="high", message="m", url=url)
+        assert _rule_cell_of(finding) == "RULE-1", url
+
+
 def test_the_verdict_line_says_passed_when_every_output_did() -> None:
     summary = render_validation_summary(
         [

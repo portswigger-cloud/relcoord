@@ -59,6 +59,8 @@ class Finding:
     file: str | None = None
     resource: str | None = None
     similarity_id: str | None = None
+    url: str | None = None
+    """Where the rule is documented, when manifest-validator knows."""
     accepted: str | None = None
     """Why this finding does not fail the verdict, or None if it does."""
 
@@ -363,6 +365,7 @@ def _finding_from_payload(payload: Mapping[str, Any]) -> Finding:
         file=_optional_string(payload, "file"),
         resource=_optional_string(payload, "resource"),
         similarity_id=_optional_string(payload, "similarity_id"),
+        url=_optional_string(payload, "url"),
         accepted=_optional_string(payload, "accepted"),
     )
 

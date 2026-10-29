@@ -622,7 +622,7 @@ def _findings_table(findings: Sequence[tuple[str, Finding]]) -> list[str]:
             "| {} | {} | {} | {} | {} |".format(
                 output,
                 finding.severity,
-                _table_cell(finding.rule_id),
+                _rule_cell(finding),
                 _table_cell(finding.file or ""),
                 _table_cell(finding.message),
             )
@@ -638,6 +638,24 @@ def _findings_table(findings: Sequence[tuple[str, Finding]]) -> list[str]:
 def _table_cell(text: str) -> str:
     """Keep a finding's own text from breaking the row it is rendered in."""
     return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+# Only a plain https URL becomes a link, with nothing in it that could end the
+# link early or the row it sits in. Anything else leaves the rule as text.
+_LINKABLE_URL = re.compile(r"https://[^\s<>()\[\]|`\\]+")
+
+
+def _rule_cell(finding: Finding) -> str:
+    """The rule id, linked to where it is documented when manifest-validator knows.
+
+    A bare KICS query id says nothing about what tripped it; the link is what
+    lets a reviewer decide between a fix and an exception from the comment.
+    """
+    rule = _table_cell(finding.rule_id)
+    if finding.url is None or not _LINKABLE_URL.fullmatch(finding.url):
+        return rule
+    text = rule.replace("[", "\\[").replace("]", "\\]")
+    return f"[{text}]({finding.url})"
 
 
 DIFF_HEADING = "Manifest diff"
