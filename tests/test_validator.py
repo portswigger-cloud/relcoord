@@ -40,6 +40,7 @@ VERDICT = {
                     "rule_id": "RBAC-1",
                     "severity": "high",
                     "file": "api.yaml",
+                    "line": 977,
                     "resource": "Service/api",
                     "message": "wildcard rule",
                     "similarity_id": "ff7c",
@@ -174,6 +175,46 @@ def test_validate_reads_where_a_rule_is_documented_when_there_is_a_link() -> Non
         "https://docs.kics.io/latest/queries/kubernetes-queries/RBAC-1/",
         None,
     ]
+
+
+def test_validate_reads_the_line_a_finding_points_at() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(("result", json.dumps(VERDICT))))
+
+    [verdict] = _validator(handler).validate(TREE, ["kics"]).verdicts
+
+    # A validator from before the field sends none, which reads as no line.
+    assert [finding.line for finding in verdict.findings] == [977, None]
+
+
+def test_validate_reads_a_line_that_points_nowhere_as_no_line() -> None:
+    for line in (0, -3, True, "12", 1.5):
+        result = json.dumps(
+            {
+                "passed": False,
+                "digest": TREE_DIGEST,
+                "verdicts": [
+                    {
+                        "passed": False,
+                        "tool": "kics",
+                        "findings": [
+                            {
+                                "rule_id": "R",
+                                "severity": "high",
+                                "message": "m",
+                                "line": line,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        def handler(request: httpx.Request, result: str = result) -> httpx.Response:
+            return httpx.Response(200, content=_sse(("result", result)))
+
+        [verdict] = _validator(handler).validate(TREE, ["kics"]).verdicts
+        assert verdict.findings[0].line is None, line
 
 
 def test_validate_forwards_the_validators_phases_as_progress() -> None:

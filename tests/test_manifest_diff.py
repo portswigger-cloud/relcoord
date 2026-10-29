@@ -24,7 +24,13 @@ from relcoord.manifest_diff import (
     markdown_fence,
     render_validation_summary,
 )
-from relcoord.validator import Finding, OutputValidation, Validation, Verdict
+from relcoord.validator import (
+    Finding,
+    OutputValidation,
+    SourceFiles,
+    Validation,
+    Verdict,
+)
 
 DEPLOYMENT = (
     "apiVersion: apps/v1\n"
@@ -704,7 +710,7 @@ def test_validation_summary_tables_findings_and_points_at_the_response() -> None
     assert "_2 more in the response._" in summary
 
 
-def _rule_cell_of(finding: Finding) -> str:
+def _cells_of(finding: Finding, files: SourceFiles | None = None) -> list[str]:
     summary = render_validation_summary(
         [
             OutputValidation(
@@ -714,11 +720,57 @@ def _rule_cell_of(finding: Finding) -> str:
                     digest="sha256:bad",
                     verdicts=(Verdict(passed=False, tool="kics", findings=(finding,)),),
                 ),
+                files=files,
             )
         ]
     )
     [row] = [line for line in summary.splitlines() if line.startswith("| prod |")]
-    return row.split(" | ")[2]
+    return row.split(" | ")
+
+
+def _rule_cell_of(finding: Finding) -> str:
+    return _cells_of(finding)[2]
+
+
+BASE = "https://github.com/acme/manifests/blob/abc123/prod"
+FILES = SourceFiles(base_url=BASE, unchanged=frozenset({"cluster/crd.yaml"}))
+
+
+def test_a_finding_in_an_unchanged_file_links_to_its_line() -> None:
+    finding = Finding(
+        rule_id="R", severity="high", message="m", file="cluster/crd.yaml", line=977
+    )
+
+    assert _cells_of(finding, FILES)[3] == (
+        f"[cluster/crd.yaml:977]({BASE}/cluster/crd.yaml#L977)"
+    )
+
+
+def test_a_finding_without_a_line_links_to_the_file() -> None:
+    finding = Finding(
+        rule_id="R", severity="high", message="m", file="./cluster/crd.yaml"
+    )
+
+    assert (
+        _cells_of(finding, FILES)[3] == f"[cluster/crd.yaml]({BASE}/cluster/crd.yaml)"
+    )
+
+
+def test_a_finding_in_a_file_the_change_writes_is_not_linked() -> None:
+    # The repository does not have the generated lines yet; the diff does.
+    finding = Finding(
+        rule_id="R", severity="high", message="m", file="app/deployment.yaml", line=4
+    )
+
+    assert _cells_of(finding, FILES)[3] == "app/deployment.yaml:4"
+
+
+def test_a_finding_is_not_linked_where_the_diff_knows_no_files() -> None:
+    finding = Finding(
+        rule_id="R", severity="high", message="m", file="cluster/crd.yaml", line=977
+    )
+
+    assert _cells_of(finding)[3] == "cluster/crd.yaml:977"
 
 
 def test_a_findings_rule_links_to_where_it_is_documented() -> None:

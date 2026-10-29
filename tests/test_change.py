@@ -28,6 +28,7 @@ from relcoord.change import (
 )
 from relcoord.config import OutputSettings, RolloutSettings, RolloutStage
 from relcoord.git import GitCredentialError
+from relcoord.validator import SourceFiles
 
 SYSTEM_REPO = "https://github.com/acme/shared-system.git"
 
@@ -1322,6 +1323,85 @@ def test_checkout_commit_materializes_requested_commit(tmp_path: Path) -> None:
 def _commit(repo: Repo, message: bytes) -> bytes:
     author = b"Test <test@example.com>"
     return porcelain.commit(repo, message=message, author=author, committer=author)
+
+
+def _regenerated_manifests(tmp_path: Path) -> tuple[Path, str]:
+    """A manifests checkout with one generation committed on top of its base.
+
+    The generation rewrites one of prod's files, adds another, leaves a third
+    alone, and creates a staging output; dev is another output it never touches.
+    """
+    checkout = tmp_path / "manifests"
+    repo = porcelain.init(checkout)
+    try:
+        (checkout / "prod" / "cluster").mkdir(parents=True)
+        (checkout / "dev").mkdir()
+        (checkout / "prod" / "cluster" / "crd.yaml").write_text("kind: CRD\n")
+        (checkout / "prod" / "deployment.yaml").write_text("replicas: 1\n")
+        (checkout / "dev" / "deployment.yaml").write_text("replicas: 1\n")
+        porcelain.add(
+            repo,
+            [b"prod/cluster/crd.yaml", b"prod/deployment.yaml", b"dev/deployment.yaml"],
+        )
+        base = _commit(repo, b"base").decode("ascii")
+
+        (checkout / "staging").mkdir()
+        (checkout / "prod" / "deployment.yaml").write_text("replicas: 2\n")
+        (checkout / "prod" / "service.yaml").write_text("kind: Service\n")
+        (checkout / "staging" / "app.yaml").write_text("kind: App\n")
+        porcelain.add(
+            repo, [b"prod/deployment.yaml", b"prod/service.yaml", b"staging/app.yaml"]
+        )
+        _commit(repo, b"generated")
+    finally:
+        repo.close()
+    return checkout, base
+
+
+def _manifests_output(
+    directory: str = "prod",
+    repository: str = "https://github.com/acme/manifests.git",
+) -> OutputSettings:
+    return OutputSettings(
+        name=directory, repository=repository, directory=Path(directory)
+    )
+
+
+def test_source_files_are_the_generated_files_the_change_left_alone(
+    tmp_path: Path,
+) -> None:
+    checkout, base = _regenerated_manifests(tmp_path)
+
+    files = change._source_files(_manifests_output(), checkout, base)
+
+    assert files == SourceFiles(
+        base_url=f"https://github.com/acme/manifests/blob/{base}/prod",
+        unchanged=frozenset({"cluster/crd.yaml"}),
+    )
+
+
+def test_a_new_outputs_files_are_all_written_by_the_change(tmp_path: Path) -> None:
+    checkout, base = _regenerated_manifests(tmp_path)
+
+    files = change._source_files(_manifests_output("staging"), checkout, base)
+
+    assert files is not None
+    assert files.unchanged == frozenset()
+
+
+def test_source_files_link_only_into_github(tmp_path: Path) -> None:
+    checkout, base = _regenerated_manifests(tmp_path)
+    output = _manifests_output(repository="https://gitlab.example/acme/manifests")
+
+    assert change._source_files(output, checkout, base) is None
+
+
+def test_source_files_are_none_rather_than_an_error_when_git_fails(
+    tmp_path: Path,
+) -> None:
+    checkout, _base = _regenerated_manifests(tmp_path)
+
+    assert change._source_files(_manifests_output(), checkout, "0" * 40) is None
 
 
 def _source_with_stale_branch(source: Path, *, conflict: bool) -> str:
