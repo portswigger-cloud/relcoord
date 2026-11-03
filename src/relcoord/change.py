@@ -21,10 +21,9 @@ from urllib.parse import quote
 from dulwich import porcelain
 from dulwich.client import FetchPackResult
 from dulwich.diff_tree import tree_changes
-from dulwich.graph import can_fast_forward
 from dulwich.object_store import iter_tree_contents, tree_lookup_path
 from dulwich.objects import Blob, Commit, ObjectID
-from dulwich.refs import HEADREF
+from dulwich.refs import HEADREF, Ref
 from dulwich.repo import Repo
 from manifest_builder import (
     ExternalPlugins,
@@ -837,8 +836,11 @@ class ChangeProcessor:
                     )
             except PushRefusedError as exc:
                 with span("rebase manifests", **{"relcoord.repository": repository}):
+                    # The commits after the one the remote is known to have are
+                    # this change's own, and are all a rebase has to replay.
+                    base = _pushed_commit(manifests_checkout)
                     upstream = _fetch_branch(manifests_checkout, repository, self.idcat)
-                    if _contains(manifests_checkout, upstream):
+                    if upstream == base:
                         raise
                     if attempt == PUSH_ATTEMPTS:
                         raise PushRefusedError(
@@ -846,13 +848,20 @@ class ChangeProcessor:
                             f"{PUSH_ATTEMPTS} attempts to push"
                         ) from exc
                     try:
-                        rebased = _rebase_onto(manifests_checkout, upstream)
+                        rebased = _rebase_onto(manifests_checkout, upstream, base=base)
                     except RebaseConflictError as conflict:
                         raise PushRefusedError(
                             f"{target} moved to {short_commit(upstream)} since it "
                             f"was checked out, and this change's commits do not "
                             f"rebase onto it: {conflict}"
                         ) from conflict
+                    except KeyError as missing:
+                        raise PushRefusedError(
+                            f"{target} moved to {short_commit(upstream)} since it "
+                            f"was checked out, and rebasing onto it needed a commit "
+                            f"the checkout does not have: {missing}"
+                        ) from missing
+                    _record_pushed_commit(manifests_checkout, upstream)
                 manifest_commit = _head_commit(manifests_checkout)
                 logger.info(
                     "manifests repo %s moved to %s since it was checked out; "
@@ -2886,16 +2895,23 @@ def _checkout_rebased_commit(
     _rebase_onto(target, default_branch_tip)
 
 
-def _rebase_onto(target: Path, upstream: str) -> int:
+def _rebase_onto(target: Path, upstream: str, base: str | None = None) -> int:
     """Rebase the checkout's current branch onto ``upstream``.
 
     ``porcelain.rebase`` updates the branch ref but not the working tree, so the
     rebased tip is checked out afterwards. An empty result means the branch was
     already up to date and the working tree already holds the right thing.
+
+    With ``base``, only the commits after it are replayed, onto ``upstream``.
+    That is what an ``upstream`` fetched shallow needs: the checkout has none of
+    its history, so where the branch left it cannot be worked out, only told.
     Returns how many commits were rebased.
     """
     try:
-        rebased = porcelain.rebase(str(target), upstream=upstream)
+        if base is None:
+            rebased = porcelain.rebase(str(target), upstream=upstream)
+        else:
+            rebased = porcelain.rebase(str(target), upstream=base, onto=upstream)
     except porcelain.Error as exc:
         raise RebaseConflictError(f"failed to rebase onto {upstream}: {exc}") from exc
     if rebased:
@@ -3216,13 +3232,20 @@ def _push_repository(
         ) from exc
     else:
         _log_dulwich_output("push", push_output)
+        _record_pushed_commit(repo_path)
 
 
 def _fetch_branch(checkout: Path, remote: str, idcat: IdcatSettings | None) -> str:
-    """Fetch the checkout's branch from ``remote``, returning where it now points.
+    """Fetch the tip of the checkout's branch from ``remote``, and return it.
 
-    The commits fetched land in the checkout's object store, which is all a
-    rebase onto them needs: nothing is checked out or merged here.
+    The tip lands in the checkout's object store, which is all a rebase onto it
+    needs: nothing is checked out or merged here.
+
+    The fetch is shallow, as the clone was. Fetched without a depth into a
+    shallow repository, GitHub's response gave dulwich the refs but no commits,
+    so the rebase then found no such commit (system#809, 3 Nov). The tip's
+    history is not needed either: a rebase onto it replays only this change's
+    own commits, and is told where they start rather than walking back to it.
     """
     purpose = f"fetching manifests repo {remote}"
     branch = _branch_ref(checkout)
@@ -3232,11 +3255,14 @@ def _fetch_branch(checkout: Path, remote: str, idcat: IdcatSettings | None) -> s
         nonlocal fetch_output
         fetch_output = BytesIO()
         if credentials.username is None:
-            return porcelain.fetch(str(checkout), remote, errstream=fetch_output)
+            return porcelain.fetch(
+                str(checkout), remote, errstream=fetch_output, depth=1
+            )
         return porcelain.fetch(
             str(checkout),
             remote,
             errstream=fetch_output,
+            depth=1,
             username=credentials.username,
             password=credentials.password or "",
         )
@@ -3277,11 +3303,33 @@ def _branch_ref(checkout: Path) -> bytes:
     return refs[-1]
 
 
-def _contains(checkout: Path, commit: str) -> bool:
-    """Whether ``commit`` is in the history of the checkout's HEAD already."""
+def _tracking_ref(repo: Repo) -> Ref:
+    """The remote-tracking ref of the checkout's branch, as a clone sets it up."""
+    refs, _ = repo.refs.follow(HEADREF)
+    return Ref(b"refs/remotes/origin/" + refs[-1].removeprefix(b"refs/heads/"))
+
+
+def _pushed_commit(checkout: Path) -> str:
+    """The commit the remote's branch is known to point at.
+
+    The clone sets the remote-tracking ref to the commit it cloned, and each
+    push, and each rebase onto a branch that moved, moves it on. The commits
+    after it are therefore the ones this change has yet to get onto the remote.
+    """
     repo = Repo(checkout)
     try:
-        return can_fast_forward(repo, ObjectID(commit.encode("ascii")), repo.head())
+        return repo.refs[_tracking_ref(repo)].decode("ascii")
+    finally:
+        repo.close()
+
+
+def _record_pushed_commit(checkout: Path, commit: str | None = None) -> None:
+    """Note that the remote's branch now points at ``commit``, by default HEAD."""
+    repo = Repo(checkout)
+    try:
+        repo.refs[_tracking_ref(repo)] = (
+            repo.head() if commit is None else ObjectID(commit.encode("ascii"))
+        )
     finally:
         repo.close()
 
