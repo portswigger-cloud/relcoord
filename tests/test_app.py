@@ -314,6 +314,7 @@ def test_change_passes_image_reference_to_processor() -> None:
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
@@ -389,6 +390,7 @@ def test_change_processes_deploy_config_when_processor_is_configured(
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
@@ -444,6 +446,7 @@ def test_change_processor_logs_from_worker_thread(
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             logging.getLogger("relcoord.change").info(
@@ -489,6 +492,7 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
@@ -566,6 +570,7 @@ def test_change_reports_missing_deploy_config(
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise DeployConfigError("missing .deploy")
@@ -611,6 +616,7 @@ def test_change_reports_credential_error_without_traceback(
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise CredentialError(
@@ -664,6 +670,7 @@ def test_change_reports_git_transport_error_without_traceback(
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise GitTransportError(
@@ -713,6 +720,7 @@ def test_change_reports_a_stopped_rollout_without_traceback(
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise RolloutStageError(
@@ -766,6 +774,7 @@ def _config_path_recording_client() -> tuple[TestClient, list[str]]:
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             config_paths.append(config_path)
@@ -830,6 +839,90 @@ def test_change_rejects_invalid_config_path(config_path: str) -> None:
     assert config_paths == []
 
 
+def _section_recording_client() -> tuple[TestClient, list[str | None]]:
+    sections: list[str | None] = []
+
+    class Processor:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+            system: bool = False,
+            outputs: Sequence[str] = (),
+            *,
+            section: str | None = None,
+            progress: ProgressSink = ignore_progress,
+        ) -> object:
+            sections.append(section)
+            return type("Result", (), {"generated_count": 0})()
+
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=Processor(),
+        )
+    )
+    return client, sections
+
+
+def test_change_passes_section_to_processor() -> None:
+    client, sections = _section_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/config", "commit": "deadbeef", "section": "fe"},
+    )
+
+    assert response.status_code == 202
+    assert sections == ["fe"]
+
+
+def test_change_without_section_passes_none_to_processor() -> None:
+    client, sections = _section_recording_client()
+
+    response = client.post(
+        "/v1/change", json={"config_repo": "acme/config", "commit": "deadbeef"}
+    )
+
+    assert response.status_code == 202
+    assert sections == [None]
+
+
+@pytest.mark.parametrize("section", ["", "   ", 7, None, ["fe"]])
+def test_change_rejects_invalid_section(section: object) -> None:
+    client, sections = _section_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/config", "commit": "deadbeef", "section": section},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_section"
+    assert sections == []
+
+
+def test_change_rejects_system_with_section() -> None:
+    client, sections = _section_recording_client()
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "acme/system",
+            "commit": "deadbeef",
+            "system": True,
+            "section": "fe",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_system_section"
+    assert sections == []
+
+
 class _StubPrincipal:
     def __init__(self, allow_system: bool, outputs: tuple[str, ...] = ()) -> None:
         self.allow_system = allow_system
@@ -860,6 +953,7 @@ def _system_recording_client(
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             systems.append(system)
@@ -968,6 +1062,7 @@ def _outputs_recording_client(
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             selections.append(tuple(outputs))
@@ -1281,6 +1376,7 @@ class ReportingProcessor:
         system: bool = False,
         outputs: Sequence[str] = (),
         *,
+        section: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         for step in self._steps:
@@ -1408,6 +1504,7 @@ class BlockingProcessor:
         system: bool = False,
         outputs: Sequence[str] = (),
         *,
+        section: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         progress(ChangeProgress(phase="workspace", message="created workspace"))
@@ -1702,6 +1799,7 @@ class _RecordingDiffProcessor:
     ) -> None:
         self.calls: list[tuple[str, str, str, bool, int | None]] = []
         self.selections: list[tuple[str, ...]] = []
+        self.sections: list[str | None] = []
         self._steps = steps or []
         self._failure = failure
         self._result = result if result is not None else _stub_diff_result()
@@ -1715,10 +1813,12 @@ class _RecordingDiffProcessor:
         outputs: Sequence[str] = (),
         *,
         pull_request: int | None = None,
+        section: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         self.calls.append((repo, commit, config_path, system, pull_request))
         self.selections.append(tuple(outputs))
+        self.sections.append(section)
         for step in self._steps:
             progress(step)
         if self._failure is not None:
@@ -1742,6 +1842,42 @@ def _diff_client(
         )
     )
     return client, diff_processor
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_diffcomment_passes_section_to_processor(stream: bool) -> None:
+    client, processor = _diff_client()
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/config",
+            "commit": "deadbeef",
+            "section": "fe",
+        },
+        headers={"Accept": "text/event-stream"} if stream else {},
+    )
+
+    assert response.status_code == 200
+    assert processor.sections == ["fe"]
+
+
+def test_diffcomment_rejects_system_with_section() -> None:
+    client, processor = _diff_client()
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/system",
+            "commit": "deadbeef",
+            "system": True,
+            "section": "fe",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_system_section"
+    assert processor.sections == []
 
 
 def test_diffcomment_returns_the_diff_and_the_posted_comment() -> None:
@@ -2222,6 +2358,7 @@ def test_change_reports_a_failed_validation_without_a_stack_trace(
             system: bool = False,
             outputs: Sequence[str] = (),
             *,
+            section: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise ManifestValidationError(message)

@@ -2259,3 +2259,217 @@ def test_change_pushes_nothing_when_a_repository_of_the_stage_fails(
         )
 
     assert pushed == []
+
+
+SYSTEM_TARGETS = """\
+version = 2
+
+[[target]]
+name = "fe-dev"
+sections = ["frontend", "common"]
+
+[[target]]
+name = "fe-prod"
+sections = ["frontend"]
+
+[[target]]
+name = "be-dev"
+sections = ["backend"]
+"""
+
+
+def _section_change_fakes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    system_config: str | None = SYSTEM_TARGETS,
+    source_config: str | None = None,
+) -> list[str]:
+    """Fake out git so a change reads its sections from a system repository.
+
+    Returns the names of the outputs generated into, in order. The source
+    repository declares no targets unless ``source_config`` says it does.
+    """
+    generated: list[str] = []
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        deploy_config = target / ".deploy"
+        deploy_config.mkdir(parents=True)
+        if source_config is not None:
+            (deploy_config / "config.toml").write_text(source_config)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+        if repo == SYSTEM_REPO:
+            (target / "plugins").mkdir()
+            if system_config is not None:
+                (target / "config.toml").write_text(system_config)
+
+    def fake_generate(
+        deploy_config: Path, output_path: Path, **kwargs
+    ) -> GenerationResult:
+        generated.append(output_path.name)
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified={Ref(kind="Deployment", namespace="c", name="api")},
+            removed=set(),
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *args, **kwargs: None)
+    return generated
+
+
+def _section_outputs() -> list[OutputSettings]:
+    return [
+        OutputSettings(
+            name=name,
+            repository="https://github.com/acme/manifests.git",
+            directory=Path(name),
+        )
+        for name in ("fe-dev", "fe-prod", "be-dev")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("section", "expected"),
+    [
+        ("frontend", ["fe-dev", "fe-prod"]),
+        ("common", ["fe-dev"]),
+        ("backend", ["be-dev"]),
+    ],
+)
+def test_change_deploys_a_section_to_the_targets_the_system_repository_builds_it_into(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    section: str,
+    expected: list[str],
+) -> None:
+    generated = _section_change_fakes(tmp_path, monkeypatch)
+
+    ChangeProcessor(outputs=_section_outputs(), system_repository=SYSTEM_REPO).process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        None,
+        section=section,
+    )
+
+    assert sorted(generated) == sorted(expected)
+
+
+def test_change_fails_on_a_section_no_target_is_built_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mistyped section must not read as "deploy to nothing"."""
+    generated = _section_change_fakes(tmp_path, monkeypatch)
+
+    with pytest.raises(ChangeProcessingError) as excinfo:
+        ChangeProcessor(
+            outputs=_section_outputs(), system_repository=SYSTEM_REPO
+        ).process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            None,
+            section="fronted",
+        )
+
+    assert str(excinfo.value) == (
+        "no target of the system repo is built from section 'fronted'; "
+        "known sections: backend, common, frontend"
+    )
+    assert generated == []
+
+
+def test_change_fails_on_a_section_target_no_output_is_configured_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cluster added to the system repository first is not silently skipped."""
+    _section_change_fakes(tmp_path, monkeypatch)
+
+    with pytest.raises(ChangeProcessingError, match="fe-prod"):
+        ChangeProcessor(
+            outputs=_section_outputs()[:1], system_repository=SYSTEM_REPO
+        ).process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            None,
+            section="frontend",
+        )
+
+
+def test_change_with_a_section_respects_the_outputs_its_role_permits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _section_change_fakes(tmp_path, monkeypatch)
+
+    with pytest.raises(ChangeProcessingError, match="not permitted"):
+        ChangeProcessor(
+            outputs=_section_outputs(), system_repository=SYSTEM_REPO
+        ).process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            None,
+            outputs=["fe-dev"],
+            section="frontend",
+        )
+
+
+def test_change_rejects_a_section_without_a_system_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _section_change_fakes(tmp_path, monkeypatch)
+
+    with pytest.raises(ChangeProcessingError, match="no system-repository"):
+        ChangeProcessor(outputs=_section_outputs()).process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            None,
+            section="frontend",
+        )
+
+
+def test_change_rejects_a_section_combined_with_declared_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _section_change_fakes(
+        tmp_path,
+        monkeypatch,
+        source_config='version = 2\n\n[[target]]\nname = "fe-dev"\nsections = ["a"]\n',
+    )
+
+    with pytest.raises(ChangeProcessingError, match="targets of its own"):
+        ChangeProcessor(
+            outputs=_section_outputs(), system_repository=SYSTEM_REPO
+        ).process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            None,
+            section="frontend",
+        )
+
+
+@pytest.mark.parametrize(
+    "system_config",
+    [None, "version = 1\n", "version = 2\n"],
+    ids=["missing", "without-targets", "no-target-entries"],
+)
+def test_change_reports_a_system_repository_that_cannot_resolve_a_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system_config: str | None
+) -> None:
+    _section_change_fakes(tmp_path, monkeypatch, system_config=system_config)
+
+    with pytest.raises(SystemRepositoryError):
+        ChangeProcessor(
+            outputs=_section_outputs(), system_repository=SYSTEM_REPO
+        ).process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            None,
+            section="frontend",
+        )
