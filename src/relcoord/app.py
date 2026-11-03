@@ -71,6 +71,7 @@ class ChangeProcessor(Protocol):
         system: bool = ...,
         outputs: Sequence[str] = ...,
         *,
+        section: str | None = ...,
         progress: ProgressSink = ...,
     ) -> object: ...
 
@@ -84,6 +85,7 @@ class DiffProcessor(Protocol):
         system: bool = ...,
         outputs: Sequence[str] = ...,
         *,
+        section: str | None = ...,
         pull_request: int | None = ...,
         progress: ProgressSink = ...,
     ) -> object: ...
@@ -122,6 +124,8 @@ class _ChangePlan:
     manifest_image: str | None
     outputs: tuple[str, ...] = ()
     """Outputs this change may deploy to, empty for every configured output."""
+    section: str | None = None
+    """Section of the system repository that says which outputs to deploy to."""
     registered: dict[str, Any] | None = field(default=None)
 
 
@@ -136,6 +140,8 @@ class _DiffPlan:
     pull_request: int | None
     outputs: tuple[str, ...] = ()
     """Outputs this diff may report on, empty for every configured output."""
+    section: str | None = None
+    """Section of the system repository that says which outputs to report on."""
 
 
 class _SystemNotAllowedError(Exception):
@@ -156,6 +162,7 @@ class NoopChangeProcessor:
         system: bool = False,
         outputs: Sequence[str] = (),
         *,
+        section: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         message = (
@@ -279,6 +286,7 @@ def create_app(
                 message="config_path cannot be combined with system mode",
             )
         config_path = _change_config_path(payload)
+        section = _change_section(payload, system)
         image = (
             ensure_string(
                 payload,
@@ -319,6 +327,7 @@ def create_app(
             system=system,
             manifest_image=manifest_image,
             outputs=_permitted_outputs(payload, principal),
+            section=section,
             registered=registered,
         )
 
@@ -386,6 +395,7 @@ def create_app(
                 plan.config_path,
                 plan.system,
                 plan.outputs,
+                section=plan.section,
             )
         except ChangeProcessingError as exc:
             status_code, error, message = _report_change_failure(request, plan, exc)
@@ -454,6 +464,7 @@ def create_app(
                 plan.system,
                 plan.outputs,
                 pull_request=plan.pull_request,
+                section=plan.section,
             )
         except ChangeProcessingError as exc:
             status_code, error, message = _report_diff_failure(request, plan, exc)
@@ -742,6 +753,22 @@ def _change_system_flag(payload: dict[str, Any]) -> bool:
     return value
 
 
+def _change_section(payload: dict[str, Any], system: bool) -> str | None:
+    if "section" not in payload:
+        return None
+    if system:
+        raise ValidationError(
+            error="invalid_system_section",
+            message="section cannot be combined with system mode",
+        )
+    return ensure_string(
+        payload,
+        "section",
+        error="invalid_section",
+        message="section must be a non-empty string",
+    )
+
+
 def _plan_diff(payload: dict[str, Any], principal: object) -> _DiffPlan:
     repo = _normalize_change_repo(
         ensure_string(
@@ -785,6 +812,7 @@ def _plan_diff(payload: dict[str, Any], principal: object) -> _DiffPlan:
         system=system,
         pull_request=pull_request,
         outputs=_permitted_outputs(payload, principal),
+        section=_change_section(payload, system),
     )
 
 
@@ -1056,6 +1084,7 @@ def _change_events(
                 plan.system,
                 plan.outputs,
                 progress=progress,
+                section=plan.section,
             ),
             complete=lambda result: _change_completion(plan, result),
             failure=lambda exc: _report_change_failure(request, plan, exc),
@@ -1084,6 +1113,7 @@ def _diff_events(
                 plan.system,
                 pull_request=plan.pull_request,
                 progress=progress,
+                section=plan.section,
             ),
             complete=lambda result: _diff_completion(plan, result),
             failure=lambda exc: _report_diff_failure(request, plan, exc),

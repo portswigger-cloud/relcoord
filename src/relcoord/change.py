@@ -28,6 +28,13 @@ from manifest_builder import (
     declared_targets,
     generate,
 )
+from manifest_builder.config import (
+    TARGETS_VERSION,
+    config_version,
+    find_config_file,
+    load_toml_file,
+    parse_targets,
+)
 
 from relcoord.config import (
     DEFAULT_MAX_CONCURRENCY,
@@ -84,6 +91,10 @@ MAX_REPORTED_OBJECTS = 3
 
 class ChangeProcessingError(Exception):
     pass
+
+
+#: Where the system repository is checked out within a change's workspace.
+SYSTEM_CHECKOUT_DIRECTORY = "system"
 
 
 class DeployConfigError(ChangeProcessingError):
@@ -278,6 +289,7 @@ class ChangeProcessor:
         system: bool = False,
         outputs: Sequence[str] = (),
         *,
+        section: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> ChangeResult:
         with span(
@@ -289,7 +301,7 @@ class ChangeProcessor:
             },
         ):
             return self._process(
-                repo, commit, image, config_path, system, outputs, progress
+                repo, commit, image, config_path, system, outputs, section, progress
             )
 
     def _process(
@@ -300,6 +312,7 @@ class ChangeProcessor:
         config_path: str,
         system: bool,
         outputs: Sequence[str],
+        section: str | None,
         progress: ProgressSink,
     ) -> ChangeResult:
         def report(phase: str, message: str, **detail: Any) -> None:
@@ -339,6 +352,7 @@ class ChangeProcessor:
                     source_checkout, repo, commit, config_path, system
                 )
                 declared = declared_targets(deploy_config)
+                _check_section_selection(section, declared, self.system_repository)
                 declares_targets = declared is not None
                 selected_outputs = _selected_outputs(
                     permitted, declared, system, configured=output_settings
@@ -366,6 +380,13 @@ class ChangeProcessor:
                     self.idcat,
                     report,
                     step="change step 3/7",
+                )
+            if section is not None:
+                selected_outputs = _section_outputs(
+                    permitted,
+                    section,
+                    workdir / SYSTEM_CHECKOUT_DIRECTORY,
+                    configured=output_settings,
                 )
 
             output_results: list[OutputResult] = []
@@ -893,6 +914,7 @@ class DiffCommentProcessor:
         system: bool = False,
         outputs: Sequence[str] = (),
         *,
+        section: str | None = None,
         pull_request: int | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> DiffResult:
@@ -905,7 +927,14 @@ class DiffCommentProcessor:
             },
         ):
             return self._diff(
-                repo, commit, config_path, system, outputs, pull_request, progress
+                repo,
+                commit,
+                config_path,
+                system,
+                outputs,
+                section,
+                pull_request,
+                progress,
             )
 
     def _diff(
@@ -915,6 +944,7 @@ class DiffCommentProcessor:
         config_path: str,
         system: bool,
         outputs: Sequence[str],
+        section: str | None,
         pull_request: int | None,
         progress: ProgressSink,
     ) -> DiffResult:
@@ -958,6 +988,7 @@ class DiffCommentProcessor:
                     source_checkout, repo, commit, config_path, system
                 )
                 declared = declared_targets(deploy_config)
+                _check_section_selection(section, declared, self.system_repository)
                 declares_targets = declared is not None
                 selected_outputs = _selected_outputs(
                     permitted, declared, system, configured=output_settings
@@ -985,6 +1016,13 @@ class DiffCommentProcessor:
                     self.idcat,
                     report,
                     step="diff step 3/6",
+                )
+            if section is not None:
+                selected_outputs = _section_outputs(
+                    permitted,
+                    section,
+                    workdir / SYSTEM_CHECKOUT_DIRECTORY,
+                    configured=output_settings,
                 )
 
             # Validator requests go to a pool of their own, so a repository
@@ -1809,6 +1847,71 @@ def _selected_outputs(
     return tuple(by_target[name] for name in declared)
 
 
+def _check_section_selection(
+    section: str | None,
+    declared: tuple[str, ...] | None,
+    system_repository: str | None,
+) -> None:
+    """Refuse a section the request cannot be resolved with."""
+    if section is None:
+        return
+    if system_repository is None:
+        raise ChangeProcessingError(
+            f"section '{section}' was requested, but no system-repository is "
+            f"configured to say which outputs it is deployed to"
+        )
+    if declared is not None:
+        # Two answers to which outputs to deploy to is one too many, and
+        # picking between them would hide whichever one lost.
+        raise DeployConfigError(
+            f"section '{section}' was requested, but the config declares targets "
+            f"of its own ({', '.join(declared)}); drop one of the two"
+        )
+
+
+def _section_outputs(
+    outputs: Sequence[OutputSettings],
+    section: str,
+    system_checkout: Path,
+    configured: Sequence[OutputSettings],
+) -> tuple[OutputSettings, ...]:
+    """Return the outputs a system repository says a section is deployed to.
+
+    The system repository's top-level config declares the targets, one per
+    output, and the sections each is built from. A repository that names the
+    section it holds is therefore deployed to every target built from it, and a
+    target added to the system repository later reaches it without the
+    repository being told.
+    """
+    names = _section_targets(system_checkout, section)
+    return _selected_outputs(outputs, names, False, configured=configured)
+
+
+def _section_targets(system_checkout: Path, section: str) -> tuple[str, ...]:
+    try:
+        config_file = find_config_file(system_checkout)
+        data = load_toml_file(config_file)
+        if config_version(data, config_file) != TARGETS_VERSION:
+            raise SystemRepositoryError(
+                f"{config_file.name} of the system repo does not declare targets "
+                f"(version = {TARGETS_VERSION}), so it cannot say which targets "
+                f"section '{section}' is built into"
+            )
+        targets = parse_targets(data, config_file)
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemRepositoryError(
+            f"cannot read the targets of the system repo: {exc}"
+        ) from exc
+    names = tuple(target.name for target in targets if section in target.sections)
+    if not names:
+        known = sorted({name for target in targets for name in target.sections})
+        raise ChangeProcessingError(
+            f"no target of the system repo is built from section '{section}'; "
+            f"known sections: {', '.join(known)}"
+        )
+    return names
+
+
 def _generate_selection(
     output: OutputSettings, declares_targets: bool
 ) -> dict[str, Any]:
@@ -2173,7 +2276,9 @@ def _system_plugins(
     """
     if system_repository is None or system:
         return None
-    plugins = _checkout_system_plugins(system_repository, workdir / "system", idcat)
+    plugins = _checkout_system_plugins(
+        system_repository, workdir / SYSTEM_CHECKOUT_DIRECTORY, idcat
+    )
     logger.info("%s: checked out plugins from %s", step, plugins.source)
     _, _, plugins_commit = plugins.source.rpartition("@")
     report(

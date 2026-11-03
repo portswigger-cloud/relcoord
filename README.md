@@ -133,6 +133,43 @@ Rollout stages are configured against every output, so a change that generates
 into some of them keeps the configured ordering and finds the other stages with
 nothing to do.
 
+### Selecting outputs by section
+
+A config repository can leave the outputs to the system repository instead, by
+naming the section it holds in the request. `/v1/change` and `/v1/diffcomment`
+take an optional `section`:
+
+```bash
+curl -H 'content-type: application/json' \
+  -d '{"config_repo": "https://github.com/example/frontend",
+       "commit": "deadbeef", "section": "frontend"}' \
+  http://localhost:8080/v1/change
+```
+
+Relcoord reads the top-level `config.toml` of the `system-repository` (the same
+shallow clone of `main` that supplies the plugins, `version = 2`) and generates
+into the output of every `[[target]]` whose `sections` include the one named. A
+cluster added to the system repository that builds the section is then deployed
+to without the repository being touched. Targets match outputs the way declared
+targets do: by the output's `target`, or its name where it sets none.
+
+```toml
+[[target]]
+name = "fe-dev"
+sections = ["frontend"]
+
+[[target]]
+name = "fe-prod"
+sections = ["frontend"]
+```
+
+The config directory of such a repository declares config blocks directly, since
+the section is what picks the targets, and each output is generated with its
+configured `vars`. These are refused: a `section` no target builds, a target of
+the section that no output is configured for, a repository that also declares
+targets of its own, a `section` without a `system-repository`, and a `section`
+combined with `system`. The role's output restriction still applies.
+
 ### Restricting a role to an output
 
 What a config repository declares says where it *wants* to deploy. A `[[role]]`
