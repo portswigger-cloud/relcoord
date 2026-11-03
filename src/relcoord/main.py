@@ -126,6 +126,7 @@ def make_change_processor(
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
         max_concurrency=settings.max_concurrency,
+        generate_while_waiting=settings.generate_while_waiting,
         # Left unset while validation on a change is disabled; see
         # ChangeProcessor.process.
         # validator=make_validator(settings),

@@ -318,6 +318,8 @@ class Settings:
     rollouts: list[RolloutSettings] = field(default_factory=list)
     detect_deployment: bool = False
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    generate_while_waiting: bool = False
+    """Generate while a rollout stage waits, rather than only between stages."""
     persistence: PersistenceSettings | None = None
     idcat: IdcatSettings | None = None
     validator: ValidatorSettings | None = None
@@ -381,6 +383,10 @@ class Settings:
         )
         _check_deployment_outputs(outputs, detect_deployment)
         _check_rollout_detection(rollouts, detect_deployment)
+        generate_while_waiting = _bool_or_default(
+            data, "generate-while-waiting", cls.generate_while_waiting
+        )
+        _check_generate_while_waiting(rollouts, generate_while_waiting)
         roles: list[RoleConfig] = []
         seen: set[str] = set()
         for entry in raw_roles:
@@ -415,6 +421,7 @@ class Settings:
             max_concurrency=_positive_int_or_default(
                 data, "max-concurrency", cls.max_concurrency
             ),
+            generate_while_waiting=generate_while_waiting,
             persistence=(
                 PersistenceSettings.from_mapping(persistence) if persistence else None
             ),
@@ -643,6 +650,19 @@ def _check_rollout_detection(
         raise ValueError(
             "[[rollout]] requires detect-deployment = true; a stage waits for the "
             "deployment it pushed to be observed before the next stage starts"
+        )
+
+
+def _check_generate_while_waiting(
+    rollouts: list[RolloutSettings], generate_while_waiting: bool
+) -> None:
+    # Without a rollout nothing waits: every output is pushed at once and
+    # detection runs in the background, so the setting would do nothing, and
+    # one that does nothing reads as though it did.
+    if generate_while_waiting and not rollouts:
+        raise ValueError(
+            "generate-while-waiting requires [[rollout]] entries; without a "
+            "rollout no stage waits, so there is no wait to generate during"
         )
 
 

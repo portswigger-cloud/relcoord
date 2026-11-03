@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import threading
 import time
+import tomllib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -20,7 +21,7 @@ from urllib.parse import quote
 from dulwich import porcelain
 from dulwich.diff_tree import tree_changes
 from dulwich.object_store import iter_tree_contents, tree_lookup_path
-from dulwich.objects import Commit, ObjectID
+from dulwich.objects import Blob, Commit, ObjectID
 from dulwich.repo import Repo
 from manifest_builder import (
     ExternalPlugins,
@@ -263,6 +264,12 @@ class ChangeStage:
         return f"stage {self.index} of {self.count}"
 
 
+# Generates one output of a stage into a manifests checkout, given the output,
+# its stage and, as manifests_checkout=, the checkout; everything else about the
+# change is bound already.
+type GenerateOutput = Callable[..., tuple[OutputResult, GenerationResult]]
+
+
 @dataclass(frozen=True)
 class ChangeProcessor:
     manifests_repository: str | None = None
@@ -279,6 +286,13 @@ class ChangeProcessor:
     """Validator every generated tree is gated on, absent without [validator]."""
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     """How many manifests repositories of a stage are generated at once."""
+    generate_while_waiting: bool = False
+    """Generate while a rollout stage waits for its deployments.
+
+    A stage then pushes what it has generated before the rest of it is, and the
+    next stage is generated while this one is waited for; see
+    :meth:`_deploy_generating_while_waiting`.
+    """
 
     def process(
         self,
@@ -389,13 +403,44 @@ class ChangeProcessor:
                     configured=output_settings,
                 )
 
+            stages = _change_stages(output_settings, self.rollouts, selected_outputs)
+            if self.generate_while_waiting and self.detect_deployment and self.rollouts:
+                predicted = (
+                    self._predict_outputs(source_checkout, selected_outputs, report)
+                    if system and declares_targets
+                    else None
+                )
+                deployed = self._deploy_generating_while_waiting(
+                    stages,
+                    predicted,
+                    generate_output=partial(
+                        self._generate_output,
+                        deploy_config=deploy_config,
+                        declares_targets=declares_targets,
+                        image=image,
+                        namespace=namespace,
+                        plugins=plugins,
+                        report=report,
+                    ),
+                    checkout_by_repository=checkout_by_repository,
+                    repo=repo,
+                    commit=commit,
+                    report=report,
+                )
+                return ChangeResult(
+                    repo=repo,
+                    commit=commit,
+                    deploy_config=deploy_config,
+                    manifests_checkout=deployed[0].manifests_checkout,
+                    generated_count=sum(output.generated_count for output in deployed),
+                    outputs=tuple(deployed),
+                )
+
             output_results: list[OutputResult] = []
             total_generated = 0
             cloned: set[str] = set()
 
-            for stage in _change_stages(
-                output_settings, self.rollouts, selected_outputs
-            ):
+            for stage in stages:
                 _report_stage(stage, report)
                 stage_results: list[tuple[OutputSettings, GenerationResult]] = []
                 repositories = list(_outputs_by_repository(stage.outputs))
@@ -475,6 +520,43 @@ class ChangeProcessor:
 
     def _configured_outputs(self) -> tuple[OutputSettings, ...]:
         return _resolve_output_settings(self.outputs, self.manifests_repository)
+
+    def _predict_outputs(
+        self,
+        source_checkout: Path,
+        outputs: Sequence[OutputSettings],
+        report: Callable[..., None],
+    ) -> frozenset[str] | None:
+        """Guess which outputs a system-mode commit affects from the paths it changed.
+
+        The guess decides what each stage generates first, so a commit that touches
+        one cluster's section has that cluster pushed without waiting for the rest
+        of its stage to be generated. It is only ever an order: a guess that cannot
+        be made, or that fails, leaves every stage in its configured order, and an
+        output it misses is still generated and pushed before its stage is let go.
+        """
+        try:
+            with span("predict outputs"):
+                config_file = find_config_file(source_checkout)
+                changes = _commit_changes(source_checkout, config_file.name)
+                if changes is None:
+                    return None
+                predicted = _predicted_outputs(config_file, changes, outputs)
+        except Exception:
+            logger.warning(
+                "could not tell which outputs the commit affects; generating each "
+                "stage in its configured order",
+                exc_info=True,
+            )
+            return None
+        if predicted is None:
+            return None
+        report(
+            "predicted-outputs",
+            _predicted_message(predicted, outputs),
+            outputs=[output.name for output in outputs if output.name in predicted],
+        )
+        return predicted
 
     def _validate(
         self,
@@ -754,11 +836,34 @@ class ChangeProcessor:
         An output the commit did not affect generated nothing, so there is no
         deployment of it to wait for and its cluster is left alone.
         """
-        deployed = [
-            (output, result)
-            for output, result in results
-            if result.created_or_modified or result.removed
-        ]
+        deployed = [(output, result) for output, result in results if _changed(result)]
+        if stage.rollout is not None:
+            observed = self._await_deployments(stage, deployed, report)
+            _report_stage_verified(stage, observed, report)
+            return
+        for output, generation_result in deployed:
+            connection = self._connection_for(output)
+            report(
+                "deployment-detection",
+                f"waiting for {output.name} to pick up the change",
+                output=output.name,
+                cluster=output.name,
+            )
+            with span("start deployment detection", **{"relcoord.output": output.name}):
+                _start_deployment_detection(
+                    generation_result,
+                    output.name,
+                    connection,
+                    self.deployment_detector,
+                )
+
+    def _await_deployments(
+        self,
+        stage: ChangeStage,
+        deployed: Sequence[tuple[OutputSettings, GenerationResult]],
+        report: Callable[..., None],
+    ) -> list[tuple[str, float]]:
+        """Wait for each of a stage's deployments in turn, timing each one."""
         observed: list[tuple[str, float]] = []
         for output, generation_result in deployed:
             connection = self._connection_for(output)
@@ -768,17 +873,6 @@ class ChangeProcessor:
                 output=output.name,
                 cluster=output.name,
             )
-            if stage.rollout is None:
-                with span(
-                    "start deployment detection", **{"relcoord.output": output.name}
-                ):
-                    _start_deployment_detection(
-                        generation_result,
-                        output.name,
-                        connection,
-                        self.deployment_detector,
-                    )
-                continue
             started = time.monotonic()
             with span(
                 "await deployment",
@@ -795,18 +889,263 @@ class ChangeProcessor:
                     self.deployment_detector,
                 )
             observed.append((output.name, time.monotonic() - started))
-        if stage.rollout is None:
-            return
-        message = _stage_verified_message(stage, observed)
-        logger.info("change step 7/7: %s", message)
+        return observed
+
+    def _deploy_generating_while_waiting(
+        self,
+        stages: Sequence[ChangeStage],
+        predicted: frozenset[str] | None,
+        *,
+        generate_output: GenerateOutput,
+        checkout_by_repository: Mapping[str, Path],
+        repo: str,
+        commit: str,
+        report: Callable[..., None],
+    ) -> list[OutputResult]:
+        """Deploy a rollout's stages, generating while each one is waited for.
+
+        A stage is deployed in up to two parts. Its predicted outputs are generated
+        and pushed first, and their deployments are waited for while the rest of
+        the stage is generated; any of the rest that changed after all, because
+        the prediction missed it, is pushed as soon as it has been generated. The
+        stage is let go only once every one of its outputs has been generated and
+        every deployment it pushed has been observed, so a prediction that misses
+        costs time and never reorders a deployment.
+
+        While a stage's deployments are waited for, the next stage is generated
+        as well, predicted outputs first, until the wait is over. Its commits sit
+        on top of everything this stage pushed and are pushed only once this stage
+        has been verified, so they reach no cluster any earlier. A failure while
+        generating ahead is held until this stage is verified and raised as the
+        next one starts, which is where generating that stage would have raised
+        it, and nothing of the next stage has been pushed by then.
+
+        Without a prediction, or with one naming every output of a stage, the
+        stage is one part, and generating the next stage is all that overlaps
+        the wait.
+        """
+        generated: dict[str, tuple[OutputResult, GenerationResult]] = {}
+        considered: set[str] = set()
+        cloned: set[str] = set()
+        held: Exception | None = None
+        results: list[OutputResult] = []
+        for index, stage in enumerate(stages):
+            _report_stage(stage, report)
+            if held is not None:
+                raise held
+            waits: list[Future[list[tuple[str, float]]]] = []
+            pushed: set[str] = set()
+            pool = ThreadPoolExecutor(thread_name_prefix="relcoord-stage-wait")
+            try:
+                for part in _stage_parts(stage.outputs, predicted):
+                    self._generate_missing(
+                        part,
+                        stage,
+                        generated,
+                        cloned,
+                        generate_output=generate_output,
+                        checkout_by_repository=checkout_by_repository,
+                        report=report,
+                    )
+                    # A deployment already found missing has failed the stage, so
+                    # nothing more of it is pushed after that.
+                    _raise_failed_wait(waits)
+                    deployed = self._push_generated(
+                        stage,
+                        generated,
+                        considered,
+                        pushed,
+                        checkout_by_repository=checkout_by_repository,
+                        repo=repo,
+                        commit=commit,
+                        report=report,
+                    )
+                    if deployed:
+                        waits.append(
+                            _submit(
+                                pool,
+                                partial(
+                                    self._await_deployments, stage, deployed, report
+                                ),
+                            )
+                        )
+                _report_unchanged_repositories(stage, pushed, report)
+                if waits and index + 1 < len(stages):
+                    held = self._generate_ahead(
+                        stages[index + 1],
+                        stage,
+                        predicted,
+                        generated,
+                        cloned,
+                        waits=waits,
+                        generate_output=generate_output,
+                        checkout_by_repository=checkout_by_repository,
+                        report=report,
+                    )
+                observed = [entry for wait in waits for entry in wait.result()]
+            finally:
+                # A wait that is still running when the stage fails is left to
+                # finish on its own: it only reads the cluster, and holding the
+                # failure back for it would only delay the answer.
+                pool.shutdown(wait=False)
+            _report_stage_verified(stage, _in_stage_order(stage, observed), report)
+            results.extend(generated[output.name][0] for output in stage.outputs)
+        return results
+
+    def _generate_missing(
+        self,
+        outputs: Sequence[OutputSettings],
+        stage: ChangeStage,
+        generated: dict[str, tuple[OutputResult, GenerationResult]],
+        cloned: set[str],
+        *,
+        generate_output: GenerateOutput,
+        checkout_by_repository: Mapping[str, Path],
+        report: Callable[..., None],
+        until: Callable[[], bool] | None = None,
+    ) -> None:
+        """Generate those of ``outputs`` not generated yet, a repository per task.
+
+        A repository's outputs are generated in turn into its one checkout, and
+        repositories run concurrently, as they do for a stage generated whole.
+        ``until`` is asked before each output and stops a repository's generation
+        once it answers true; what was generated by then is kept.
+        """
+        repositories = _outputs_by_repository(
+            [output for output in outputs if output.name not in generated]
+        )
+
+        def generate_repository(
+            repository: str, repository_outputs: Sequence[OutputSettings]
+        ) -> list[tuple[str, tuple[OutputResult, GenerationResult]]]:
+            checkout = checkout_by_repository[repository]
+            if repository not in cloned:
+                self._clone_manifests(repository, checkout, report)
+            done: list[tuple[str, tuple[OutputResult, GenerationResult]]] = []
+            for output in repository_outputs:
+                if until is not None and until():
+                    break
+                done.append(
+                    (
+                        output.name,
+                        generate_output(output, stage, manifests_checkout=checkout),
+                    )
+                )
+            return done
+
+        finished = _run_concurrently(
+            [
+                partial(generate_repository, repository, repository_outputs)
+                for repository, repository_outputs in repositories
+            ],
+            self.max_concurrency,
+        )
+        cloned.update(repository for repository, _ in repositories)
+        for done in finished:
+            generated.update(done)
+
+    def _push_generated(
+        self,
+        stage: ChangeStage,
+        generated: Mapping[str, tuple[OutputResult, GenerationResult]],
+        considered: set[str],
+        pushed: set[str],
+        *,
+        checkout_by_repository: Mapping[str, Path],
+        repo: str,
+        commit: str,
+        report: Callable[..., None],
+    ) -> list[tuple[OutputSettings, GenerationResult]]:
+        """Push every repository holding changes of the stage not pushed yet.
+
+        A push sends a repository's checkout as it stands, which holds every
+        output of the stage generated so far, including any generated ahead, so
+        all of them are pushed and waited for together. Nothing of a later stage
+        is in it yet: the next stage is generated only once this one has pushed.
+        Repositories are pushed in configured order and named in ``pushed``.
+        """
+        deployed: list[tuple[OutputSettings, GenerationResult]] = []
+        for repository, outputs in _outputs_by_repository(stage.outputs):
+            fresh = [
+                output
+                for output in outputs
+                if output.name in generated and output.name not in considered
+            ]
+            considered.update(output.name for output in fresh)
+            changed = [
+                (output, generated[output.name][1])
+                for output in fresh
+                if _changed(generated[output.name][1])
+            ]
+            if not changed:
+                continue
+            self._push_manifests(
+                repository, checkout_by_repository[repository], repo, commit, report
+            )
+            pushed.add(repository)
+            deployed.extend(changed)
+        return deployed
+
+    def _generate_ahead(
+        self,
+        stage: ChangeStage,
+        waiting: ChangeStage,
+        predicted: frozenset[str] | None,
+        generated: dict[str, tuple[OutputResult, GenerationResult]],
+        cloned: set[str],
+        *,
+        waits: Sequence[Future[list[tuple[str, float]]]],
+        generate_output: GenerateOutput,
+        checkout_by_repository: Mapping[str, Path],
+        report: Callable[..., None],
+    ) -> Exception | None:
+        """Generate ``stage`` while ``waiting``'s deployments are waited for.
+
+        Generation stops once the wait is over, after the output in hand, and the
+        stage picks up from there when it starts. A failure is returned rather
+        than raised, because the stage being waited for has yet to be verified
+        and is reported first.
+        """
+
+        def waited() -> bool:
+            # Over once every deployment has been observed, or as soon as one has
+            # failed, since a stage that fails is not followed by the next.
+            return all(wait.done() for wait in waits) or any(
+                wait.done() and wait.exception() is not None for wait in waits
+            )
+
+        if not stage.outputs or waited():
+            return None
         report(
-            "rollout-stage-verified",
-            message,
+            "generate-ahead",
+            f"generating {stage.label} while {waiting.label} is verified",
             rollout=stage.rollout,
             stage=stage.index,
             stages=stage.count,
-            outputs=[name for name, _ in observed],
         )
+        try:
+            for part in _stage_parts(stage.outputs, predicted):
+                self._generate_missing(
+                    part,
+                    stage,
+                    generated,
+                    cloned,
+                    generate_output=generate_output,
+                    checkout_by_repository=checkout_by_repository,
+                    report=report,
+                    until=waited,
+                )
+        except Exception as exc:
+            # Logged as it happens, since the failure surfaces only once the
+            # stage being waited for has been verified, which can be minutes on.
+            logger.info(
+                "generating %s ahead failed; raising it once %s is verified",
+                stage.label,
+                waiting.label,
+                exc_info=True,
+            )
+            return exc
+        return None
 
     def _connection_for(self, output: OutputSettings) -> OutputSettings | None:
         """Return the connection for an output's deployment destination.
@@ -1731,6 +2070,80 @@ def _report_stage(stage: ChangeStage, report: Callable[..., None]) -> None:
     )
 
 
+def _report_stage_verified(
+    stage: ChangeStage,
+    observed: Sequence[tuple[str, float]],
+    report: Callable[..., None],
+) -> None:
+    message = _stage_verified_message(stage, observed)
+    logger.info("change step 7/7: %s", message)
+    report(
+        "rollout-stage-verified",
+        message,
+        rollout=stage.rollout,
+        stage=stage.index,
+        stages=stage.count,
+        outputs=[name for name, _ in observed],
+    )
+
+
+def _report_unchanged_repositories(
+    stage: ChangeStage, pushed: set[str], report: Callable[..., None]
+) -> None:
+    """Say which of a stage's repositories it had nothing to push to."""
+    for repository, _ in _outputs_by_repository(stage.outputs):
+        if repository in pushed:
+            continue
+        logger.info(
+            "change step 6/7: manifest-builder produced no changes for repo %s; "
+            "nothing to commit or push",
+            repository,
+        )
+        report(
+            "no-changes",
+            f"no changes for {short_repo(repository)}",
+            repository=repository,
+        )
+
+
+def _changed(result: GenerationResult) -> bool:
+    return bool(result.created_or_modified or result.removed)
+
+
+def _stage_parts(
+    outputs: Sequence[OutputSettings], predicted: frozenset[str] | None
+) -> tuple[tuple[OutputSettings, ...], ...]:
+    """Split a stage's outputs into what is pushed first and what follows.
+
+    The predicted outputs come first and the others after, each in the order
+    the stage configures. Without a prediction, or where it names all of a
+    stage's outputs or none, the stage is one part.
+    """
+    if predicted is None:
+        parts = (tuple(outputs),)
+    else:
+        parts = (
+            tuple(output for output in outputs if output.name in predicted),
+            tuple(output for output in outputs if output.name not in predicted),
+        )
+    return tuple(part for part in parts if part)
+
+
+def _in_stage_order(
+    stage: ChangeStage, observed: Sequence[tuple[str, float]]
+) -> list[tuple[str, float]]:
+    """Order a stage's observed deployments as the stage configures its outputs."""
+    position = {output.name: index for index, output in enumerate(stage.outputs)}
+    return sorted(observed, key=lambda entry: position[entry[0]])
+
+
+def _raise_failed_wait(waits: Sequence[Future[Any]]) -> None:
+    """Raise the failure of the first wait, in order, that has failed already."""
+    for wait in waits:
+        if wait.done() and wait.exception() is not None:
+            wait.result()
+
+
 def _change_stages(
     outputs: Sequence[OutputSettings],
     rollouts: Sequence[RolloutSettings],
@@ -1910,6 +2323,167 @@ def _section_targets(system_checkout: Path, section: str) -> tuple[str, ...]:
             f"known sections: {', '.join(known)}"
         )
     return names
+
+
+@dataclass(frozen=True)
+class CommitChanges:
+    """What a config commit changed against its first parent.
+
+    This is what the commit's own diff says, which is enough to order a stage's
+    generation and no more: whether an output's manifests change is only known
+    by generating it.
+    """
+
+    paths: frozenset[str]
+    """Paths the commit added, modified or removed, relative to the repository."""
+    parent_config: bytes | None
+    """The top-level config file as the parent had it, or None where it had none."""
+
+
+def _commit_changes(checkout: Path, config_name: str) -> CommitChanges | None:
+    """Read what the checked-out commit changed against its first parent.
+
+    None for a root commit, or one whose parent the checkout does not hold, since
+    neither has anything to be compared with.
+    """
+    repo = Repo(checkout)
+    try:
+        head = repo.object_store[repo.head()]
+        if not isinstance(head, Commit) or not head.parents:
+            return None
+        try:
+            parent = repo.object_store[head.parents[0]]
+        except KeyError:
+            return None
+        if not isinstance(parent, Commit):
+            return None
+        paths = frozenset(
+            entry.path.decode("utf-8")
+            for change in tree_changes(repo.object_store, parent.tree, head.tree)
+            for entry in (change.old, change.new)
+            if entry is not None and entry.path is not None
+        )
+        try:
+            _mode, sha = tree_lookup_path(
+                repo.object_store.__getitem__,
+                parent.tree,
+                config_name.encode("utf-8"),
+            )
+        except KeyError:
+            return CommitChanges(paths=paths, parent_config=None)
+        blob = repo.object_store[ObjectID(sha)]
+        if not isinstance(blob, Blob):
+            return CommitChanges(paths=paths, parent_config=None)
+        return CommitChanges(paths=paths, parent_config=blob.data)
+    finally:
+        repo.close()
+
+
+def _predicted_outputs(
+    config_file: Path, changes: CommitChanges, outputs: Sequence[OutputSettings]
+) -> frozenset[str] | None:
+    """Name the outputs a commit's changed paths can affect, erring towards more.
+
+    ``config_file`` is the top-level config file of a config directory at the
+    root of the repository, which is where a system-mode change reads it from,
+    so the changed paths are relative to the config directory too.
+
+    A section is a directory at the top of the config directory, so a path inside
+    one can only reach the targets built from it. A config file that declares
+    targets declares nothing else, so a change to it reaches the targets whose
+    entries changed, or every target where its version did. Any other path may
+    be read by any target, and reaches them all.
+
+    None where the config declares no targets, which leaves nothing to map the
+    paths onto. The answer only orders generation: every output is still
+    generated, so a path this misjudges costs time and never a deployment.
+    """
+    data = load_toml_file(config_file)
+    if config_version(data, config_file) != TARGETS_VERSION:
+        return None
+    by_section: dict[str, set[str]] = {}
+    for target in parse_targets(data, config_file):
+        for section in target.sections:
+            by_section.setdefault(section, set()).add(target.name)
+    every = frozenset(output.name for output in outputs)
+    affected: set[str] = set()
+    for path in changes.paths:
+        if path == config_file.name:
+            changed = _changed_targets(changes.parent_config, data)
+            if changed is None:
+                return every
+            affected |= changed
+            continue
+        section, separator, _ = path.partition("/")
+        if not separator or section not in by_section:
+            return every
+        affected |= by_section[section]
+    return frozenset(
+        output.name for output in outputs if output.target_name in affected
+    )
+
+
+def _changed_targets(
+    parent_config: bytes | None, data: dict[str, Any]
+) -> set[str] | None:
+    """Name the targets whose ``[[target]]`` entries differ from the parent's.
+
+    None where anything besides the targets changed, which for a config that
+    declares targets is its version, or where the parent's file cannot be read:
+    either way every target may be affected.
+    """
+    if parent_config is None:
+        return None
+    try:
+        parent = tomllib.loads(parent_config.decode("utf-8"))
+    except UnicodeDecodeError, tomllib.TOMLDecodeError:
+        return None
+    if _without_targets(parent) != _without_targets(data):
+        return None
+    before = _target_tables(parent)
+    after = _target_tables(data)
+    if before is None or after is None:
+        return None
+    return {
+        name
+        for name in before.keys() | after.keys()
+        if before.get(name) != after.get(name)
+    }
+
+
+def _without_targets(data: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in data.items() if key != "target"}
+
+
+def _target_tables(data: dict[str, Any]) -> dict[str, Any] | None:
+    """A config file's ``[[target]]`` tables by name, or None if any is malformed."""
+    tables = data.get("target", [])
+    if not isinstance(tables, list):
+        return None
+    by_name: dict[str, Any] = {}
+    for table in tables:
+        if not isinstance(table, dict) or not isinstance(table.get("name"), str):
+            return None
+        by_name[table["name"]] = table
+    return by_name
+
+
+def _predicted_message(
+    predicted: frozenset[str], outputs: Sequence[OutputSettings]
+) -> str:
+    """Say what a stage's generation order will be, now the commit's paths are read."""
+    if predicted == {output.name for output in outputs}:
+        return (
+            "this commit can affect every output, so each stage generates in its "
+            "configured order"
+        )
+    if not predicted:
+        return (
+            "this commit's paths reach no output, so each stage generates in its "
+            "configured order"
+        )
+    names = join_names([output.name for output in outputs if output.name in predicted])
+    return f"expecting changes in {names}, so their stages generate them first"
 
 
 def _generate_selection(

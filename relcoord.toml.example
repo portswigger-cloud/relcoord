@@ -10,6 +10,12 @@ detect-deployment = false
 # How many manifests repositories a change or diff works on at once, and how
 # many validator requests a diff keeps in flight.
 max-concurrency = 4
+# Generate while a rollout stage waits for its deployments: the next stage is
+# generated during the wait, and a system-mode change generates and pushes the
+# outputs its commit's paths point at before the rest of their stage. Requires
+# a [[rollout]]. The README's "Generating while a stage waits" says what a
+# failure then leaves pushed.
+# generate-while-waiting = true
 
 # Shared system repository. For non-system requests, its "plugins" subdirectory
 # is passed to manifest-builder alongside the config directory's own plugins.

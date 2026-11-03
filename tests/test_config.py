@@ -1005,6 +1005,50 @@ def test_settings_reject_rollout_without_detect_deployment(tmp_path: Path) -> No
         Settings.from_toml(config)
 
 
+def test_settings_parse_generate_while_waiting(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        "generate-while-waiting = true\n"
+        + ROLLOUT_OUTPUTS
+        + """
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["platform-dev", "platform-prod", "observability"]
+        """
+    )
+
+    assert Settings.from_toml(config).generate_while_waiting is True
+
+
+def test_settings_default_to_generating_between_stages(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("")
+
+    assert Settings.from_toml(config).generate_while_waiting is False
+
+
+def test_settings_reject_generate_while_waiting_without_a_rollout(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("generate-while-waiting = true\n")
+
+    with pytest.raises(
+        ValueError, match=r"generate-while-waiting requires \[\[rollout\]\] entries"
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_non_boolean_generate_while_waiting(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('generate-while-waiting = "yes"\n')
+
+    with pytest.raises(TypeError, match="generate-while-waiting must be a boolean"):
+        Settings.from_toml(config)
+
+
 def test_settings_reject_rollout_without_outputs(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(
