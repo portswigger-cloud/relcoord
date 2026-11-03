@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from time import perf_counter
@@ -126,7 +126,6 @@ class _ChangePlan:
     """Outputs this change may deploy to, empty for every configured output."""
     section: str | None = None
     """Section of the system repository that says which outputs to deploy to."""
-    registered: dict[str, Any] | None = field(default=None)
 
 
 @dataclass(frozen=True)
@@ -309,17 +308,9 @@ def create_app(
                 message="image_repo and tag cannot be combined with system mode",
             )
 
-        registered: dict[str, Any] | None = None
-        manifest_image = None
-        if image is not None and tag is not None:
-            result = await service.register_version(image=image, version=tag)
-            manifest_image = f"{image}:{tag}"
-            registered = {
-                "image": result.image,
-                "version": result.version,
-                "timestamp": _format_timestamp(result.timestamp),
-                "created": result.created,
-            }
+        manifest_image = (
+            f"{image}:{tag}" if image is not None and tag is not None else None
+        )
         return _ChangePlan(
             repo=repo,
             commit=commit,
@@ -328,7 +319,6 @@ def create_app(
             manifest_image=manifest_image,
             outputs=_permitted_outputs(payload, principal),
             section=section,
-            registered=registered,
         )
 
     async def change(request: Request) -> Response:
@@ -942,7 +932,6 @@ def _change_completion(plan: _ChangePlan, result: object) -> dict[str, Any]:
         "message": _change_summary(processed),
         "config_repo": plan.repo,
         "commit": plan.commit,
-        "registered": plan.registered,
         "processed": processed,
     }
 
@@ -1074,7 +1063,6 @@ def _change_events(
                 ),
                 "config_repo": plan.repo,
                 "commit": plan.commit,
-                "registered": plan.registered,
             },
             run=lambda progress: change_processor.process(
                 plan.repo,

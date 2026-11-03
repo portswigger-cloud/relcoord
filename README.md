@@ -322,8 +322,7 @@ curl -N -H 'accept: text/event-stream' -H 'content-type: application/json' \
 
 The stream carries four kinds of event:
 
-- `accepted` — sent immediately, with a `message`, `config_repo`, `commit` and the
-  `registered` image version, so the client can render something before any git
+- `accepted` — sent immediately, with a `message`, `config_repo`, and `commit`, so the client can render something before any git
   work starts.
 - `progress` — one per step, with a stable `phase` (`source-checkout`,
   `deploy-config`, `system-checkout`, `rollout-stage`, `manifests-checkout`,
