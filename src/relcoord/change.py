@@ -18,9 +18,12 @@ from typing import Any, Protocol, cast
 from urllib.parse import quote
 
 from dulwich import porcelain
+from dulwich.client import FetchPackResult
 from dulwich.diff_tree import tree_changes
+from dulwich.graph import can_fast_forward
 from dulwich.object_store import iter_tree_contents, tree_lookup_path
 from dulwich.objects import Commit, ObjectID
+from dulwich.refs import HEADREF
 from dulwich.repo import Repo
 from manifest_builder import (
     ExternalPlugins,
@@ -127,6 +130,22 @@ class GitTransportError(ChangeProcessingError):
     inaccessible), so this carries whatever detail is available and is reported
     without a stack trace.
     """
+
+
+class PushRefusedError(GitTransportError):
+    """Raised when the remote did not take a push of the manifests repository.
+
+    Either the branch had moved on to a commit the checkout does not have, which
+    another config repository pushing meanwhile causes, or the remote refused
+    the ref update outright. The first is retried on top of the moved branch;
+    the second, and the first once retrying has run out, fail the change.
+    """
+
+
+# How many times a stage's push is tried while the branch it updates keeps
+# moving. Each retry fetches and rebases first, so it only fails again if
+# another push lands in the moment between that fetch and the retry.
+PUSH_ATTEMPTS = 3
 
 
 class DeploymentDetectionError(ChangeProcessingError):
@@ -690,7 +709,17 @@ class ChangeProcessor:
         commit: str,
         report: Callable[..., None],
     ) -> None:
-        """Push what manifest-builder committed for one stage of one repository."""
+        """Push what manifest-builder committed for one stage of one repository.
+
+        The checkout was cloned when the change started, and other config
+        repositories push to the same manifests repository without waiting for
+        this change, so its branch can have moved on by the time a stage pushes.
+        A push the remote refuses is then rebased onto the branch as it now
+        stands and tried again. Every writer generates into directories of its
+        own, so the rebase has nothing to merge; one that conflicts all the same
+        fails the change, as does a refusal while the branch has not moved, which
+        a rebase cannot help.
+        """
         manifest_commit = _head_commit(manifests_checkout)
         # The commit is named by the push lines either side of it, so it is logged
         # rather than reported: one action is worth one line in the stream.
@@ -698,31 +727,70 @@ class ChangeProcessor:
             "change step 6/7: manifest-builder created manifests commit %s",
             manifest_commit,
         )
-        short = short_commit(manifest_commit)
         target = short_repo(repository)
-        logger.info(
-            "change step 7/7: pushing manifests commit %s to %s",
-            manifest_commit,
-            repository,
-        )
-        report(
-            "push",
-            f"pushing {short} to {target}",
-            repository=repository,
-            manifest_commit=manifest_commit,
-        )
-        with span(
-            "push manifests",
-            **{
-                "relcoord.repository": repository,
-                "relcoord.manifest_commit": manifest_commit,
-            },
-        ):
-            _push_repository(
-                manifests_checkout,
+        for attempt in range(1, PUSH_ATTEMPTS + 1):
+            logger.info(
+                "change step 7/7: pushing manifests commit %s to %s",
+                manifest_commit,
                 repository,
-                self.idcat,
             )
+            report(
+                "push",
+                f"pushing {short_commit(manifest_commit)} to {target}",
+                repository=repository,
+                manifest_commit=manifest_commit,
+            )
+            try:
+                with span(
+                    "push manifests",
+                    **{
+                        "relcoord.repository": repository,
+                        "relcoord.manifest_commit": manifest_commit,
+                    },
+                ):
+                    _push_repository(
+                        manifests_checkout,
+                        repository,
+                        self.idcat,
+                    )
+            except PushRefusedError as exc:
+                with span("rebase manifests", **{"relcoord.repository": repository}):
+                    upstream = _fetch_branch(manifests_checkout, repository, self.idcat)
+                    if _contains(manifests_checkout, upstream):
+                        raise
+                    if attempt == PUSH_ATTEMPTS:
+                        raise PushRefusedError(
+                            f"{exc}; {target} moved again on each of "
+                            f"{PUSH_ATTEMPTS} attempts to push"
+                        ) from exc
+                    try:
+                        rebased = _rebase_onto(manifests_checkout, upstream)
+                    except RebaseConflictError as conflict:
+                        raise PushRefusedError(
+                            f"{target} moved to {short_commit(upstream)} since it "
+                            f"was checked out, and this change's commits do not "
+                            f"rebase onto it: {conflict}"
+                        ) from conflict
+                manifest_commit = _head_commit(manifests_checkout)
+                logger.info(
+                    "manifests repo %s moved to %s since it was checked out; "
+                    "rebased %d commit(s) onto it as %s",
+                    repository,
+                    upstream,
+                    rebased,
+                    manifest_commit,
+                )
+                report(
+                    "rebased",
+                    f"{target} moved to {short_commit(upstream)} since it was "
+                    f"checked out; rebased onto it and pushing again",
+                    repository=repository,
+                    upstream=upstream,
+                    manifest_commit=manifest_commit,
+                )
+                continue
+            break
+        short = short_commit(manifest_commit)
         logger.info(
             "change complete: pushed manifests commit %s for source repo %s "
             "at commit %s",
@@ -2244,12 +2312,13 @@ def _checkout_rebased_commit(
     _rebase_onto(target, default_branch_tip)
 
 
-def _rebase_onto(target: Path, upstream: str) -> None:
+def _rebase_onto(target: Path, upstream: str) -> int:
     """Rebase the checkout's current branch onto ``upstream``.
 
     ``porcelain.rebase`` updates the branch ref but not the working tree, so the
     rebased tip is checked out afterwards. An empty result means the branch was
     already up to date and the working tree already holds the right thing.
+    Returns how many commits were rebased.
     """
     try:
         rebased = porcelain.rebase(str(target), upstream=upstream)
@@ -2257,6 +2326,7 @@ def _rebase_onto(target: Path, upstream: str) -> None:
         raise RebaseConflictError(f"failed to rebase onto {upstream}: {exc}") from exc
     if rebased:
         _dulwich_checkout(target, rebased[-1].decode("ascii"))
+    return len(rebased)
 
 
 def _system_plugins(
@@ -2504,18 +2574,37 @@ def _push_repository(
         # not pollute the error detail of the second.
         push_output = BytesIO()
         if credentials.username is None:
-            porcelain.push(
+            result = porcelain.push(
                 repo_path,
                 remote,
                 errstream=push_output,
             )
         else:
-            porcelain.push(
+            result = porcelain.push(
                 repo_path,
                 remote,
                 errstream=push_output,
                 username=credentials.username,
                 password=credentials.password or "",
+            )
+        # dulwich writes a ref update the remote refused to its errstream and
+        # returns as though the push had succeeded, so the refusal is read
+        # here. Missed, the change would go on to wait for a deployment of a
+        # commit the remote never took, and fail minutes later as a timeout.
+        refused = {
+            ref.decode("utf-8", "replace"): error
+            for ref, error in (result.ref_status or {}).items()
+            if error is not None
+        }
+        if refused:
+            raise PushRefusedError(
+                _dulwich_error_message(
+                    "push",
+                    {"source": str(repo_path), "remote": remote},
+                    RuntimeError(
+                        ", ".join(f"{ref}: {error}" for ref, error in refused.items())
+                    ),
+                )
             )
 
     try:
@@ -2525,6 +2614,22 @@ def _push_repository(
             push,
             credentials=lambda: _credentials_for(remote, idcat, purpose),
         )
+    except PushRefusedError:
+        _log_dulwich_output("push", push_output)
+        raise
+    except porcelain.DivergedBranches as exc:
+        # The branch moved since the checkout last saw it, which dulwich finds
+        # before sending anything.
+        _log_dulwich_output("push", push_output)
+        raise PushRefusedError(
+            _dulwich_error_message(
+                "push",
+                {"source": str(repo_path), "remote": remote},
+                RuntimeError(
+                    f"{remote} has moved to a commit this checkout does not have"
+                ),
+            )
+        ) from exc
     except Exception as exc:
         _log_dulwich_output("push", push_output)
         raise GitTransportError(
@@ -2537,6 +2642,74 @@ def _push_repository(
         ) from exc
     else:
         _log_dulwich_output("push", push_output)
+
+
+def _fetch_branch(checkout: Path, remote: str, idcat: IdcatSettings | None) -> str:
+    """Fetch the checkout's branch from ``remote``, returning where it now points.
+
+    The commits fetched land in the checkout's object store, which is all a
+    rebase onto them needs: nothing is checked out or merged here.
+    """
+    purpose = f"fetching manifests repo {remote}"
+    branch = _branch_ref(checkout)
+    fetch_output = BytesIO()
+
+    def fetch(credentials: GitCredentials) -> FetchPackResult:
+        nonlocal fetch_output
+        fetch_output = BytesIO()
+        if credentials.username is None:
+            return porcelain.fetch(str(checkout), remote, errstream=fetch_output)
+        return porcelain.fetch(
+            str(checkout),
+            remote,
+            errstream=fetch_output,
+            username=credentials.username,
+            password=credentials.password or "",
+        )
+
+    try:
+        result = with_fresh_token_on_unauthorized(
+            remote,
+            idcat,
+            fetch,
+            credentials=lambda: _credentials_for(remote, idcat, purpose),
+        )
+    except Exception as exc:
+        _log_dulwich_output("fetch", fetch_output)
+        raise GitTransportError(
+            _dulwich_error_message(
+                "fetch",
+                {"remote": remote, "target": str(checkout)},
+                exc,
+                fetch_output,
+            )
+        ) from exc
+    _log_dulwich_output("fetch", fetch_output)
+    upstream = (result.refs or {}).get(branch)
+    if upstream is None:
+        raise GitTransportError(
+            f"{remote} has no {branch.decode('utf-8', 'replace')} to push onto"
+        )
+    return upstream.decode("ascii")
+
+
+def _branch_ref(checkout: Path) -> bytes:
+    """The ref the checkout's HEAD points at, which is what a push updates."""
+    repo = Repo(checkout)
+    try:
+        refs, _ = repo.refs.follow(HEADREF)
+    finally:
+        repo.close()
+    return refs[-1]
+
+
+def _contains(checkout: Path, commit: str) -> bool:
+    """Whether ``commit`` is in the history of the checkout's HEAD already."""
+    repo = Repo(checkout)
+    try:
+        return can_fast_forward(repo, ObjectID(commit.encode("ascii")), repo.head())
+    finally:
+        repo.close()
 
 
 def _dulwich_error_message(
