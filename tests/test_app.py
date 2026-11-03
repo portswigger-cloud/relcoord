@@ -272,34 +272,6 @@ def test_reject_invalid_timestamp(client: TestClient, timestamp: str | None) -> 
     }
 
 
-def test_change_registers_image_version_when_image_and_tag_present(
-    client: TestClient,
-) -> None:
-    response = client.post(
-        "/v1/change",
-        json={
-            "config_repo": "acme/api",
-            "commit": "abc123",
-            "image_repo": "registry.example.com/team/api",
-            "tag": "1.2.3",
-        },
-    )
-
-    assert response.status_code == 202
-    body = response.json()
-    assert body["config_repo"] == "acme/api"
-    assert body["commit"] == "abc123"
-    assert body["registered"]["image"] == "registry.example.com/team/api"
-    assert body["registered"]["version"] == "1.2.3"
-    assert body["registered"]["created"] is True
-
-    latest = client.post(
-        "/v1/images/latest",
-        json={"images": ["registry.example.com/team/api"]},
-    )
-    assert latest.json() == {"versions": {"registry.example.com/team/api": "1.2.3"}}
-
-
 def test_change_passes_image_reference_to_processor() -> None:
     class Processor:
         def __init__(self) -> None:
@@ -360,7 +332,6 @@ def test_change_without_image_and_tag_acknowledges_without_registering(
         "message": "no manifest changes to deploy",
         "config_repo": "acme/config",
         "commit": "deadbeef",
-        "registered": None,
         "processed": {"generated": 0, "outputs": []},
     }
     assert (
@@ -420,7 +391,6 @@ def test_change_processes_deploy_config_when_processor_is_configured(
         "message": "no manifest changes to deploy",
         "config_repo": "https://github.com/acme/config.git",
         "commit": "deadbeef",
-        "registered": None,
         "processed": {"generated": 3, "outputs": []},
     }
     assert (
@@ -1441,8 +1411,6 @@ def test_change_streams_progress_when_client_accepts_event_stream() -> None:
     accepted = events[0][1]
     assert accepted["config_repo"] == "acme/config"
     assert accepted["commit"] == "deadbeef"
-    registered = accepted["registered"]
-    assert registered["version"] == "1.2.3"
 
     assert events[1][1] == {
         "phase": "source-checkout",
@@ -1454,7 +1422,6 @@ def test_change_streams_progress_when_client_accepts_event_stream() -> None:
         "message": "no manifest changes to deploy",
         "config_repo": "acme/config",
         "commit": "deadbeef",
-        "registered": registered,
         "processed": {"generated": 2, "outputs": []},
     }
 
@@ -1689,7 +1656,6 @@ def test_change_returns_json_when_event_stream_is_not_accepted() -> None:
         "message": "no manifest changes to deploy",
         "config_repo": "acme/config",
         "commit": "deadbeef",
-        "registered": None,
         "processed": {"generated": 1, "outputs": []},
     }
 
