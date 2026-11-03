@@ -67,6 +67,15 @@ def test_processors_use_max_concurrency() -> None:
     assert make_diff_processor(settings).max_concurrency == 2
 
 
+def test_make_change_processor_uses_generate_while_waiting() -> None:
+    settings = Settings(
+        manifests_repository="https://github.com/acme/manifests.git",
+        generate_while_waiting=True,
+    )
+
+    assert make_change_processor(settings).generate_while_waiting is True
+
+
 def test_make_change_processor_uses_outputs() -> None:
     processor = make_change_processor(
         Settings(

@@ -328,7 +328,8 @@ The stream carries four kinds of event:
 - `progress` — one per step, with a stable `phase` (`source-checkout`,
   `deploy-config`, `system-checkout`, `rollout-stage`, `manifests-checkout`,
   `generate`, `generated`, `changed-objects`, `no-changes`, `push`,
-  `rebased`, `pushed`, `deployment-detection`, `rollout-stage-verified`),
+  `rebased`, `pushed`, `deployment-detection`, `rollout-stage-verified`, and
+  with `generate-while-waiting` also `predicted-outputs` and `generate-ahead`),
   a human readable `message`, and a `detail` object with specifics of the step.
   The validation phases (`validate`, `running`, `validated`, `validation-failed`,
   `validation-error`, `no-validation`) come back with validation on a change.
@@ -375,7 +376,9 @@ A change generates every repository of a rollout stage before it pushes any of
 them, and then pushes them in configured order. A generation that fails anywhere
 in the stage therefore pushes nothing, where before it would have left the
 repositories ahead of it pushed. When several fail, the error reported is that
-of the first in configured order, not of whichever failed first.
+of the first in configured order, not of whichever failed first. With
+`generate-while-waiting`, a stage is pushed in up to two parts instead, each
+generated whole first; see "Generating while a stage waits" below.
 
 Changes from different config repositories can push to one manifests repository
 at the same time: nothing queues them across repositories, and each change
@@ -669,3 +672,56 @@ by.
 Outputs sharing a manifests repository are pushed as one commit per stage rather
 than one commit per change, since a stage cannot push what a later stage has not
 generated yet.
+
+### Generating while a stage waits
+
+Most of a rollout is waiting. Generating an output takes seconds, while seeing
+it arrive in its cluster takes tens of seconds, and the two otherwise happen in
+turn: every output of a stage is generated before any of it is pushed, and the
+next stage is not generated until this one has been observed.
+`generate-while-waiting` overlaps them:
+
+```toml
+detect-deployment = true
+generate-while-waiting = true
+```
+
+While a stage's deployments are waited for, the next stage is generated. Its
+commits sit on top of everything this stage pushed and are pushed only once the
+stage has been verified, so nothing reaches a later stage's clusters any sooner,
+and what was generated ahead is pushed as it is rather than generated again. A
+generation that fails ahead is raised once the stage being waited for has been
+verified, which is where generating that stage would have raised it.
+
+A system-mode change to a config that declares targets is also read for the
+outputs it can reach. relcoord diffs the commit against its first parent:
+
+- a path inside a section directory reaches the targets built from that
+  section;
+- a change to the config file reaches the targets whose `[[target]]` entries
+  changed, or every target where its version did;
+- any other path reaches every target.
+
+Each stage then generates its predicted outputs first, pushes them, and
+generates the rest while their deployments are waited for, so a commit that
+touches one cluster's section has that cluster pushed without waiting for the
+rest of its stage to be generated. An output the prediction missed is still
+generated, and pushed as soon as it has been. A stage is let go only once all of
+its outputs have been generated and every deployment it pushed has been
+observed, so a wrong prediction costs time and never changes the order a
+rollout deploys in. A `predicted-outputs` progress event says what was
+predicted; a prediction that cannot be made leaves each stage in its configured
+order.
+
+Pushing a stage in two parts changes what a failure leaves behind. A stage
+generated whole pushes nothing when one of its outputs fails to generate; with
+a prediction, the predicted outputs have been pushed by the time the rest is
+generated, and stay pushed, the way a deployment that is not observed leaves
+its stage pushed.
+
+The diff is the commit's own, so a change that also deploys earlier commits, as
+one that replaced a queued change does, predicts only what its own commit
+touched. An output reached only by the earlier commits is generated with the
+rest of its stage rather than first.
+
+Without a `[[rollout]]` nothing waits, so `generate-while-waiting` requires one.

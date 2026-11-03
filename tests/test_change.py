@@ -2265,6 +2265,43 @@ def test_change_pushes_nothing_when_a_repository_of_the_stage_fails(
     assert pushed == []
 
 
+def test_generating_while_waiting_generates_repositories_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    both_generating = threading.Barrier(2, timeout=5)
+    pushed = _two_repository_change(
+        tmp_path, monkeypatch, lambda output: both_generating.wait()
+    )
+
+    class Detector:
+        def wait_for_success(
+            self, *, created_or_modified: Mapping, removed: set
+        ) -> None:
+            pass
+
+    result = ChangeProcessor(
+        outputs=TWO_REPOSITORY_OUTPUTS,
+        rollouts=[
+            RolloutSettings(
+                name="linear",
+                stages=(RolloutStage(outputs=("example-dev", "example-prod")),),
+            )
+        ],
+        detect_deployment=True,
+        deployment_detector=Detector(),
+        generate_while_waiting=True,
+    ).process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert [output.name for output in result.outputs] == [
+        "example-dev",
+        "example-prod",
+    ]
+    assert pushed == [
+        "https://github.com/acme/dev-manifests.git",
+        "https://github.com/acme/prod-manifests.git",
+    ]
+
+
 SYSTEM_TARGETS = """\
 version = 2
 
@@ -2746,3 +2783,496 @@ def test_push_gives_up_when_the_branch_keeps_moving(
         "rebased",
         "push",
     ]
+
+
+def _waiting_change_processor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    changed: set[str],
+    system_paths: set[str] | None = None,
+    failing: frozenset[str] = frozenset(),
+    unrenderable: frozenset[str] = frozenset(),
+    held_until: Mapping[str, str] | None = None,
+) -> tuple[ChangeProcessor, list[str]]:
+    """A processor that generates while it waits, recording what it did in order.
+
+    Waits run on threads of their own, so a test asserts only the orderings the
+    walk guarantees. ``held_until`` holds a deployment's wait open until another
+    output's generation has started, which is how a test shows that generation
+    happened during the wait: without the overlap, the wait would never end.
+
+    ``system_paths`` makes the change a system-mode one whose commit changed
+    those paths, from which the stages' outputs are predicted.
+    """
+    calls: list[str] = []
+    started = {output.name: threading.Event() for output in ROLLOUT_OUTPUTS}
+
+    class Detector:
+        def wait_for_success(
+            self, *, created_or_modified: Mapping, removed: set
+        ) -> None:
+            (name,) = {ref.name for ref in created_or_modified}
+            calls.append(f"wait:{name}")
+            other = (held_until or {}).get(name)
+            if other is not None and not started[other].wait(timeout=5):
+                raise RuntimeError(f"{other} was not generated during the wait")
+            if name in failing:
+                raise RuntimeError(f"{name} never reached the cluster")
+            calls.append(f"verified:{name}")
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+        (target / "config.toml").write_text(PREDICTION_CONFIG)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        calls.append("clone")
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path, output_path: Path, **kwargs
+    ) -> GenerationResult:
+        name = output_path.name
+        calls.append(f"generate:{name}")
+        started[name].set()
+        if name in unrenderable:
+            raise RuntimeError(f"helm pull failed for {name}")
+        created = (
+            {Ref(kind="Deployment", namespace="config", name=name)}
+            if name in changed
+            else set()
+        )
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified=created,
+            removed=set(),
+            manifest_ids={ref: f"{name}-content" for ref in created},
+        )
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        calls.append("push")
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
+    if system_paths is not None:
+        monkeypatch.setattr(
+            change,
+            "_commit_changes",
+            lambda checkout, config_name: change.CommitChanges(
+                paths=frozenset(system_paths),
+                parent_config=PREDICTION_CONFIG.encode(),
+            ),
+        )
+
+    processor = ChangeProcessor(
+        outputs=ROLLOUT_OUTPUTS,
+        rollouts=[LINEAR_ROLLOUT],
+        detect_deployment=True,
+        deployment_detector=Detector(),
+        generate_while_waiting=True,
+    )
+    return processor, calls
+
+
+def _pushes(calls: list[str]) -> list[int]:
+    return [index for index, call in enumerate(calls) if call == "push"]
+
+
+def test_generating_while_waiting_generates_the_next_stage_during_the_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _waiting_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"platform-dev", "platform-prod", "observability"},
+        held_until={"platform-dev": "observability"},
+    )
+
+    events: list[ChangeProgress] = []
+    result = processor.process(
+        "https://github.com/acme/config.git", "deadbeef", None, progress=events.append
+    )
+
+    first_push, second_push = _pushes(calls)
+    # Stage two is generated after stage one has pushed, while it is waited for,
+    # and pushed only once stage one has been verified.
+    assert (
+        calls.index("generate:platform-dev")
+        < first_push
+        < calls.index("generate:platform-prod")
+        < calls.index("generate:observability")
+        < calls.index("verified:platform-dev")
+        < second_push
+    )
+    # What was generated ahead is pushed as it is, not generated again.
+    assert calls.count("generate:platform-prod") == 1
+    assert calls.count("generate:observability") == 1
+    assert "verified:observability" in calls
+    ahead = [event for event in events if event.phase == "generate-ahead"]
+    assert [event.message for event in ahead] == [
+        "generating stage 2 of 2 while stage 1 of 2 is verified"
+    ]
+    assert [
+        (output.name, output.rollout, output.stage) for output in result.outputs
+    ] == [
+        ("platform-dev", "linear", 1),
+        ("platform-prod", "linear", 2),
+        ("observability", "linear", 2),
+    ]
+
+
+def test_generating_while_waiting_pushes_the_predicted_outputs_of_a_stage_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _waiting_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"observability"},
+        system_paths={"observability/values.yaml"},
+    )
+
+    events: list[ChangeProgress] = []
+    processor.process(
+        "https://github.com/acme/system.git",
+        "deadbeef",
+        None,
+        system=True,
+        progress=events.append,
+    )
+
+    (push,) = _pushes(calls)
+    # observability is configured after platform-prod, and is still generated
+    # and pushed before it.
+    assert (
+        calls.index("generate:platform-dev")
+        < calls.index("generate:observability")
+        < push
+        < calls.index("generate:platform-prod")
+    )
+    predicted = [event for event in events if event.phase == "predicted-outputs"]
+    assert [(event.message, event.detail) for event in predicted] == [
+        (
+            "expecting changes in observability, so their stages generate them first",
+            {"outputs": ["observability"]},
+        )
+    ]
+
+
+def test_generating_while_waiting_pushes_an_output_the_prediction_missed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _waiting_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"observability", "platform-prod"},
+        system_paths={"observability/values.yaml"},
+    )
+
+    events: list[ChangeProgress] = []
+    result = processor.process(
+        "https://github.com/acme/system.git",
+        "deadbeef",
+        None,
+        system=True,
+        progress=events.append,
+    )
+
+    first_push, second_push = _pushes(calls)
+    assert (
+        calls.index("generate:observability")
+        < first_push
+        < calls.index("generate:platform-prod")
+        < second_push
+    )
+    assert {"verified:observability", "verified:platform-prod"} <= set(calls)
+    verified = [event for event in events if event.phase == "rollout-stage-verified"]
+    assert verified[-1].detail["outputs"] == ["platform-prod", "observability"]
+    assert [output.name for output in result.outputs] == [
+        "platform-dev",
+        "platform-prod",
+        "observability",
+    ]
+
+
+def test_generating_while_waiting_never_pushes_the_stage_after_a_failed_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _waiting_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"platform-dev", "platform-prod", "observability"},
+        failing=frozenset({"platform-dev"}),
+        held_until={"platform-dev": "platform-prod"},
+    )
+
+    with pytest.raises(
+        RolloutStageError,
+        match="deployment in cluster platform-dev was not observed: "
+        "platform-dev never reached the cluster",
+    ):
+        processor.process("https://github.com/acme/config.git", "deadbeef", None)
+
+    # Stage two had been generated ahead by the time the wait failed.
+    assert "generate:platform-prod" in calls
+    assert len(_pushes(calls)) == 1
+
+
+def test_generating_while_waiting_raises_a_failure_ahead_once_the_stage_is_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _waiting_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"platform-dev", "platform-prod", "observability"},
+        unrenderable=frozenset({"platform-prod"}),
+        held_until={"platform-dev": "platform-prod"},
+    )
+
+    events: list[ChangeProgress] = []
+    with pytest.raises(
+        ChangeProcessingError, match="helm pull failed for platform-prod"
+    ):
+        processor.process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+            None,
+            progress=events.append,
+        )
+
+    assert calls.index("generate:platform-prod") < calls.index("verified:platform-dev")
+    assert len(_pushes(calls)) == 1
+    # Stage one is reported verified and stage two started before the failure
+    # surfaces, as it would have had stage two been generated only then.
+    assert [event.phase for event in events][-2:] == [
+        "rollout-stage-verified",
+        "rollout-stage",
+    ]
+
+
+def test_generating_while_waiting_keeps_a_predicted_push_when_the_rest_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stage's predicted part is pushed before the rest is generated.
+
+    A failure generating the rest therefore leaves that part pushed, as a
+    deployment that is not observed leaves its stage pushed, where a stage
+    generated whole would have pushed none of it.
+    """
+    processor, calls = _waiting_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"observability"},
+        system_paths={"observability/values.yaml"},
+        unrenderable=frozenset({"platform-prod"}),
+    )
+
+    with pytest.raises(
+        ChangeProcessingError, match="helm pull failed for platform-prod"
+    ):
+        processor.process(
+            "https://github.com/acme/system.git", "deadbeef", None, system=True
+        )
+
+    (push,) = _pushes(calls)
+    assert calls.index("generate:observability") < push
+    assert push < calls.index("generate:platform-prod")
+
+
+def test_generating_while_waiting_keeps_configured_order_without_a_prediction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    processor, calls = _waiting_change_processor(
+        tmp_path, monkeypatch, changed={"observability"}
+    )
+
+    def unreadable_commit(checkout: Path, config_name: str) -> None:
+        raise RuntimeError("cannot read the commit")
+
+    monkeypatch.setattr(change, "_commit_changes", unreadable_commit)
+
+    events: list[ChangeProgress] = []
+    with caplog.at_level(logging.WARNING, logger="relcoord.change"):
+        processor.process(
+            "https://github.com/acme/system.git",
+            "deadbeef",
+            None,
+            system=True,
+            progress=events.append,
+        )
+
+    assert calls == [
+        "clone",
+        "generate:platform-dev",
+        "generate:platform-prod",
+        "generate:observability",
+        "push",
+        "wait:observability",
+        "verified:observability",
+    ]
+    assert "predicted-outputs" not in {event.phase for event in events}
+    assert "could not tell which outputs the commit affects" in caplog.text
+
+
+# A system config whose three targets share base: platform-dev and platform-prod
+# are both built from platform, and observability from a section of its own.
+PREDICTION_CONFIG = """\
+version = 2
+
+[[target]]
+name = "platform-dev"
+sections = ["base", "platform"]
+
+[[target]]
+name = "platform-prod"
+sections = ["base", "platform"]
+
+[[target]]
+name = "observability"
+sections = ["base", "observability"]
+"""
+
+EVERY_ROLLOUT_OUTPUT = frozenset({"platform-dev", "platform-prod", "observability"})
+
+
+def _predict(
+    tmp_path: Path,
+    paths: set[str],
+    *,
+    config: str = PREDICTION_CONFIG,
+    parent_config: bytes | None = PREDICTION_CONFIG.encode(),
+) -> frozenset[str] | None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(config)
+    return change._predicted_outputs(
+        config_file,
+        change.CommitChanges(paths=frozenset(paths), parent_config=parent_config),
+        ROLLOUT_OUTPUTS,
+    )
+
+
+@pytest.mark.parametrize(
+    ("paths", "predicted"),
+    [
+        ({"observability/values.yaml"}, {"observability"}),
+        ({"platform/relcoord/relcoord.toml"}, {"platform-dev", "platform-prod"}),
+        ({"observability/a.yaml", "observability/b.yaml"}, {"observability"}),
+        ({"base/argocd/values.yaml"}, EVERY_ROLLOUT_OUTPUT),
+        # Nothing places these in a section, so any target may read them.
+        ({"images.toml"}, EVERY_ROLLOUT_OUTPUT),
+        ({"plugins/simple.py"}, EVERY_ROLLOUT_OUTPUT),
+        ({"observability/a.yaml", "README.md"}, EVERY_ROLLOUT_OUTPUT),
+        (set(), set()),
+    ],
+    ids=[
+        "own-section",
+        "shared-section",
+        "two-files",
+        "base",
+        "top-level-file",
+        "plugins",
+        "one-unplaced-path",
+        "nothing",
+    ],
+)
+def test_predicted_outputs_follow_the_sections_a_commit_touches(
+    tmp_path: Path, paths: set[str], predicted: set[str]
+) -> None:
+    assert _predict(tmp_path, paths) == predicted
+
+
+def test_predicted_outputs_follow_the_target_entries_a_config_change_touches(
+    tmp_path: Path,
+) -> None:
+    config = PREDICTION_CONFIG.replace(
+        'sections = ["base", "observability"]',
+        'sections = ["base", "observability"]\nvars = { replicas = 2 }',
+    )
+
+    assert _predict(tmp_path, {"config.toml"}, config=config) == {"observability"}
+
+
+@pytest.mark.parametrize(
+    "parent_config",
+    [None, b"version = 1\n", b"not toml ["],
+    ids=["new-file", "other-version", "unreadable"],
+)
+def test_predicted_outputs_are_every_output_when_more_than_targets_changed(
+    tmp_path: Path, parent_config: bytes | None
+) -> None:
+    predicted = _predict(tmp_path, {"config.toml"}, parent_config=parent_config)
+
+    assert predicted == EVERY_ROLLOUT_OUTPUT
+
+
+def test_predicted_outputs_need_a_config_that_declares_targets(tmp_path: Path) -> None:
+    assert _predict(tmp_path, {"observability/a.yaml"}, config="version = 1\n") is None
+
+
+def test_commit_changes_read_the_paths_and_the_parent_config(tmp_path: Path) -> None:
+    source = tmp_path / "system"
+    repo = porcelain.init(source)
+    try:
+        (source / "base").mkdir()
+        (source / "config.toml").write_text("version = 2\n")
+        (source / "base" / "values.yaml").write_text("replicas: 1\n")
+        porcelain.add(repo, [b"config.toml", b"base/values.yaml"])
+        _commit(repo, b"first")
+
+        (source / "observability").mkdir()
+        (source / "observability" / "values.yaml").write_text("replicas: 1\n")
+        (source / "config.toml").write_text("version = 2\n# observability\n")
+        porcelain.add(repo, [b"observability/values.yaml", b"config.toml"])
+        porcelain.remove(repo, paths=[b"base/values.yaml"])
+        _commit(repo, b"second")
+    finally:
+        repo.close()
+
+    assert change._commit_changes(source, "config.toml") == change.CommitChanges(
+        paths=frozenset(
+            {"config.toml", "observability/values.yaml", "base/values.yaml"}
+        ),
+        parent_config=b"version = 2\n",
+    )
+
+
+def test_commit_changes_have_no_parent_config_where_the_parent_had_none(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "system"
+    repo = porcelain.init(source)
+    try:
+        (source / "README.md").write_text("system\n")
+        porcelain.add(repo, [b"README.md"])
+        _commit(repo, b"first")
+        (source / "config.toml").write_text("version = 2\n")
+        porcelain.add(repo, [b"config.toml"])
+        _commit(repo, b"second")
+    finally:
+        repo.close()
+
+    changes = change._commit_changes(source, "config.toml")
+
+    assert changes == change.CommitChanges(
+        paths=frozenset({"config.toml"}), parent_config=None
+    )
+
+
+def test_commit_changes_have_nothing_to_compare_a_root_commit_with(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "system"
+    repo = porcelain.init(source)
+    try:
+        (source / "config.toml").write_text("version = 2\n")
+        porcelain.add(repo, [b"config.toml"])
+        _commit(repo, b"first")
+    finally:
+        repo.close()
+
+    assert change._commit_changes(source, "config.toml") is None
