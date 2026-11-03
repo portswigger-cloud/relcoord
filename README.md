@@ -328,8 +328,8 @@ The stream carries four kinds of event:
 - `progress` — one per step, with a stable `phase` (`source-checkout`,
   `deploy-config`, `system-checkout`, `rollout-stage`, `manifests-checkout`,
   `generate`, `generated`, `changed-objects`, `no-changes`, `push`,
-  `pushed`, `deployment-detection`, `rollout-stage-verified`, and with
-  `generate-while-waiting` also `predicted-outputs` and `generate-ahead`),
+  `rebased`, `pushed`, `deployment-detection`, `rollout-stage-verified`, and
+  with `generate-while-waiting` also `predicted-outputs` and `generate-ahead`),
   a human readable `message`, and a `detail` object with specifics of the step.
   The validation phases (`validate`, `running`, `validated`, `validation-failed`,
   `validation-error`, `no-validation`) come back with validation on a change.
@@ -379,6 +379,16 @@ repositories ahead of it pushed. When several fail, the error reported is that
 of the first in configured order, not of whichever failed first. With
 `generate-while-waiting`, a stage is pushed in up to two parts instead, each
 generated whole first; see "Generating while a stage waits" below.
+
+Changes from different config repositories can push to one manifests repository
+at the same time: nothing queues them across repositories, and each change
+clones the manifests repository once, when it starts. A stage whose push finds
+the branch moved since then fetches it, rebases its commits onto it, reports
+`rebased`, and pushes again, up to three times. Each config repository
+generates into directories of its own, so the rebase has nothing to merge, and
+a stage that does conflict fails without pushing. A push the remote refuses
+while the branch has not moved fails the change with the remote's reason,
+since rebasing cannot help it.
 
 A diff sends each output's tree to the validator as soon as that output is
 generated, on a pool of up to `max-concurrency` requests, and goes on to the

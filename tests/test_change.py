@@ -11,6 +11,10 @@ from pathlib import Path
 import pytest
 from dulwich import porcelain
 from dulwich.errors import NotGitRepository
+from dulwich.object_store import iter_tree_contents
+from dulwich.objects import Commit
+from dulwich.refs import HEADREF
+from dulwich.refs import Ref as GitRef
 from dulwich.repo import Repo
 from manifest_builder import ExternalPlugins
 
@@ -2510,6 +2514,275 @@ def test_change_reports_a_system_repository_that_cannot_resolve_a_section(
             None,
             section="frontend",
         )
+
+
+def _commit_files(checkout: Path, files: Mapping[str, str], message: bytes) -> bytes:
+    for name, text in files.items():
+        path = checkout / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    repo = Repo(str(checkout))
+    try:
+        porcelain.add(repo, [name.encode() for name in files])
+        return _commit(repo, message)
+    finally:
+        repo.close()
+
+
+class _Manifests:
+    """A manifests repository, a change's checkout of it, and another writer.
+
+    The remote stands in for GitHub, and the checkout is cloned the way a change
+    clones it, shallow. ``land`` pushes a commit from a clone of the writer's
+    own, which is what another config repository deploying meanwhile does.
+    """
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.remote = tmp_path / "manifests.git"
+        porcelain.init(str(self.remote), bare=True).close()
+        seed = tmp_path / "seed"
+        porcelain.init(str(seed)).close()
+        _commit_files(
+            seed,
+            {
+                "observability-prod/base.yaml": "kind: Base\n",
+                "observability-prod/shared.yaml": "replicas: 1\n",
+            },
+            b"base",
+        )
+        seed_repo = Repo(str(seed))
+        try:
+            (_, branch), _ = seed_repo.refs.follow(HEADREF)
+        finally:
+            seed_repo.close()
+        porcelain.push(
+            str(seed),
+            str(self.remote),
+            branch + b":refs/heads/main",
+            errstream=BytesIO(),
+        )
+        remote = Repo(str(self.remote))
+        try:
+            remote.refs.set_symbolic_ref(HEADREF, MAIN)
+            self.base = remote.refs[MAIN]
+        finally:
+            remote.close()
+        self.checkout = tmp_path / "checkout"
+        change._clone_repository(
+            str(self.remote), self.checkout, None, purpose="cloning", depth="1"
+        )
+        self.writer = tmp_path / "writer"
+        porcelain.clone(str(self.remote), str(self.writer), branch=b"main").close()
+        self.push = porcelain.push
+
+    def land(self, files: Mapping[str, str], message: bytes) -> bytes:
+        porcelain.pull(str(self.writer), str(self.remote), errstream=BytesIO())
+        commit = _commit_files(self.writer, files, message)
+        self.push(
+            str(self.writer),
+            str(self.remote),
+            b"refs/heads/main:refs/heads/main",
+            errstream=BytesIO(),
+        )
+        return commit
+
+    def tip(self) -> Commit:
+        remote = Repo(str(self.remote))
+        try:
+            commit = remote[remote.refs[MAIN]]
+        finally:
+            remote.close()
+        assert isinstance(commit, Commit)
+        return commit
+
+    def files(self) -> set[str]:
+        tree = self.tip().tree
+        remote = Repo(str(self.remote))
+        try:
+            return {
+                entry.path.decode()
+                for entry in iter_tree_contents(remote.object_store, tree)
+                if entry.path is not None
+            }
+        finally:
+            remote.close()
+
+
+MAIN = GitRef(b"refs/heads/main")
+
+
+def _push_stage(
+    manifests: _Manifests, events: list[ChangeProgress] | None = None
+) -> list[ChangeProgress]:
+    """Push the checkout as a stage does, recording what it reports in ``events``."""
+    if events is None:
+        events = []
+
+    def report(phase: str, message: str, **detail) -> None:
+        events.append(ChangeProgress(phase=phase, message=message, detail=detail))
+
+    ChangeProcessor()._push_manifests(
+        str(manifests.remote),
+        manifests.checkout,
+        "https://github.com/acme/system.git",
+        "deadbeef",
+        report,
+    )
+    return events
+
+
+def test_push_rebases_onto_a_branch_another_change_moved(tmp_path: Path) -> None:
+    manifests = _Manifests(tmp_path)
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/system/configmap.yaml": "kind: ConfigMap\n"},
+        b"system",
+    )
+    theirs = manifests.land(
+        {"observability-prod/grafana/dashboard.yaml": "kind: Dashboard\n"},
+        b"grafana",
+    )
+
+    events = _push_stage(manifests)
+
+    tip = manifests.tip()
+    assert tip.message.strip() == b"system"
+    assert tip.parents == [theirs]
+    assert manifests.files() == {
+        "observability-prod/base.yaml",
+        "observability-prod/shared.yaml",
+        "observability-prod/system/configmap.yaml",
+        "observability-prod/grafana/dashboard.yaml",
+    }
+    assert [event.phase for event in events] == ["push", "rebased", "push", "pushed"]
+    assert events[1].detail["upstream"] == theirs.decode()
+    # What was pushed, and what a deployment is then waited for at, is the
+    # rebased commit, not the one the checkout first made.
+    assert events[-1].detail["manifest_commit"] == tip.id.decode()
+
+
+def test_push_retries_an_update_refused_while_another_push_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The remote took another push between dulwich reading the branch and ours.
+
+    dulwich reports that refusal only on its error stream, which is how a push
+    used to be logged as pushed while the remote never took it.
+    """
+    manifests = _Manifests(tmp_path)
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/system/configmap.yaml": "kind: ConfigMap\n"},
+        b"system",
+    )
+    landed: list[bytes] = []
+
+    def racing_push(repo_path, remote, *args, **kwargs):
+        if not landed:
+            landed.append(
+                manifests.land(
+                    {"observability-prod/grafana/dashboard.yaml": "kind: Dashboard\n"},
+                    b"grafana",
+                )
+            )
+            return type(
+                "Result", (), {"ref_status": {b"refs/heads/main": "fetch first"}}
+            )
+        return manifests.push(repo_path, remote, *args, **kwargs)
+
+    monkeypatch.setattr(change.porcelain, "push", racing_push)
+
+    events = _push_stage(manifests)
+
+    assert manifests.tip().parents == landed
+    assert [event.phase for event in events] == ["push", "rebased", "push", "pushed"]
+
+
+def test_push_fails_when_the_remote_refuses_an_unmoved_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifests = _Manifests(tmp_path)
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/system/configmap.yaml": "kind: ConfigMap\n"},
+        b"system",
+    )
+    monkeypatch.setattr(
+        change.porcelain,
+        "push",
+        lambda *args, **kwargs: type(
+            "Result",
+            (),
+            {"ref_status": {b"refs/heads/main": "protected branch hook declined"}},
+        ),
+    )
+
+    with pytest.raises(
+        change.PushRefusedError,
+        match="refs/heads/main: protected branch hook declined",
+    ):
+        _push_stage(manifests)
+
+    assert manifests.tip().id == manifests.base
+
+
+def test_push_fails_without_pushing_when_the_moved_branch_conflicts(
+    tmp_path: Path,
+) -> None:
+    manifests = _Manifests(tmp_path)
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/shared.yaml": "replicas: 2\n"},
+        b"system",
+    )
+    theirs = manifests.land(
+        {"observability-prod/shared.yaml": "replicas: 3\n"}, b"other"
+    )
+
+    with pytest.raises(change.PushRefusedError, match="do not rebase onto it"):
+        _push_stage(manifests)
+
+    assert manifests.tip().id == theirs
+
+
+def test_push_gives_up_when_the_branch_keeps_moving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifests = _Manifests(tmp_path)
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/system/configmap.yaml": "kind: ConfigMap\n"},
+        b"system",
+    )
+    landed: list[bytes] = []
+
+    def always_beaten(repo_path, remote, *args, **kwargs):
+        # Another push lands just before each of ours.
+        landed.append(
+            manifests.land(
+                {
+                    f"observability-prod/grafana/dashboard-{len(landed)}.yaml": "kind: X\n"
+                },
+                b"grafana",
+            )
+        )
+        return manifests.push(repo_path, remote, *args, **kwargs)
+
+    monkeypatch.setattr(change.porcelain, "push", always_beaten)
+    events: list[ChangeProgress] = []
+
+    with pytest.raises(change.PushRefusedError, match="moved again on each of 3"):
+        _push_stage(manifests, events)
+
+    assert len(landed) == change.PUSH_ATTEMPTS
+    assert manifests.tip().id == landed[-1]
+    assert [event.phase for event in events] == [
+        "push",
+        "rebased",
+        "push",
+        "rebased",
+        "push",
+    ]
 
 
 def _waiting_change_processor(
