@@ -3276,3 +3276,119 @@ def test_commit_changes_have_nothing_to_compare_a_root_commit_with(
         repo.close()
 
     assert change._commit_changes(source, "config.toml") is None
+
+
+def _history(manifests: _Manifests) -> list[bytes]:
+    """The remote branch's commit messages, newest first, down to the base."""
+    remote = Repo(str(manifests.remote))
+    try:
+        messages = []
+        commit = remote[remote.refs[MAIN]]
+        while isinstance(commit, Commit):
+            messages.append(commit.message.strip())
+            if not commit.parents:
+                break
+            commit = remote[commit.parents[0]]
+        return messages
+    finally:
+        remote.close()
+
+
+def test_push_rebases_only_the_stage_a_moved_branch_refused(tmp_path: Path) -> None:
+    """A stage that pushed is not replayed when a later stage's push is refused.
+
+    This is how it happened on 3 Nov (system#809): stage one pushed, another
+    config repository pushed on top of it, and stage two's push was refused.
+    """
+    manifests = _Manifests(tmp_path)
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/system/stage-1.yaml": "stage: 1\n"},
+        b"stage 1",
+    )
+    _push_stage(manifests)
+    manifests.land(
+        {"observability-prod/grafana/dashboard.yaml": "kind: Dashboard\n"},
+        b"grafana",
+    )
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/system/stage-2.yaml": "stage: 2\n"},
+        b"stage 2",
+    )
+
+    events = _push_stage(manifests)
+
+    assert _history(manifests) == [b"stage 2", b"grafana", b"stage 1", b"base"]
+    assert [event.phase for event in events] == ["push", "rebased", "push", "pushed"]
+
+
+def test_push_records_the_commit_the_remote_now_has(tmp_path: Path) -> None:
+    manifests = _Manifests(tmp_path)
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/system/configmap.yaml": "kind: ConfigMap\n"},
+        b"system",
+    )
+
+    _push_stage(manifests)
+
+    assert change._pushed_commit(manifests.checkout) == manifests.tip().id.decode()
+
+
+def test_push_fetches_a_moved_branch_shallow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fetch is as shallow as the clone.
+
+    Fetched without a depth into a shallow repository, GitHub's response gave
+    dulwich the refs but no commits, and the rebase then found no such commit.
+    A local remote does not reproduce that, so this holds the fetch to what does.
+    """
+    manifests = _Manifests(tmp_path)
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/system/configmap.yaml": "kind: ConfigMap\n"},
+        b"system",
+    )
+    manifests.land(
+        {"observability-prod/grafana/dashboard.yaml": "kind: Dashboard\n"},
+        b"grafana",
+    )
+    fetched: list[dict] = []
+    real_fetch = porcelain.fetch
+
+    def recording_fetch(*args, **kwargs):
+        fetched.append(kwargs)
+        return real_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(change.porcelain, "fetch", recording_fetch)
+
+    _push_stage(manifests)
+
+    assert [kwargs.get("depth") for kwargs in fetched] == [1]
+
+
+def test_push_names_a_commit_the_rebase_could_not_find(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifests = _Manifests(tmp_path)
+    _commit_files(
+        manifests.checkout,
+        {"observability-prod/system/configmap.yaml": "kind: ConfigMap\n"},
+        b"system",
+    )
+    manifests.land(
+        {"observability-prod/grafana/dashboard.yaml": "kind: Dashboard\n"},
+        b"grafana",
+    )
+
+    def missing_commit(target: Path, upstream: str, base: str | None = None) -> int:
+        raise KeyError(upstream.encode())
+
+    monkeypatch.setattr(change, "_rebase_onto", missing_commit)
+
+    with pytest.raises(
+        change.PushRefusedError, match="needed a commit the checkout does not have"
+    ):
+        _push_stage(manifests)
