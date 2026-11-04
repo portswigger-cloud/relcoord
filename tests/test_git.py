@@ -9,6 +9,7 @@ import pytest
 from dulwich import porcelain
 from dulwich.client import HTTPUnauthorized
 from dulwich.config import StackedConfig
+from dulwich.errors import GitProtocolError, NotGitRepository
 
 from relcoord.config import IdcatSettings
 from relcoord.git import (
@@ -435,3 +436,69 @@ def test_installation_token_url_preserves_idcat_base_path(tmp_path: Path) -> Non
         )
         == "https://idcat.example.test/base/installation-token/deployments/acme/api"
     )
+
+
+def _no_credentials() -> GitCredentials:
+    return GitCredentials()
+
+
+def test_transient_failure_is_retried_with_increasing_delays() -> None:
+    """A remote 500 is retried at once, then after 5, 10 and 20 seconds."""
+    attempts = 0
+
+    def operation(credentials: GitCredentials) -> str:
+        nonlocal attempts
+        attempts += 1
+        raise GitProtocolError(
+            "unexpected http resp 500 for https://x/git-receive-pack"
+        )
+
+    with (
+        patch("relcoord.git.time.sleep") as sleep,
+        pytest.raises(GitProtocolError, match="resp 500"),
+    ):
+        with_fresh_token_on_unauthorized(
+            "https://github.com/acme/api.git",
+            None,
+            operation,
+            credentials=_no_credentials,
+        )
+
+    assert attempts == 5
+    assert [call.args[0] for call in sleep.call_args_list] == [5.0, 10.0, 20.0]
+
+
+def test_transient_failure_that_clears_returns_the_result() -> None:
+    results: list[object] = [GitProtocolError("unexpected http resp 500"), "done"]
+
+    def operation(credentials: GitCredentials) -> str:
+        result = results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return str(result)
+
+    with patch("relcoord.git.time.sleep") as sleep:
+        result = with_fresh_token_on_unauthorized(
+            "https://github.com/acme/api.git",
+            None,
+            operation,
+            credentials=_no_credentials,
+        )
+
+    assert result == "done"
+    sleep.assert_not_called()
+
+
+def test_non_transient_failure_is_not_retried() -> None:
+    operation = MagicMock(side_effect=NotGitRepository())
+
+    with patch("relcoord.git.time.sleep") as sleep, pytest.raises(NotGitRepository):
+        with_fresh_token_on_unauthorized(
+            "https://github.com/acme/api.git",
+            None,
+            operation,
+            credentials=_no_credentials,
+        )
+
+    operation.assert_called_once()
+    sleep.assert_not_called()
