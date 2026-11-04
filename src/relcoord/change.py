@@ -33,6 +33,7 @@ from manifest_builder import (
 )
 from manifest_builder.config import (
     TARGETS_VERSION,
+    Target,
     config_version,
     find_config_file,
     load_toml_file,
@@ -2373,11 +2374,22 @@ def _section_outputs(
     target added to the system repository later reaches it without the
     repository being told.
     """
-    names = _section_targets(system_checkout, section)
-    return _selected_outputs(outputs, names, False, configured=configured)
+    targets = _section_targets(system_checkout, section)
+    selected = _selected_outputs(
+        outputs, tuple(target.name for target in targets), False, configured=configured
+    )
+    # The system repository's targets carry the variables their sections are
+    # rendered with, and the section's repository has none of its own, so each
+    # output starts from its target's variables. What the output configures
+    # itself still wins.
+    variables = {target.name: target.variables for target in targets}
+    return tuple(
+        replace(output, vars={**variables[output.target_name], **output.vars})
+        for output in selected
+    )
 
 
-def _section_targets(system_checkout: Path, section: str) -> tuple[str, ...]:
+def _section_targets(system_checkout: Path, section: str) -> tuple[Target, ...]:
     try:
         config_file = find_config_file(system_checkout)
         data = load_toml_file(config_file)
@@ -2392,14 +2404,14 @@ def _section_targets(system_checkout: Path, section: str) -> tuple[str, ...]:
         raise SystemRepositoryError(
             f"cannot read the targets of the system repo: {exc}"
         ) from exc
-    names = tuple(target.name for target in targets if section in target.sections)
-    if not names:
+    built = tuple(target for target in targets if section in target.sections)
+    if not built:
         known = sorted({name for target in targets for name in target.sections})
         raise ChangeProcessingError(
             f"no target of the system repo is built from section '{section}'; "
             f"known sections: {', '.join(known)}"
         )
-    return names
+    return built
 
 
 @dataclass(frozen=True)

@@ -2404,6 +2404,42 @@ def test_change_deploys_a_section_to_the_targets_the_system_repository_builds_it
     assert sorted(generated) == sorted(expected)
 
 
+def test_change_with_a_section_generates_with_the_vars_of_the_system_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_config = (
+        'version = 2\n\n[[target]]\nname = "fe-dev"\nsections = ["frontend"]\n'
+        '\n[target.vars]\naccount_id = 111122223333\ncluster = "from-target"\n'
+    )
+    _section_change_fakes(tmp_path, monkeypatch, system_config=system_config)
+    seen: list[object] = []
+
+    def recording_generate(
+        deploy_config: Path, output_path: Path, **kwargs: object
+    ) -> GenerationResult:
+        seen.append(kwargs["vars"])
+        return GenerationResult(
+            written_paths=set(), created_or_modified=set(), removed=set()
+        )
+
+    monkeypatch.setattr(change, "generate", recording_generate)
+    output = OutputSettings(
+        name="fe-dev",
+        repository="https://github.com/acme/manifests.git",
+        directory=Path("fe-dev"),
+        vars={"cluster": "from-output"},
+    )
+
+    ChangeProcessor(outputs=[output], system_repository=SYSTEM_REPO).process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        None,
+        section="frontend",
+    )
+
+    assert seen == [{"account_id": 111122223333, "cluster": "from-output"}]
+
+
 def test_change_fails_on_a_section_no_target_is_built_from(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
