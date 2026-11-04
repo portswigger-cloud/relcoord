@@ -2240,7 +2240,7 @@ def _change_stages(
     """
     if selected is None:
         selected = outputs
-    selected_names = {output.name for output in selected}
+    selected_by_name = {output.name: output for output in selected}
     if not rollouts:
         return (ChangeStage(outputs=tuple(selected)),)
     by_name = {output.name: output for output in outputs}
@@ -2255,10 +2255,12 @@ def _change_stages(
                 )
             stages.append(
                 ChangeStage(
+                    # The selected output, not the configured one: a section
+                    # change carries its target's variables on the former only.
                     outputs=tuple(
-                        by_name[name]
+                        selected_by_name[name]
                         for name in stage.outputs
-                        if name in selected_names
+                        if name in selected_by_name
                     ),
                     rollout=rollout.name,
                     index=index,

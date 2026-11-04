@@ -2404,8 +2404,9 @@ def test_change_deploys_a_section_to_the_targets_the_system_repository_builds_it
     assert sorted(generated) == sorted(expected)
 
 
+@pytest.mark.parametrize("with_rollout", [False, True])
 def test_change_with_a_section_generates_with_the_vars_of_the_system_target(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_rollout: bool
 ) -> None:
     system_config = (
         'version = 2\n\n[[target]]\nname = "fe-dev"\nsections = ["frontend"]\n'
@@ -2430,7 +2431,15 @@ def test_change_with_a_section_generates_with_the_vars_of_the_system_target(
         vars={"cluster": "from-output"},
     )
 
-    ChangeProcessor(outputs=[output], system_repository=SYSTEM_REPO).process(
+    rollouts = (
+        [RolloutSettings(name="r", stages=(RolloutStage(outputs=("fe-dev",)),))]
+        if with_rollout
+        else []
+    )
+
+    ChangeProcessor(
+        outputs=[output], rollouts=rollouts, system_repository=SYSTEM_REPO
+    ).process(
         "https://github.com/acme/config.git",
         "deadbeef",
         None,
