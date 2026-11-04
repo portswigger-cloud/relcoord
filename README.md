@@ -164,7 +164,8 @@ sections = ["frontend"]
 ```
 
 The config directory of such a repository declares config blocks directly, since
-the section is what picks the targets, and each output is generated with its
+the section is what picks the targets, and each output is generated with the
+`vars` of its system repository `[[target]]`, overridden by the output's own
 configured `vars`. These are refused: a `section` no target builds, a target of
 the section that no output is configured for, a repository that also declares
 targets of its own, a `section` without a `system-repository`, and a `section`
