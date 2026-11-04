@@ -15,8 +15,10 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import httpx
+import urllib3.exceptions
 from dulwich import porcelain
 from dulwich.client import HTTPUnauthorized
+from dulwich.errors import GitProtocolError
 
 from relcoord.config import IdcatSettings
 
@@ -30,6 +32,22 @@ GITHUB_TOKEN_USERNAME = "x-access-token"
 # GitHub's real expiry and clones fail with "No valid credentials provided".
 # with_fresh_token_on_unauthorized backstops that by refetching once on refusal.
 INSTALLATION_TOKEN_TTL_SECONDS = 3300.0
+
+# Pauses before each retry of a git operation that failed for a reason on the
+# remote's side or in the network. The first attempt is made immediately, so
+# this makes up to len(...) + 1 attempts: one straight away, an immediate retry,
+# then after 5, 10 and 20 seconds.
+TRANSIENT_RETRY_DELAYS_SECONDS = (0.0, 5.0, 10.0, 20.0)
+
+# What dulwich raises for a remote that answers 5xx ("unexpected http resp
+# 500"), hangs up mid-conversation, or cannot be reached. Rejected credentials
+# (HTTPUnauthorized) and a missing repository (NotGitRepository) are not here:
+# trying again cannot change those.
+TRANSIENT_GIT_EXCEPTIONS = (
+    GitProtocolError,
+    OSError,
+    urllib3.exceptions.HTTPError,
+)
 
 _SCP_STYLE_GIT_URI = re.compile(r"(?:[^@/:]+@)?([^/:]+):(.+)")
 _SSH_STYLE_SCHEMES = {"ssh", "git+ssh"}
@@ -155,7 +173,7 @@ def with_fresh_token_on_unauthorized[T](
     unauthorized repository still fails fast.
     """
     try:
-        return operation(credentials())
+        return _retry_transient(source, lambda: operation(credentials()))
     except HTTPUnauthorized:
         if not invalidate_installation_token(source, idcat):
             raise
@@ -164,7 +182,32 @@ def with_fresh_token_on_unauthorized[T](
             "refetching and retrying once",
             source,
         )
-        return operation(credentials())
+        return _retry_transient(source, lambda: operation(credentials()))
+
+
+def _retry_transient[T](source: str, attempt: Callable[[], T]) -> T:
+    """Call attempt, retrying after a pause when the remote or network fails.
+
+    Tries once straight away and then again after each of
+    TRANSIENT_RETRY_DELAYS_SECONDS; the last failure propagates. A zero delay
+    retries without sleeping.
+    """
+    delays = iter(TRANSIENT_RETRY_DELAYS_SECONDS)
+    while True:
+        try:
+            return attempt()
+        except TRANSIENT_GIT_EXCEPTIONS as exc:
+            delay = next(delays, None)
+            if delay is None:
+                raise
+            logger.warning(
+                "git operation on %s failed (%s); retrying in %.0f seconds",
+                source,
+                exc,
+                delay,
+            )
+            if delay > 0:
+                time.sleep(delay)
 
 
 def clone_repository(
