@@ -717,7 +717,7 @@ wheels = [
 
 [[package]]
 name = "manifest-builder"
-version = "0.9.0"
+version = "0.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -725,11 +725,11 @@ dependencies = [
     { name = "pystache" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c7/8c/00318a532ceb1eff2eb5233a04a528d94aacecebad9ac06353965869e3f9/manifest_builder-0.9.0.tar.gz", hash = "sha256:50f3552c5931d2b3131a777559f1093ec815e098617de8806716c24a105bded6", size = 55118, upload-time = "2026-10-22T14:25:16.581Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/f9/1b658d16322871f4d8c9633aaa404f8d4ead2202c4ffa0ce7324cbced9e9/manifest_builder-0.9.1.tar.gz", hash = "sha256:4fce1a2ea09c646251439787722a02a81eaf8540dc352707f7a8e9bd53fd86a6", size = 56184, upload-time = "2026-11-03T16:55:01.862Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/09/f3/55465d65ec8f12ef4e47ee04794b775a330d67f4762d9b552706de93b77a/manifest_builder-0.9.0-cp314-abi3-macosx_11_0_arm64.whl", hash = "sha256:b6de88dae2783339c83e603ae50f14bf7cb4ca3591ca6b59fc6c5b3f91e51864", size = 829477, upload-time = "2026-10-22T14:25:11.727Z" },
-    { url = "https://files.pythonhosted.org/packages/82/13/0b9a8b3f7aa0ee041e33af9d0eda012ba0027297bf68d735df0a6d30f872/manifest_builder-0.9.0-cp314-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:4b2e554693204262338b51c7377f900a1ae77f1b719ae47fcb716867d756d902", size = 905648, upload-time = "2026-10-22T14:25:13.765Z" },
-    { url = "https://files.pythonhosted.org/packages/08/30/2fb16616f57d2ac780ebfa6c45dd870d437ef2f50d9c73d4be9702b510f7/manifest_builder-0.9.0-cp314-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:26fb6540635082eb28bc97d204fdb57eee0b0e8c2d9722a382ad9e2919f0cfd3", size = 935984, upload-time = "2026-10-22T14:25:15.422Z" },
+    { url = "https://files.pythonhosted.org/packages/df/f8/2b33344bfad96afaf467240ba7f7676dd5a3be268dab8d2bc4874be27216/manifest_builder-0.9.1-cp314-abi3-macosx_11_0_arm64.whl", hash = "sha256:3b0b46fe98cb5ed01a52bf291365af59069f0a059bb49aa9a95724253e1f38ad", size = 831405, upload-time = "2026-11-03T16:54:57.287Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/53/b30ec54b5b47c67632c9cf8da60d63e1f206d255b0e56193b2c7691a8cd4/manifest_builder-0.9.1-cp314-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:d4dff0ab856d5be6569a4975fa041e64157599da5e391bdc619b3a56884ab684", size = 909279, upload-time = "2026-11-03T16:54:59.017Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/4a/e52c61f782ca629228b29f64baeb0347e08290624635575b1e547dc5880a/manifest_builder-0.9.1-cp314-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:69e2f219a171b74974564d2fce89eb16f92d7bd165d85c72f9acb78972e84930", size = 939005, upload-time = "2026-11-03T16:55:00.638Z" },
 ]
 
 [[package]]
@@ -1309,7 +1309,7 @@ requires-dist = [
     { name = "dulwich", extras = ["merge"] },
     { name = "httpx" },
     { name = "hypercorn" },
-    { name = "manifest-builder", specifier = ">=0.9.0,<0.10", index = "https://pypi.org/simple" },
+    { name = "manifest-builder", specifier = ">=0.9.1,<0.10", index = "https://pypi.org/simple" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.45.1" },
     { name = "opentelemetry-instrumentation-asgi", specifier = ">=0.66b1" },
     { name = "opentelemetry-instrumentation-httpx", specifier = ">=0.66b1" },
