@@ -11,7 +11,11 @@ removed object is gone.
 Carrying the manifest-id only says that the write landed, not that it took effect.
 For the workload kinds that roll a write out — Deployments and StatefulSets — the
 wait goes further and holds until that rollout has finished; see
-``_deployment_rollout_progress`` and ``_statefulset_rollout_progress``.
+``_deployment_rollout_progress`` and ``_statefulset_rollout_progress``. A pod is
+only Ready in a meaningful sense when a readiness probe or ``minReadySeconds`` says
+so, so a rollout without either has to stay complete for a settle window before it
+counts; otherwise a container that crash loops is Ready for long enough, on every
+attempt, to look like a rollout that worked.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import math
 import random
 import ssl
 import time
@@ -56,6 +61,11 @@ DEFAULT_THROTTLE_ATTEMPTS = 10
 DEFAULT_THROTTLE_INITIAL_DELAY_SECONDS = 1.0
 DEFAULT_THROTTLE_BACKOFF_MULTIPLIER = 2.0
 DEFAULT_THROTTLE_MAX_DELAY_SECONDS = 30.0
+# How long a rollout that nothing vouches for has to stay complete before it
+# counts. Without a readiness probe a pod is Ready as soon as its containers are
+# running, which a crash looping container is for a moment on every attempt, so
+# a rollout that merely looked complete once says very little.
+DEFAULT_SETTLE_SECONDS = 10.0
 # The apps/v1 group, which serves the kinds that have a rollout to wait for.
 APPS_PATH_PREFIX = "/apis/apps/v1"
 DEPLOYMENTS_RESOURCE_NAME = "deployments"
@@ -107,6 +117,13 @@ class Progress:
 
     state: ProgressState
     detail: str
+    settle: bool = False
+    """Whether a complete verdict only counts once it has held for a while.
+
+    Set when the pods' readiness is nothing anyone vouches for, see
+    ``_readiness_is_vouched_for``. The detector decides how long that is, and
+    starts the clock over whenever the object stops looking complete.
+    """
 
 
 @dataclass(frozen=True)
@@ -121,12 +138,19 @@ def _pending(detail: str) -> Progress:
     return Progress(ProgressState.PENDING, detail)
 
 
-def _complete(detail: str = "") -> Progress:
-    return Progress(ProgressState.COMPLETE, detail)
+def _complete(detail: str = "", *, settle: bool = False) -> Progress:
+    return Progress(ProgressState.COMPLETE, detail, settle=settle)
 
 
 def _failed(detail: str) -> Progress:
     return Progress(ProgressState.FAILED, detail)
+
+
+class _Hold:
+    """When the object last started to look complete, or None while it does not."""
+
+    def __init__(self) -> None:
+        self.since: float | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +248,7 @@ class KubernetesDeploymentDetector:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         watch_timeout_seconds: float = WATCH_TIMEOUT_SECONDS,
         retry_delay_seconds: float = WATCH_RETRY_SECONDS,
+        settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         throttle_attempts: int = DEFAULT_THROTTLE_ATTEMPTS,
         throttle_initial_delay_seconds: float = DEFAULT_THROTTLE_INITIAL_DELAY_SECONDS,
         throttle_backoff_multiplier: float = DEFAULT_THROTTLE_BACKOFF_MULTIPLIER,
@@ -239,6 +264,7 @@ class KubernetesDeploymentDetector:
         self._timeout_seconds = timeout_seconds
         self._watch_timeout_seconds = watch_timeout_seconds
         self._retry_delay_seconds = retry_delay_seconds
+        self._settle_seconds = settle_seconds
         self._throttle_attempts = throttle_attempts
         self._throttle_initial_delay_seconds = throttle_initial_delay_seconds
         self._throttle_backoff_multiplier = throttle_backoff_multiplier
@@ -306,9 +332,10 @@ class KubernetesDeploymentDetector:
         deadline: float,
     ) -> None:
         began = time.monotonic()
+        hold = _Hold()
         while True:
             progress = goal.progress(self._list_object(resource, ref))
-            if self._settled(ref, goal, progress, began):
+            if self._settled(ref, goal, progress, began, hold):
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -325,18 +352,27 @@ class KubernetesDeploymentDetector:
                 progress.detail,
             )
             started = time.monotonic()
+            # A healthy object produces no events, so a watch that outlasted the
+            # hold would never get to see it end.
+            watch_for = min(self._watch_timeout_seconds, remaining)
+            if hold.since is not None:
+                due = hold.since + self._settle_seconds - started
+                watch_for = min(watch_for, max(1.0, math.ceil(due)))
             for event_type, event_object in self._watch_object(
-                resource, ref, min(self._watch_timeout_seconds, remaining)
+                resource, ref, watch_for
             ):
                 observed = None if event_type == "DELETED" else event_object
-                if self._settled(ref, goal, goal.progress(observed), began):
+                if self._settled(ref, goal, goal.progress(observed), began, hold):
                     return
             # The watch ended without the object reaching the state the change
             # asked for, which is what an expired watch looks like, and the loop
             # opens another one. A watch that ends immediately instead means the
             # API server is dropping them, so this waits a little rather than
             # spinning through the whole timeout in a tight loop.
-            if time.monotonic() - started < self._retry_delay_seconds:
+            if (
+                hold.since is None
+                and time.monotonic() - started < self._retry_delay_seconds
+            ):
                 time.sleep(self._retry_delay_seconds)
 
     def _settled(
@@ -345,6 +381,7 @@ class KubernetesDeploymentDetector:
         goal: Goal,
         progress: Progress,
         began: float,
+        hold: _Hold,
     ) -> bool:
         """Return whether the wait is over, raising when it ended in failure.
 
@@ -355,8 +392,13 @@ class KubernetesDeploymentDetector:
         The line this logs is the only trace an object that was already in the
         state the change asked for leaves behind, so it says what was observed
         and how long it took to observe it rather than only which goal was met.
+
+        A complete verdict that asks to settle is not final until it has held for
+        the settle window without a pending one in between, so it takes the first
+        sighting to start the clock and a later one to end it.
         """
         if progress.state is ProgressState.PENDING:
+            hold.since = None
             return False
         if progress.state is ProgressState.FAILED:
             raise DeploymentDetectionError(
@@ -364,6 +406,12 @@ class KubernetesDeploymentDetector:
                 f"{self._cluster_name or '<unnamed>'} will not reach "
                 f"{goal.description}: {progress.detail}"
             )
+        if progress.settle and self._settle_seconds > 0:
+            now = time.monotonic()
+            if hold.since is None:
+                hold.since = now
+            if now - hold.since < self._settle_seconds:
+                return False
         logger.info(
             "observed %s in cluster %s reaching %s after %.1fs%s",
             _format_ref(ref),
@@ -822,7 +870,8 @@ def _deployment_rollout_progress(obj: dict[str, Any]) -> Progress:
     else:
         return _complete(
             f"generation {generation} observed, {updated} of {desired} replicas "
-            "updated and available"
+            "updated and available" + _unvouched_note(spec, desired),
+            settle=desired > 0 and not _readiness_is_vouched_for(spec),
         )
     return _pending(_with_replica_failure(status, detail))
 
@@ -868,6 +917,11 @@ def _statefulset_rollout_progress(obj: dict[str, Any]) -> Progress:
     updated = _count(status.get("updatedReplicas"))
     if ready < desired:
         return _pending(f"{ready} of {desired} replicas are ready")
+    # Ready says nothing about how long, so with minReadySeconds it is the
+    # available count that carries the controller's own stability window.
+    available = _count(status.get("availableReplicas"))
+    if _count(spec.get("minReadySeconds")) > 0 and available < desired:
+        return _pending(f"{available} of {desired} replicas are available")
 
     partition = _count(_child(strategy, "rollingUpdate").get("partition"))
     if partition > 0:
@@ -882,6 +936,8 @@ def _statefulset_rollout_progress(obj: dict[str, Any]) -> Progress:
         return _complete(
             f"generation {generation} observed, {updated} of {covered} replicas "
             f"above partition {partition} updated and {ready} of {desired} ready"
+            + _unvouched_note(spec, desired),
+            settle=desired > 0 and not _readiness_is_vouched_for(spec),
         )
 
     if updated < desired:
@@ -899,7 +955,8 @@ def _statefulset_rollout_progress(obj: dict[str, Any]) -> Progress:
         )
     return _complete(
         f"generation {generation} observed, {updated} of {desired} replicas "
-        "updated and ready"
+        "updated and ready" + _unvouched_note(spec, desired),
+        settle=desired > 0 and not _readiness_is_vouched_for(spec),
     )
 
 
@@ -909,6 +966,39 @@ _ROLLOUT_PROGRESS: dict[str, Callable[[dict[str, Any]], Progress]] = {
     DEPLOYMENTS_RESOURCE_NAME: _deployment_rollout_progress,
     STATEFULSETS_RESOURCE_NAME: _statefulset_rollout_progress,
 }
+
+
+def _readiness_is_vouched_for(spec: dict[str, Any]) -> bool:
+    """Return whether a pod being Ready says it has been working for a while.
+
+    A pod is Ready once all of its containers are. A container with a readiness
+    probe is Ready when that probe passes, and one without is Ready as soon as it
+    is running, which a container that crashes on startup is on every attempt.
+    ``minReadySeconds`` makes the controller count a pod only once it has stayed
+    Ready that long. Either one makes the replica counts trustworthy, and with
+    neither the rollout can only be told apart from a crash loop by watching it
+    for a while. Every container has to have a probe, since the one without is
+    free to be the one that crashes.
+    """
+    if _count(spec.get("minReadySeconds")) > 0:
+        return True
+    pod_spec = _child(_child(spec, "template"), "spec")
+    containers = pod_spec.get("containers")
+    if not isinstance(containers, list) or not containers:
+        return False
+    return all(
+        isinstance(container, dict) and container.get("readinessProbe")
+        for container in containers
+    )
+
+
+def _unvouched_note(spec: dict[str, Any], desired: int) -> str:
+    if desired > 0 and not _readiness_is_vouched_for(spec):
+        return (
+            "; with no readiness probe on every container and no minReadySeconds "
+            "its readiness only counts once it has held for a while"
+        )
+    return ""
 
 
 def _with_replica_failure(status: dict[str, Any], detail: str) -> str:
