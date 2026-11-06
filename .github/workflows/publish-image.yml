@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+  # A pull request builds the image too, so that a Dockerfile that no longer
+  # builds fails there rather than after it merges. Only main publishes: nothing
+  # else signs in to AWS, and the publish role's trust policy would refuse any
+  # other ref anyway.
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -23,8 +28,16 @@ env:
   IMAGE_REPOSITORY: relcoord
 
 jobs:
-  publish:
+  # Works out what the image is called, and on main whether it is already
+  # published, once for both architectures.
+  prepare:
     runs-on: ubuntu-latest
+
+    outputs:
+      tag: ${{ steps.image-version.outputs.tag }}
+      image_version: ${{ steps.image-version.outputs.image_version }}
+      version: ${{ steps.image-version.outputs.version }}
+      exists: ${{ steps.published.outputs.exists }}
 
     steps:
       - name: Check out repository
@@ -66,7 +79,13 @@ jobs:
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Note that this run does not publish
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "Not on main, so this run builds the image for each architecture without publishing it." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Configure AWS credentials
+        if: github.ref == 'refs/heads/main'
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::436027055282:role/crossplane/relcoord-ecr-publish
@@ -74,6 +93,7 @@ jobs:
 
       - name: Check whether the image is already published
         id: published
+        if: github.ref == 'refs/heads/main'
         run: |
           # The tag is a hash of the build context, so a tag already in the registry
           # names an image built from exactly this source and there is nothing to
@@ -110,28 +130,111 @@ jobs:
         env:
           IMAGE_VERSION: ${{ steps.image-version.outputs.image_version }}
 
+  # Each architecture builds on a runner of its own kind rather than under QEMU
+  # emulation, which made the arm64 half of a single-runner build several times
+  # slower than the amd64 half.
+  build:
+    name: build (${{ matrix.platform }})
+    needs: prepare
+    if: needs.prepare.outputs.exists != 'true'
+
+    strategy:
+      # So that a pull request shows whether each architecture builds, rather than
+      # cancelling one as soon as the other fails.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            digest_output: digest_amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            digest_output: digest_arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    # Each leg sets only its own output, so the two don't overwrite each other.
+    outputs:
+      digest_amd64: ${{ steps.digest.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.digest.outputs.digest_arm64 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::436027055282:role/crossplane/relcoord-ecr-publish
+          aws-region: us-east-1
+
       - name: Log in to Amazon ECR Public
-        if: steps.published.outputs.exists != 'true'
+        if: github.ref == 'refs/heads/main'
         uses: aws-actions/amazon-ecr-login@v2
         with:
           registry-type: public
 
-      - name: Set up QEMU
-        if: steps.published.outputs.exists != 'true'
-        uses: docker/setup-qemu-action@v4
-
       - name: Set up Docker Buildx
-        if: steps.published.outputs.exists != 'true'
         uses: docker/setup-buildx-action@v4
 
-      - name: Build and push Docker image
-        if: steps.published.outputs.exists != 'true'
+      - name: Build Docker image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.image-version.outputs.tag }}
+          platforms: ${{ matrix.platform }}
+          # Pushed by digest alone, without the tag: the merge job tags it once
+          # both architectures are in the registry, so the tag never names an image
+          # that has only one of them. Off main, nothing is pushed.
+          outputs: type=image,name=${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_REPOSITORY }},push-by-digest=true,name-canonical=true,push=${{ github.ref == 'refs/heads/main' }}
           build-args: |
-            RELCOORD_VERSION=${{ steps.image-version.outputs.version }}
-            RELCOORD_IMAGE_TAG=${{ steps.image-version.outputs.image_version }}
+            RELCOORD_VERSION=${{ needs.prepare.outputs.version }}
+            RELCOORD_IMAGE_TAG=${{ needs.prepare.outputs.image_version }}
+
+      - name: Export digest
+        id: digest
+        run: echo "${DIGEST_OUTPUT}=${DIGEST}" >> "$GITHUB_OUTPUT"
+        env:
+          DIGEST_OUTPUT: ${{ matrix.digest_output }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+  # Puts the tag on a manifest list naming both architectures' images, which is
+  # the moment the image is published.
+  merge:
+    needs: [prepare, build]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::436027055282:role/crossplane/relcoord-ecr-publish
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Tag the image for both architectures
+        run: |
+          # An empty digest would otherwise surface as an unhelpful "invalid
+          # reference" from imagetools.
+          : "${DIGEST_AMD64:?no linux/amd64 digest from the build job}"
+          : "${DIGEST_ARM64:?no linux/arm64 digest from the build job}"
+          image="${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}"
+          docker buildx imagetools create \
+            --tag "${TAG}" \
+            "${image}@${DIGEST_AMD64}" \
+            "${image}@${DIGEST_ARM64}"
+          docker buildx imagetools inspect "${TAG}"
+          echo "Published for linux/amd64 and linux/arm64." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          DIGEST_AMD64: ${{ needs.build.outputs.digest_amd64 }}
+          DIGEST_ARM64: ${{ needs.build.outputs.digest_arm64 }}
