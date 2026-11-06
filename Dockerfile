@@ -1,6 +1,9 @@
 FROM cleanstart/helm:4.3.1 AS helm
 
-FROM astral/uv:trixie AS builder
+# The slim variant has no C compiler, which nothing here needs: with Python pinned
+# to 3.14 below, every dependency installs from a wheel. A dependency that ever
+# has to be built from source fails the pull request's image build instead.
+FROM astral/uv:trixie-slim AS builder
 
 WORKDIR /build
 
