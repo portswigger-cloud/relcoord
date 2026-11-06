@@ -559,6 +559,17 @@ cluster has given up on, one that is paused or one whose rollout exceeded its
 progress deadline, fails the wait immediately rather than waiting out the
 timeout.
 
+A pod without a readiness probe is Ready as soon as its containers are running,
+which a container that crashes on startup is for a moment on every attempt, so a
+rollout can look complete and then go into `CrashLoopBackOff`. A Deployment or
+StatefulSet whose readiness is vouched for — a `readinessProbe` on every
+container, or a `minReadySeconds` above zero, which the controller applies
+itself — is taken at its word. For one that is not, the rollout also has to stay
+complete for 10 seconds without a break before it counts, and the clock starts
+over whenever it stops looking complete. That is a heuristic: a container that
+takes longer than that to crash is not caught, and the fix for that is a readiness
+probe.
+
 The connection properties live on the output whose deployment they describe.
 With deployment detection enabled, every output must explicitly set
 `connection-type` to either `eks` or `local`:
