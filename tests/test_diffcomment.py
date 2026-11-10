@@ -186,15 +186,7 @@ def test_diff_generates_commits_and_diffs_without_pushing(
             "manifests",
             {"purpose": f"cloning manifests repo {MANIFESTS_REPO}", "depth": "1"},
         ),
-        (
-            "generate",
-            ".deploy",
-            Path("manifests"),
-            True,
-            None,
-            "config",
-            {"prod": False},
-        ),
+        ("generate", ".deploy", Path("manifests"), True, None, "config", {}),
         ("diff", "manifests", "feedface"),
     ]
     assert result.generated_count == 1
