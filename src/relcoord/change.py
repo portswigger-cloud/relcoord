@@ -45,6 +45,7 @@ from relcoord.config import (
     IdcatSettings,
     OutputSettings,
     RolloutSettings,
+    TemplateValue,
 )
 from relcoord.git import (
     GitCredentialError,
@@ -2583,7 +2584,21 @@ def _generate_selection(
     """Return the generate() argument that picks what an output generates."""
     if declares_targets:
         return {"target": output.target_name}
-    return {"vars": output.vars}
+    return {"vars": _with_derived_vars(output.vars)}
+
+
+def _with_derived_vars(vars: dict[str, TemplateValue]) -> dict[str, TemplateValue]:
+    """Return ``vars`` plus ``prod``, true when ``cluster_name`` ends in ``-prod``.
+
+    A ``prod`` the output sets itself is left alone.
+    """
+    if "prod" in vars:
+        return vars
+    cluster_name = vars.get("cluster_name")
+    return {
+        **vars,
+        "prod": isinstance(cluster_name, str) and cluster_name.endswith("-prod"),
+    }
 
 
 def _plugins_log_summary(plugins: ExternalPlugins | None) -> str:
