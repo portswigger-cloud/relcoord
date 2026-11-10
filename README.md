@@ -507,10 +507,6 @@ account_id = 111122223333
 issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEDEVCLUSTERID"
 ```
 
-relcoord adds a boolean `prod` variable to the `vars` it passes, true when
-`cluster_name` is a string ending in `-prod`. A `prod` set in `[output.vars]`
-takes precedence.
-
 `manifest-builder` config directories come in two layouts, told apart by the
 `version` field of the top-level `config.toml` (or `manifest-builder.toml`) of
 the commit being processed. A directory that declares config blocks directly

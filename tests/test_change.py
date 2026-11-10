@@ -30,12 +30,7 @@ from relcoord.change import (
     RolloutStageError,
     SystemRepositoryError,
 )
-from relcoord.config import (
-    OutputSettings,
-    RolloutSettings,
-    RolloutStage,
-    TemplateValue,
-)
+from relcoord.config import OutputSettings, RolloutSettings, RolloutStage
 from relcoord.git import GitCredentialError
 from relcoord.validator import SourceFiles
 
@@ -161,7 +156,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
             True,
             "registry.example.com/team/api:1.2.3",
             "config",
-            {"prod": False},
+            {},
         ),
         ("head", "manifests"),
         ("push", "manifests", "https://github.com/acme/manifests.git", None),
@@ -438,11 +433,7 @@ def test_change_processor_generates_configured_outputs_with_vars(
             True,
             None,
             "config",
-            {
-                "cluster_name": "example-dev",
-                "account_id": 111122223333,
-                "prod": False,
-            },
+            {"cluster_name": "example-dev", "account_id": 111122223333},
         ),
         (
             "generate",
@@ -452,11 +443,7 @@ def test_change_processor_generates_configured_outputs_with_vars(
             True,
             None,
             "config",
-            {
-                "cluster_name": "example-prod",
-                "account_id": 444455556666,
-                "prod": True,
-            },
+            {"cluster_name": "example-prod", "account_id": 444455556666},
         ),
         ("head", "manifests"),
         ("push", "manifests", "https://github.com/acme/manifests.git", None),
@@ -2167,31 +2154,6 @@ def test_generating_message_uses_the_config_repositorys_own_terms(
     assert change._generating_message(output, declares_targets) == expected
 
 
-@pytest.mark.parametrize(
-    ("vars", "expected"),
-    [
-        pytest.param({"cluster_name": "example-prod"}, True, id="prod-suffix"),
-        pytest.param({"cluster_name": "example-dev"}, False, id="dev"),
-        pytest.param({"cluster_name": "prod-example"}, False, id="prod-prefix"),
-        pytest.param({"cluster_name": "prod"}, False, id="no-dash"),
-        pytest.param({}, False, id="no-cluster-name"),
-        pytest.param({"cluster_name": 5}, False, id="not-a-string"),
-        pytest.param({"cluster_name": "a-prod", "prod": False}, False, id="explicit"),
-    ],
-)
-def test_generate_selection_derives_prod_from_the_cluster_name(
-    vars: dict[str, TemplateValue], expected: bool
-) -> None:
-    output = OutputSettings(
-        name="o", repository=ROLLOUT_REPOSITORY, directory=Path("o"), vars=vars
-    )
-
-    selection = change._generate_selection(output, False)
-
-    assert selection["vars"]["prod"] is expected
-    assert output.vars == vars
-
-
 def test_stage_verified_message_reports_a_skipped_stage() -> None:
     stage = change._change_stages(ROLLOUT_OUTPUTS, [LINEAR_ROLLOUT])[1]
 
@@ -2484,9 +2446,7 @@ def test_change_with_a_section_generates_with_the_vars_of_the_system_target(
         section="frontend",
     )
 
-    assert seen == [
-        {"account_id": 111122223333, "cluster": "from-output", "prod": False}
-    ]
+    assert seen == [{"account_id": 111122223333, "cluster": "from-output"}]
 
 
 def test_change_fails_on_a_section_no_target_is_built_from(
