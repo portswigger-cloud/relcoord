@@ -40,6 +40,12 @@ from dulwich.patch import write_tree_diff
 from dulwich.repo import Repo
 from manifest_builder import __version__ as MANIFEST_BUILDER_VERSION
 
+from relcoord.raw_iam_kms import (
+    REMEDY,
+    SYSTEM_ONLY_API_GROUPS,
+    RawResource,
+    system_name,
+)
 from relcoord.validator import Finding, OutputValidation, SourceFiles
 
 logger = logging.getLogger(__name__)
@@ -671,6 +677,44 @@ def _link(text: str, url: str | None) -> str:
     return f"[{escaped}]({url})"
 
 
+def render_raw_iam_kms_refusal(
+    refused: Sequence[tuple[str, Sequence[RawResource]]],
+    system_repository: str | None,
+) -> str:
+    """Render the raw IAM and KMS resources a change was refused for.
+
+    It opens the comment, above the validation verdicts: this is not a finding
+    to weigh but the reason the change will not deploy, so it is the first thing
+    a reviewer reads, with what to do about it.
+    """
+    rows = [(output, resource) for output, found in refused for resource in found]
+    if not rows:
+        return ""
+    groups = ", ".join(f"`{group}`" for group in sorted(SYSTEM_ONLY_API_GROUPS))
+    verdict = (
+        f"**Refused** — only `{system_name(system_repository)}` may deploy "
+        f"resources in {groups}, so this change will not be deployed."
+    )
+    shown = rows[:MAX_VALIDATION_FINDINGS]
+    lines = [
+        "### Raw IAM and KMS resources",
+        "",
+        verdict,
+        "",
+        "| Output | Resource | File |",
+        "| --- | --- | --- |",
+        *(
+            f"| {_table_cell(output)} | {_table_cell(resource.describe())} | {_table_cell(resource.file)} |"
+            for output, resource in shown
+        ),
+    ]
+    remaining = len(rows) - len(shown)
+    if remaining > 0:
+        lines.extend(["", f"_{remaining} more in the error relcoord returned._"])
+    lines.extend(["", REMEDY])
+    return "\n".join(lines)
+
+
 DIFF_HEADING = "Manifest diff"
 
 
@@ -703,10 +747,12 @@ def build_comment_body(
     longer than GitHub accepts; ``omitted_context_diff`` reports whether the
     comment leaves the reader needing the full diff.
 
-    ``validation`` is manifest-validator's verdicts, rendered by
-    :func:`render_validation_summary`. It opens the comment: whether the change
-    is deployable is read before the diff, and its findings stay collapsed so
-    they cost a reader who only wants the diff one line.
+    ``validation`` is whatever decides whether the change deploys: a raw IAM
+    and KMS refusal from :func:`render_raw_iam_kms_refusal` and
+    manifest-validator's verdicts from :func:`render_validation_summary`. It
+    opens the comment: whether the change is deployable is read before the
+    diff, and its findings stay collapsed so they cost a reader who only wants
+    the diff one line.
 
     The diff gets a heading of its own beneath it, so the two do not run
     together. Not when there is nothing above it to separate it from, and not

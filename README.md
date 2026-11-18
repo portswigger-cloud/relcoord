@@ -107,8 +107,9 @@ points a reader who needs the part it left out.
 `Accept: text/event-stream` works here too, with the same event shapes as
 `/v1/change` and phases `source-checkout`, `deploy-config`, `system-checkout`,
 `manifests-checkout`, `generate`, `generated`, `validate`, `running`,
-`validated`, `validation-failed`, `validation-error`, `no-validation`, `diff`,
-`no-changes`, `comment`, `commented` and `no-comment`.
+`validated`, `validation-failed`, `validation-error`, `no-validation`,
+`raw-iam-kms-refused`, `diff`, `no-changes`, `comment`, `commented` and
+`no-comment`.
 
 ## Selecting outputs
 
@@ -307,6 +308,46 @@ its `checks`, the content `digest` that was scanned, whether the verdict was
 that produced them. A finding whose `accepted` is set did not fail the verdict,
 and says why.
 
+## Raw IAM and KMS resources
+
+Only the system repository may generate Crossplane IAM and KMS resources
+directly: anything in `iam.aws.m.upbound.io` or `kms.aws.m.upbound.io`, or in
+the cluster-scoped `iam.aws.upbound.io` and `kms.aws.upbound.io`, of any kind
+and version. Every other repository asks for what it needs through a composite
+resource, such as a `KMSPermission`, whose Composition decides which IAM and KMS
+resources it becomes. The provider's `ProviderConfig` and its other services
+(`s3`, `route53`, ...) are in other groups and not affected.
+
+The exemption is a system-mode request whose verified token was issued to the
+configured `system-repository`: the `repository` claim of a GitHub Actions
+token, compared with that URL's owner and name. System mode alone is a property
+of the role and does not say which repository holds it, and `config_repo` is
+whatever the caller sent, so neither is enough on its own. A request without a
+verified token, as with authentication disabled, is exempt from nothing.
+
+What is checked is what the generation publishes and nothing else: for a
+repository generating into its own namespace, that namespace's directory as
+manifest-builder leaves it, every document of every file and every item of a
+`List`. Resources already deployed by another owner never stop a change, and a
+change that removes its own raw resources is deployed like any other. A file
+that cannot be read as YAML is refused rather than passed.
+
+`/v1/change` checks each output as it is generated, before anything is pushed,
+and fails with `raw_iam_kms_not_allowed` (422) naming each resource and its
+file. `/v1/diffcomment` puts the same list at the top of its comment, posts it,
+and then fails the same way, so the check that asked for the diff fails as the
+merge would. Both stream a `raw-iam-kms-refused` progress event per output. This
+is the one thing a diff gates, and it does so whether or not a `[validator]` is
+configured: it is relcoord's rule, not manifest-validator's, because only
+relcoord knows which repository a manifest came from.
+
+This is a check on GitOps sources, not Kubernetes admission. It does not see
+what a cluster admin applies directly, nor the resources a Composition composes
+from a composite resource, which is how a `KMSPermission` becomes IAM and KMS
+resources by design. Config repositories can also load manifest-builder plugins
+from their own `plugins/` directory, which run inside relcoord, so this keeps
+honest mistakes out rather than containing a repository's own code.
+
 
 ## Progress streaming
 
@@ -327,7 +368,8 @@ The stream carries four kinds of event:
   work starts.
 - `progress` — one per step, with a stable `phase` (`source-checkout`,
   `deploy-config`, `system-checkout`, `rollout-stage`, `manifests-checkout`,
-  `generate`, `generated`, `changed-objects`, `no-changes`, `push`,
+  `generate`, `generated`, `changed-objects`, `raw-iam-kms-refused`,
+  `no-changes`, `push`,
   `rebased`, `pushed`, `deployment-detection`, `rollout-stage-verified`, and
   with `generate-while-waiting` also `predicted-outputs` and `generate-ahead`),
   a human readable `message`, and a `detail` object with specifics of the step.

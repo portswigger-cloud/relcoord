@@ -61,7 +61,15 @@ from relcoord.manifest_diff import (
     build_rebase_required_comment,
     comment_marker,
     manifest_diff,
+    render_raw_iam_kms_refusal,
     render_validation_summary,
+)
+from relcoord.raw_iam_kms import (
+    RawResource,
+    find_raw_resources,
+    generated_tree,
+    may_generate_raw_iam_kms,
+    refusal_message,
 )
 from relcoord.tracing import span
 from relcoord.validator import (
@@ -170,6 +178,15 @@ class ManifestValidationError(ChangeProcessingError):
     nothing else, so a scanner that cannot be reached stops a change exactly as
     a finding does. It says nothing about relcoord, so it is reported without a
     stack trace.
+    """
+
+
+class RawIamKmsError(ChangeProcessingError):
+    """Raised when a repository other than system generates raw IAM or KMS.
+
+    A change raises it before the output is pushed, so the manifests repository
+    is left as it was; a diff raises it once the comment saying why is posted.
+    Like a failed validation, it says nothing about relcoord.
     """
 
 
@@ -323,8 +340,15 @@ class ChangeProcessor:
         outputs: Sequence[str] = (),
         *,
         section: str | None = None,
+        source_repository: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> ChangeResult:
+        """Generate and push one config commit.
+
+        ``source_repository`` is the repository the request's verified token was
+        issued to, None without one. Together with ``system`` it decides whether
+        the change may generate raw IAM and KMS resources; ``repo`` never does.
+        """
         with span(
             "change.process",
             **{
@@ -334,7 +358,19 @@ class ChangeProcessor:
             },
         ):
             return self._process(
-                repo, commit, image, config_path, system, outputs, section, progress
+                repo,
+                commit,
+                image,
+                config_path,
+                system,
+                outputs,
+                section,
+                may_generate_raw_iam_kms(
+                    system=system,
+                    source_repository=source_repository,
+                    system_repository=self.system_repository,
+                ),
+                progress,
             )
 
     def _process(
@@ -346,6 +382,7 @@ class ChangeProcessor:
         system: bool,
         outputs: Sequence[str],
         section: str | None,
+        raw_iam_kms_allowed: bool,
         progress: ProgressSink,
     ) -> ChangeResult:
         def report(phase: str, message: str, **detail: Any) -> None:
@@ -439,6 +476,7 @@ class ChangeProcessor:
                         image=image,
                         namespace=namespace,
                         plugins=plugins,
+                        raw_iam_kms_allowed=raw_iam_kms_allowed,
                         report=report,
                     ),
                     checkout_by_repository=checkout_by_repository,
@@ -480,6 +518,7 @@ class ChangeProcessor:
                             image=image,
                             namespace=namespace,
                             plugins=plugins,
+                            raw_iam_kms_allowed=raw_iam_kms_allowed,
                             report=report,
                         )
                         for repository, stage_outputs in repositories
@@ -641,6 +680,7 @@ class ChangeProcessor:
         image: str | None,
         namespace: str | None,
         plugins: ExternalPlugins | None,
+        raw_iam_kms_allowed: bool,
         report: Callable[..., None],
     ) -> list[tuple[OutputResult, GenerationResult]]:
         """Generate one stage's outputs of one manifests repository.
@@ -663,6 +703,7 @@ class ChangeProcessor:
                     image=image,
                     namespace=namespace,
                     plugins=plugins,
+                    raw_iam_kms_allowed=raw_iam_kms_allowed,
                     report=report,
                 )
             )
@@ -685,9 +726,16 @@ class ChangeProcessor:
         image: str | None,
         namespace: str | None,
         plugins: ExternalPlugins | None,
+        raw_iam_kms_allowed: bool,
         report: Callable[..., None],
     ) -> tuple[OutputResult, GenerationResult]:
-        """Let manifest-builder write one output into the manifests checkout."""
+        """Let manifest-builder write one output into the manifests checkout.
+
+        What it wrote is checked for raw IAM and KMS here, rather than where the
+        stage pushes, so the one check covers a stage generated whole and one
+        generated while the stage before it waits: either way an output that
+        fails it raises before anything it generated is pushed.
+        """
         repo_root = Path("/")
         create_commit = True
         output_path = manifests_checkout / output.directory
@@ -767,6 +815,13 @@ class ChangeProcessor:
                 created_or_modified=object_ref_payloads(created_or_modified),
                 removed=object_ref_payloads(removed_refs),
             )
+        if not raw_iam_kms_allowed:
+            refused = _raw_iam_kms(output, output_path, namespace, report)
+            if refused:
+                raise RawIamKmsError(
+                    refusal_message(output.name, refused, self.system_repository)
+                    + f" Nothing generated for {output.name} was pushed."
+                )
         return (
             OutputResult(
                 name=output.name,
@@ -1289,6 +1344,8 @@ class _RepositoryDiffRun:
     outputs: tuple[OutputDiff, ...]
     diff: RepositoryDiff
     validations: tuple[Future[OutputValidation], ...]
+    refused: tuple[tuple[str, tuple[RawResource, ...]], ...] = ()
+    """Each output that generated raw IAM or KMS, with what it generated."""
 
 
 @dataclass(frozen=True)
@@ -1333,8 +1390,16 @@ class DiffCommentProcessor:
         *,
         section: str | None = None,
         pull_request: int | None = None,
+        source_repository: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> DiffResult:
+        """Generate one config commit and report its diff.
+
+        ``source_repository`` decides, with ``system``, whether the commit may
+        generate raw IAM and KMS resources, as it does for a change. A diff that
+        generates them comments why and then fails, so the check that asked for
+        it fails as the change would.
+        """
         with span(
             "diff.process",
             **{
@@ -1351,6 +1416,11 @@ class DiffCommentProcessor:
                 outputs,
                 section,
                 pull_request,
+                may_generate_raw_iam_kms(
+                    system=system,
+                    source_repository=source_repository,
+                    system_repository=self.system_repository,
+                ),
                 progress,
             )
 
@@ -1363,6 +1433,7 @@ class DiffCommentProcessor:
         outputs: Sequence[str],
         section: str | None,
         pull_request: int | None,
+        raw_iam_kms_allowed: bool,
         progress: ProgressSink,
     ) -> DiffResult:
         def report(phase: str, message: str, **detail: Any) -> None:
@@ -1458,6 +1529,7 @@ class DiffCommentProcessor:
                             declares_targets=declares_targets,
                             namespace=namespace,
                             plugins=plugins,
+                            raw_iam_kms_allowed=raw_iam_kms_allowed,
                             validation_pool=validation_pool,
                             report=report,
                         )
@@ -1474,6 +1546,7 @@ class DiffCommentProcessor:
                 ]
             output_diffs = [diff for run in repository_runs for diff in run.outputs]
             repository_diffs = [run.diff for run in repository_runs]
+            refused = [entry for run in repository_runs for entry in run.refused]
             total_generated = sum(diff.generated_count for diff in output_diffs)
 
             marker = comment_marker()
@@ -1481,11 +1554,27 @@ class DiffCommentProcessor:
                 _diff_sections(repository_diffs),
                 full_diff_reference=FULL_DIFF_REFERENCE,
                 marker=marker,
-                validation=render_validation_summary(validations),
+                validation="\n\n".join(
+                    part
+                    for part in (
+                        render_raw_iam_kms_refusal(refused, self.system_repository),
+                        render_validation_summary(validations),
+                    )
+                    if part
+                ),
             )
             with span("post diff comment", **{"relcoord.pull_request": pull_request}):
                 comment = self._comment(
                     repo, pull_request, comment_body.body, marker, report
+                )
+            if refused:
+                # The comment says why on the pull request; failing the request
+                # is what fails the check that asked for it.
+                raise RawIamKmsError(
+                    " ".join(
+                        refusal_message(output, found, self.system_repository)
+                        for output, found in refused
+                    )
                 )
             return DiffResult(
                 repo=repo,
@@ -1514,6 +1603,7 @@ class DiffCommentProcessor:
         declares_targets: bool,
         namespace: str | None,
         plugins: ExternalPlugins | None,
+        raw_iam_kms_allowed: bool,
         validation_pool: ThreadPoolExecutor,
         report: Callable[..., None],
     ) -> _RepositoryDiffRun:
@@ -1525,6 +1615,7 @@ class DiffCommentProcessor:
         """
         output_diffs: list[OutputDiff] = []
         validations: list[Future[OutputValidation]] = []
+        refused: list[tuple[str, tuple[RawResource, ...]]] = []
         logger.info(
             "diff step 4/6: checking out manifests repo %s into %s",
             repository,
@@ -1609,6 +1700,12 @@ class DiffCommentProcessor:
                     generated_count=len(generated),
                 )
             )
+            if not raw_iam_kms_allowed:
+                # Read before the next output commits into the checkout, as
+                # the validation tree is.
+                found = _raw_iam_kms(output, output_path, namespace, report)
+                if found:
+                    refused.append((output.name, found))
             if self.validator is not None:
                 # The tree is read here, before the next output commits into
                 # the checkout, and only the request runs in the pool.
@@ -1655,6 +1752,7 @@ class DiffCommentProcessor:
             outputs=tuple(output_diffs),
             diff=RepositoryDiff(repository=repository, manifest_diff=repository_diff),
             validations=tuple(validations),
+            refused=tuple(refused),
         )
 
     def _comment(
@@ -1789,6 +1887,44 @@ def _run_concurrently[T](tasks: Sequence[Callable[[], T]], max_workers: int) -> 
     with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
         futures = [_submit(pool, task) for task in tasks]
     return [future.result() for future in futures]
+
+
+def _raw_iam_kms(
+    output: OutputSettings,
+    output_path: Path,
+    namespace: str | None,
+    report: Callable[..., None],
+) -> tuple[RawResource, ...]:
+    """Find the raw IAM and KMS resources one generation published.
+
+    Only the generation's own directories are read, so resources another owner
+    already has in the output never stop this one, and a resource this change
+    removes is not there to be found.
+    """
+    with span("check raw iam kms", **{"relcoord.output": output.name}):
+        refused = find_raw_resources(generated_tree(output_path, namespace))
+    if refused:
+        described = ", ".join(resource.describe() for resource in refused)
+        logger.warning(
+            "output %s generates raw IAM or KMS resources: %s", output.name, described
+        )
+        report(
+            "raw-iam-kms-refused",
+            f"{output.name}: refused raw IAM or KMS resources: {described}",
+            output=output.name,
+            resources=[
+                {
+                    "file": resource.file,
+                    "api_version": resource.api_version,
+                    "kind": resource.kind,
+                    "namespace": resource.namespace,
+                    "name": resource.name,
+                    "unreadable": resource.unreadable,
+                }
+                for resource in refused
+            ],
+        )
+    return refused
 
 
 def _validate_generated_output(
