@@ -318,12 +318,15 @@ resource, such as a `KMSPermission`, whose Composition decides which IAM and KMS
 resources it becomes. The provider's `ProviderConfig` and its other services
 (`s3`, `route53`, ...) are in other groups and not affected.
 
-The exemption is a system-mode request whose verified token was issued to the
-configured `system-repository`: the `repository` claim of a GitHub Actions
-token, compared with that URL's owner and name. System mode alone is a property
-of the role and does not say which repository holds it, and `config_repo` is
-whatever the caller sent, so neither is enough on its own. A request without a
-verified token, as with authentication disabled, is exempt from nothing.
+The exemption is a system-mode request to generate the configured
+`system-repository`, from a verified token issued to that same repository: the
+`repository` claim of a GitHub Actions token and the request's `config_repo`
+both compared with that URL's owner and name. System mode alone is a property
+of the role and does not say which repository holds it; the token alone does
+not say what is being generated, since `config_repo` is whatever the caller
+sent, so the system repository's own token asking for another repository to be
+generated as system is refused. A request without a verified token, as with
+authentication disabled, is exempt from nothing.
 
 What is checked is what the generation publishes and nothing else: for a
 repository generating into its own namespace, that namespace's directory as
@@ -336,7 +339,8 @@ that cannot be read as YAML is refused rather than passed.
 and fails with `raw_iam_kms_not_allowed` (422) naming each resource and its
 file. `/v1/diffcomment` puts the same list at the top of its comment, posts it,
 and then fails the same way, so the check that asked for the diff fails as the
-merge would. Both stream a `raw-iam-kms-refused` progress event per output. This
+merge would. A comment GitHub refuses does not change that answer: the request
+still fails with the refusal, and says the comment could not be posted. Both stream a `raw-iam-kms-refused` progress event per output. This
 is the one thing a diff gates, and it does so whether or not a `[validator]` is
 configured: it is relcoord's rule, not manifest-validator's, because only
 relcoord knows which repository a manifest came from.

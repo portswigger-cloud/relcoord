@@ -368,6 +368,7 @@ class ChangeProcessor:
                 may_generate_raw_iam_kms(
                     system=system,
                     source_repository=source_repository,
+                    config_repo=repo,
                     system_repository=self.system_repository,
                 ),
                 progress,
@@ -1419,6 +1420,7 @@ class DiffCommentProcessor:
                 may_generate_raw_iam_kms(
                     system=system,
                     source_repository=source_repository,
+                    config_repo=repo,
                     system_repository=self.system_repository,
                 ),
                 progress,
@@ -1563,19 +1565,30 @@ class DiffCommentProcessor:
                     if part
                 ),
             )
-            with span("post diff comment", **{"relcoord.pull_request": pull_request}):
-                comment = self._comment(
-                    repo, pull_request, comment_body.body, marker, report
-                )
+            refusal = " ".join(
+                refusal_message(output, found, self.system_repository)
+                for output, found in refused
+            )
+            try:
+                with span(
+                    "post diff comment", **{"relcoord.pull_request": pull_request}
+                ):
+                    comment = self._comment(
+                        repo, pull_request, comment_body.body, marker, report
+                    )
+            except (CommentPostError, CredentialError) as exc:
+                if not refused:
+                    raise
+                # A comment that could not be posted must not hide what the
+                # change was refused for: the refusal is the answer either way.
+                raise RawIamKmsError(
+                    f"{refusal} The pull request comment saying so could not be "
+                    f"posted: {exc}"
+                ) from exc
             if refused:
                 # The comment says why on the pull request; failing the request
                 # is what fails the check that asked for it.
-                raise RawIamKmsError(
-                    " ".join(
-                        refusal_message(output, found, self.system_repository)
-                        for output, found in refused
-                    )
-                )
+                raise RawIamKmsError(refusal)
             return DiffResult(
                 repo=repo,
                 commit=commit,

@@ -90,25 +90,38 @@ def verified_repository(principal: object) -> str | None:
 
 
 def may_generate_raw_iam_kms(
-    *, system: bool, source_repository: str | None, system_repository: str | None
+    *,
+    system: bool,
+    source_repository: str | None,
+    config_repo: str,
+    system_repository: str | None,
 ) -> bool:
     """Whether a generation may emit resources in :data:`SYSTEM_ONLY_API_GROUPS`.
 
-    Only a system-mode generation from the configured system repository may.
-    System mode alone is not enough: it is a property of the role, and which
-    repository the role was granted to is the token's to say, not the request's.
-    ``source_repository`` is that verified repository, never ``config_repo``,
-    which the caller chooses. A deployment without authentication has no
-    verified repository, so nothing it generates is exempt.
+    Only a system-mode generation of the configured system repository, asked
+    for by that repository, may. System mode alone is not enough: it is a
+    property of the role, and which repository the role was granted to is the
+    token's to say, not the request's. ``source_repository`` is that verified
+    repository. It is not enough either, because what is generated is
+    ``config_repo``, which the caller chooses: the system repository's own
+    token asking for another repository to be generated as system gets no
+    exemption for it. A deployment without authentication has no verified
+    repository, so nothing it generates is exempt.
     """
     if not system or source_repository is None or system_repository is None:
         return False
-    system_repo = github_repo_from_url(system_repository)
-    if system_repo is None:
+    canonical = _owner_and_name(system_repository)
+    if canonical is None:
         return False
     # GitHub names are case-insensitive; the claim carries GitHub's own casing.
-    canonical = f"{system_repo.owner}/{system_repo.name}"
-    return source_repository.casefold() == canonical.casefold()
+    return source_repository.casefold() == canonical and (
+        _owner_and_name(config_repo) == canonical
+    )
+
+
+def _owner_and_name(url: str) -> str | None:
+    repo = github_repo_from_url(url)
+    return None if repo is None else f"{repo.owner}/{repo.name}".casefold()
 
 
 def generated_tree(output_dir: Path, namespace: str | None) -> dict[str, bytes]:

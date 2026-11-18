@@ -26,11 +26,12 @@ from relcoord.auth import ValidatedClaims
 from relcoord.change import (
     ChangeProcessor,
     ChangeProgress,
+    CommentPostError,
     DiffCommentProcessor,
     RawIamKmsError,
 )
 from relcoord.config import OutputSettings, RolloutSettings, RolloutStage
-from relcoord.github import PostedComment
+from relcoord.github import GithubCommentError, PostedComment
 from relcoord.manifest_diff import render_raw_iam_kms_refusal
 from relcoord.raw_iam_kms import (
     GITHUB_ACTIONS_ISSUER,
@@ -221,31 +222,43 @@ def test_the_generated_tree_of_system_is_the_roots_system_owns(
 # Who may
 
 
+TENANT_REPOSITORY = "https://github.com/acme/idfrog"
+
+
 @pytest.mark.parametrize(
-    ("system", "source", "system_repository", "allowed"),
+    ("system", "source", "config_repo", "system_repository", "allowed"),
     [
-        (True, SYSTEM, SYSTEM_REPOSITORY, True),
-        (True, "ACME/System", SYSTEM_REPOSITORY, True),
-        (True, SYSTEM, SYSTEM_REPOSITORY + ".git", True),
+        (True, SYSTEM, SYSTEM_REPOSITORY, SYSTEM_REPOSITORY, True),
+        (True, "ACME/System", SYSTEM_REPOSITORY, SYSTEM_REPOSITORY, True),
+        (True, SYSTEM, SYSTEM_REPOSITORY + ".git", SYSTEM_REPOSITORY, True),
+        (True, SYSTEM, SYSTEM_REPOSITORY, SYSTEM_REPOSITORY + ".git", True),
         # System mode is the role's; the repository is the token's.
-        (True, TENANT, SYSTEM_REPOSITORY, False),
-        (True, None, SYSTEM_REPOSITORY, False),
+        (True, TENANT, SYSTEM_REPOSITORY, SYSTEM_REPOSITORY, False),
+        (True, None, SYSTEM_REPOSITORY, SYSTEM_REPOSITORY, False),
+        # The system repository's token generating another repository as system.
+        (True, SYSTEM, TENANT_REPOSITORY, SYSTEM_REPOSITORY, False),
+        (True, SYSTEM, "/srv/checkouts/system", SYSTEM_REPOSITORY, False),
         # The system repository's own token, outside system mode.
-        (False, SYSTEM, SYSTEM_REPOSITORY, False),
-        (False, TENANT, SYSTEM_REPOSITORY, False),
+        (False, SYSTEM, SYSTEM_REPOSITORY, SYSTEM_REPOSITORY, False),
+        (False, TENANT, TENANT_REPOSITORY, SYSTEM_REPOSITORY, False),
         # Nothing names the system repository to compare with.
-        (True, SYSTEM, None, False),
-        (True, SYSTEM, "git@github.com:acme/system.git", False),
-        (True, "other/system", SYSTEM_REPOSITORY, False),
+        (True, SYSTEM, SYSTEM_REPOSITORY, None, False),
+        (True, SYSTEM, SYSTEM_REPOSITORY, "git@github.com:acme/system.git", False),
+        (True, "other/system", SYSTEM_REPOSITORY, SYSTEM_REPOSITORY, False),
     ],
 )
-def test_only_system_mode_from_the_system_repository_may(
-    system: bool, source: str | None, system_repository: str | None, allowed: bool
+def test_only_system_mode_of_the_system_repository_by_it_may(
+    system: bool,
+    source: str | None,
+    config_repo: str,
+    system_repository: str | None,
+    allowed: bool,
 ) -> None:
     assert (
         may_generate_raw_iam_kms(
             system=system,
             source_repository=source,
+            config_repo=config_repo,
             system_repository=system_repository,
         )
         is allowed
@@ -458,6 +471,28 @@ def no_system_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(change, "_system_plugins", lambda *args, **kwargs: None)
 
 
+def _serve(monkeypatch: pytest.MonkeyPatch, urls: Mapping[str, str]) -> None:
+    """Clone each of ``urls`` from the local repository it maps to.
+
+    The exemption compares ``config_repo`` with the configured GitHub URL, so a
+    system change has to be asked for by that URL to be one.
+    """
+    clone = change._clone_repository
+
+    def serve(source: str, *args: Any, **kwargs: Any) -> None:
+        clone(urls.get(source, source), *args, **kwargs)
+
+    monkeypatch.setattr(change, "_clone_repository", serve)
+    # A diff rebases the pull request onto its default branch; these are.
+    monkeypatch.setattr(
+        change,
+        "_checkout_rebased_commit",
+        lambda source, commit, target, idcat: change._checkout_commit(
+            source, commit, target, idcat
+        ),
+    )
+
+
 def _events() -> tuple[list[ChangeProgress], Any]:
     events: list[ChangeProgress] = []
     return events, events.append
@@ -599,7 +634,9 @@ def test_a_tenant_naming_the_system_repository_as_config_repo_is_still_refused(
     assert remote.tip() == remote.base
 
 
-def test_system_may_deploy_raw_iam_and_kms(tmp_path: Path) -> None:
+def test_system_may_deploy_raw_iam_and_kms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     remote = _Remote.seeded(tmp_path, {})
     repo, commit = _system_repo(
         tmp_path,
@@ -608,10 +645,11 @@ def test_system_may_deploy_raw_iam_and_kms(tmp_path: Path) -> None:
             "key.yaml": _document("kms.aws.m.upbound.io/v1beta1", "Key", "signing"),
         },
     )
+    _serve(monkeypatch, {SYSTEM_REPOSITORY: repo})
 
     ChangeProcessor(
         system_repository=SYSTEM_REPOSITORY, outputs=_outputs(remote, "fe-dev")
-    ).process(repo, commit, None, system=True, source_repository=SYSTEM)
+    ).process(SYSTEM_REPOSITORY, commit, None, system=True, source_repository=SYSTEM)
 
     files = remote.files()
     assert "fe-dev/crossplane-system/role-idfrog-irsa.yaml" in files
@@ -620,10 +658,11 @@ def test_system_may_deploy_raw_iam_and_kms(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("source", [None, TENANT])
 def test_system_mode_without_the_system_repositorys_token_is_refused(
-    tmp_path: Path, source: str | None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str | None
 ) -> None:
     remote = _Remote.seeded(tmp_path, {})
     repo, commit = _system_repo(tmp_path, {"role.yaml": RAW_ROLE})
+    _serve(monkeypatch, {SYSTEM_REPOSITORY: repo})
 
     with pytest.raises(
         RawIamKmsError,
@@ -631,7 +670,27 @@ def test_system_mode_without_the_system_repositorys_token_is_refused(
     ):
         ChangeProcessor(
             system_repository=SYSTEM_REPOSITORY, outputs=_outputs(remote, "fe-dev")
-        ).process(repo, commit, None, system=True, source_repository=source)
+        ).process(
+            SYSTEM_REPOSITORY, commit, None, system=True, source_repository=source
+        )
+
+    assert remote.tip() == remote.base
+
+
+def test_the_system_token_generating_another_repository_as_system_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The token is the system repository's; what is checked out is not.
+    remote = _Remote.seeded(tmp_path, {})
+    repo, commit = _system_repo(tmp_path, {"role.yaml": RAW_ROLE})
+    _serve(monkeypatch, {TENANT_REPOSITORY: repo})
+
+    with pytest.raises(RawIamKmsError, match=r"Role crossplane-system/idfrog-irsa"):
+        ChangeProcessor(
+            system_repository=SYSTEM_REPOSITORY, outputs=_outputs(remote, "fe-dev")
+        ).process(
+            TENANT_REPOSITORY, commit, None, system=True, source_repository=SYSTEM
+        )
 
     assert remote.tip() == remote.base
 
@@ -762,17 +821,82 @@ def test_a_system_diff_with_raw_iam_is_not_refused(
 ) -> None:
     remote = _Remote.seeded(tmp_path, {})
     repo, commit = _system_repo(tmp_path, {"role.yaml": RAW_ROLE})
-    monkeypatch.setattr(
-        change,
-        "_checkout_rebased_commit",
-        lambda source, commit, target, idcat: change._checkout_commit(
-            source, commit, target, idcat
-        ),
-    )
+    _serve(monkeypatch, {SYSTEM_REPOSITORY: repo})
 
     result = DiffCommentProcessor(
         system_repository=SYSTEM_REPOSITORY, outputs=_outputs(remote, "fe-dev")
-    ).diff(repo, commit, system=True, source_repository=SYSTEM)
+    ).diff(SYSTEM_REPOSITORY, commit, system=True, source_repository=SYSTEM)
 
     assert "Raw IAM" not in result.comment.body
     assert "role-idfrog-irsa.yaml" in result.comment.body
+
+
+def test_a_system_token_diff_of_another_repository_as_system_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote = _Remote.seeded(tmp_path, {})
+    repo, commit = _system_repo(tmp_path, {"role.yaml": RAW_ROLE})
+    _serve(monkeypatch, {TENANT_REPOSITORY: repo})
+    commenter = _Commenter()
+
+    with pytest.raises(RawIamKmsError, match=r"Role crossplane-system/idfrog-irsa"):
+        DiffCommentProcessor(
+            system_repository=SYSTEM_REPOSITORY,
+            outputs=_outputs(remote, "fe-dev"),
+            commenter=commenter,
+        ).diff(
+            TENANT_REPOSITORY,
+            commit,
+            system=True,
+            pull_request=7,
+            source_repository=SYSTEM,
+        )
+
+    [(_, _, body)] = commenter.posted
+    assert "### Raw IAM and KMS resources" in body
+
+
+@dataclass
+class _FailingCommenter:
+    def post_comment(
+        self, repo: str, pull_request: int, body: str, *, marker: str | None = None
+    ) -> PostedComment:
+        raise GithubCommentError("GitHub returned HTTP 403")
+
+
+def test_a_refused_diff_whose_comment_fails_still_says_what_was_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote = _Remote.seeded(tmp_path, {})
+    repo, commit = _tenant_repo(tmp_path, {"role.yaml": RAW_ROLE})
+    _serve(monkeypatch, {})
+
+    with pytest.raises(RawIamKmsError) as raised:
+        DiffCommentProcessor(
+            system_repository=SYSTEM_REPOSITORY,
+            outputs=_outputs(remote, "fe-dev"),
+            commenter=_FailingCommenter(),
+        ).diff(repo, commit, pull_request=7, source_repository=TENANT)
+
+    message = str(raised.value)
+    assert "Role idfrog/idfrog-irsa (iam.aws.m.upbound.io/v1beta1)" in message
+    assert "KMSPermission" in message
+    assert message.endswith(
+        "The pull request comment saying so could not be posted: "
+        "GitHub returned HTTP 403"
+    )
+
+
+def test_a_diff_whose_comment_fails_without_a_refusal_reports_the_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote = _Remote.seeded(tmp_path, {})
+    repo, commit = _tenant_repo(tmp_path, {"deployment.yaml": DEPLOYMENT})
+    _serve(monkeypatch, {})
+
+    with pytest.raises(CommentPostError, match="HTTP 403"):
+        DiffCommentProcessor(
+            system_repository=SYSTEM_REPOSITORY,
+            outputs=_outputs(remote, "fe-dev"),
+            commenter=_FailingCommenter(),
+        ).diff(repo, commit, pull_request=7, source_repository=TENANT)
