@@ -163,6 +163,10 @@ def test_every_aws_and_crossplane_kind_in_any_version_is_found(
         # Other Crossplane groups and other providers are outside the rule.
         ("protection.crossplane.io/v1beta1", "Usage"),
         ("postgresql.sql.crossplane.io/v1alpha1", "Role"),
+        # The Crossplane groups are refused exactly, not the groups under them.
+        ("example.pkg.crossplane.io/v1", "Thing"),
+        ("sub.apiextensions.crossplane.io/v1", "Thing"),
+        ("x.ops.crossplane.io/v1alpha1", "Thing"),
     ],
 )
 def test_other_api_groups_are_left_alone(api_version: str, kind: str) -> None:

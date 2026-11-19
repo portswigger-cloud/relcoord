@@ -311,13 +311,14 @@ and says why.
 ## Raw AWS and Crossplane resources
 
 Only the system repository may generate Crossplane AWS resources or Crossplane's
-own definitions directly: anything in one of these API groups or a group under
-it, of any kind and version.
+own definitions directly: anything, of any kind and version, in `aws.m.upbound.io`
+or `aws.upbound.io` or a group under either, or in exactly
+`apiextensions.crossplane.io`, `pkg.crossplane.io` or `ops.crossplane.io`.
 
 | Group | What lives there |
 | --- | --- |
-| `aws.m.upbound.io` | Crossplane v2's namespaced AWS resources, one group per service (`iam.aws.m.upbound.io`, `kms.aws.m.upbound.io`, `s3.aws.m.upbound.io`, ...), and the provider's `ProviderConfig` |
-| `aws.upbound.io` | The same for Crossplane v1, cluster-scoped |
+| `aws.m.upbound.io` and every group under it | Crossplane v2's namespaced AWS resources, one group per service (`iam.aws.m.upbound.io`, `kms.aws.m.upbound.io`, `s3.aws.m.upbound.io`, ...), and the provider's `ProviderConfig` |
+| `aws.upbound.io` and every group under it | The same for Crossplane v1, cluster-scoped |
 | `apiextensions.crossplane.io` | `CompositeResourceDefinition`, `Composition`, `EnvironmentConfig` |
 | `pkg.crossplane.io` | `Provider`, `Function`, `Configuration` and their runtime configuration |
 | `ops.crossplane.io` | Crossplane v2 `Operation`s, which run functions against other resources |
@@ -347,9 +348,12 @@ manifest-builder leaves it, every document of every file and every item of a
 change that removes its own raw resources is deployed like any other. A file
 that cannot be read as YAML is refused rather than passed.
 
-`/v1/change` checks each output as it is generated, before anything is pushed,
-and fails with `raw_iam_kms_not_allowed` (422) naming each resource and its
-file. `/v1/diffcomment` puts the same list at the top of its comment, posts it,
+`/v1/change` checks each output as it is generated, before anything generated
+for that output is pushed, and fails with `raw_iam_kms_not_allowed` (422) naming
+each resource and its file. In a rollout the refused output and every stage after
+it are not pushed, but stages before it may already have been: a change that is
+refused only on a production output can leave its development outputs deployed,
+as any other stage failure does. `/v1/diffcomment` puts the same list at the top of its comment, posts it,
 and then fails the same way, so the check that asked for the diff fails as the
 merge would. A comment GitHub refuses does not change that answer: the request
 still fails with the refusal, and says the comment could not be posted. Both stream a `raw-iam-kms-refused` progress event per output. This

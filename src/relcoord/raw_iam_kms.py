@@ -22,7 +22,7 @@ how a ``KMSPermission`` legitimately ends up as raw resources.
 from __future__ import annotations
 
 import tomllib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,13 +38,15 @@ from relcoord.validator import read_tree
 #: ``.m.`` ones are Crossplane v2's namespaced managed resources, the others the
 #: cluster-scoped ones of Crossplane v1, which manifest-builder cannot always
 #: tell are cluster-scoped and so would write into a namespace directory rather
-#: than refuse. The Crossplane groups define and run what composites become:
-#: XRDs, Compositions and EnvironmentConfigs, packages such as Providers and
-#: Functions, and Operations.
+#: than refuse.
+SYSTEM_ONLY_API_GROUP_FAMILIES = frozenset({"aws.m.upbound.io", "aws.upbound.io"})
+
+#: API groups only the system repository may generate resources in, these
+#: groups exactly, in any version and of any kind. They define and run what
+#: composites become: XRDs, Compositions and EnvironmentConfigs, packages such
+#: as Providers and Functions, and Operations.
 SYSTEM_ONLY_API_GROUPS = frozenset(
     {
-        "aws.m.upbound.io",
-        "aws.upbound.io",
         "apiextensions.crossplane.io",
         "pkg.crossplane.io",
         "ops.crossplane.io",
@@ -105,7 +107,7 @@ def may_generate_raw_iam_kms(
     config_repo: str,
     system_repository: str | None,
 ) -> bool:
-    """Whether a generation may emit resources in :data:`SYSTEM_ONLY_API_GROUPS`.
+    """Whether a generation may emit the resources only system may generate.
 
     Only a system-mode generation of the configured system repository, asked
     for by that repository, may. System mode alone is not enough: it is a
@@ -192,9 +194,18 @@ def refusal_message(
     )
     return (
         f"{output}: only {system_name(system_repository)} may deploy raw AWS or "
-        f"Crossplane resources (in {', '.join(sorted(SYSTEM_ONLY_API_GROUPS))} or "
-        f"a group under them), and this change generates {listed}. {REMEDY}"
+        f"Crossplane resources (in {system_only_groups()}), and this change "
+        f"generates {listed}. {REMEDY}"
     )
+
+
+def system_only_groups(quote: Callable[[str], str] = str) -> str:
+    """Name the groups only the system repository may generate resources in."""
+    families = ", ".join(
+        quote(group) for group in sorted(SYSTEM_ONLY_API_GROUP_FAMILIES)
+    )
+    groups = ", ".join(quote(group) for group in sorted(SYSTEM_ONLY_API_GROUPS))
+    return f"{families} or a group under them, or {groups}"
 
 
 def system_name(system_repository: str | None) -> str:
@@ -207,9 +218,9 @@ def system_name(system_repository: str | None) -> str:
 def _system_only(api_version: str) -> bool:
     group, _, _version = api_version.strip().rpartition("/")
     group = group.lower()
-    return any(
-        group == system_only or group.endswith(f".{system_only}")
-        for system_only in SYSTEM_ONLY_API_GROUPS
+    return group in SYSTEM_ONLY_API_GROUPS or any(
+        group == family or group.endswith(f".{family}")
+        for family in SYSTEM_ONLY_API_GROUP_FAMILIES
     )
 
 

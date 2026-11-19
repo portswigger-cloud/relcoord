@@ -184,8 +184,10 @@ class ManifestValidationError(ChangeProcessingError):
 class RawIamKmsError(ChangeProcessingError):
     """Raised when a repository other than system generates raw AWS or Crossplane resources.
 
-    A change raises it before the output is pushed, so the manifests repository
-    is left as it was; a diff raises it once the comment saying why is posted.
+    A change raises it before the refused output is pushed, so that output and
+    the stages after it are left as they were, though earlier stages of a
+    rollout may already be pushed; a diff raises it once the comment saying why
+    is posted.
     Like a failed validation, it says nothing about relcoord.
     """
 
