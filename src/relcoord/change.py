@@ -182,10 +182,12 @@ class ManifestValidationError(ChangeProcessingError):
 
 
 class RawIamKmsError(ChangeProcessingError):
-    """Raised when a repository other than system generates raw IAM or KMS.
+    """Raised when a repository other than system generates raw AWS or Crossplane resources.
 
-    A change raises it before the output is pushed, so the manifests repository
-    is left as it was; a diff raises it once the comment saying why is posted.
+    A change raises it before the refused output is pushed, so that output and
+    the stages after it are left as they were, though earlier stages of a
+    rollout may already be pushed; a diff raises it once the comment saying why
+    is posted.
     Like a failed validation, it says nothing about relcoord.
     """
 
@@ -347,7 +349,7 @@ class ChangeProcessor:
 
         ``source_repository`` is the repository the request's verified token was
         issued to, None without one. Together with ``system`` it decides whether
-        the change may generate raw IAM and KMS resources; ``repo`` never does.
+        the change may generate raw AWS and Crossplane resources; ``repo`` never does.
         """
         with span(
             "change.process",
@@ -732,7 +734,7 @@ class ChangeProcessor:
     ) -> tuple[OutputResult, GenerationResult]:
         """Let manifest-builder write one output into the manifests checkout.
 
-        What it wrote is checked for raw IAM and KMS here, rather than where the
+        What it wrote is checked for raw AWS and Crossplane resources here, rather than where the
         stage pushes, so the one check covers a stage generated whole and one
         generated while the stage before it waits: either way an output that
         fails it raises before anything it generated is pushed.
@@ -1346,7 +1348,7 @@ class _RepositoryDiffRun:
     diff: RepositoryDiff
     validations: tuple[Future[OutputValidation], ...]
     refused: tuple[tuple[str, tuple[RawResource, ...]], ...] = ()
-    """Each output that generated raw IAM or KMS, with what it generated."""
+    """Each output that generated raw AWS or Crossplane resources, with what it generated."""
 
 
 @dataclass(frozen=True)
@@ -1397,7 +1399,7 @@ class DiffCommentProcessor:
         """Generate one config commit and report its diff.
 
         ``source_repository`` decides, with ``system``, whether the commit may
-        generate raw IAM and KMS resources, as it does for a change. A diff that
+        generate raw AWS and Crossplane resources, as it does for a change. A diff that
         generates them comments why and then fails, so the check that asked for
         it fails as the change would.
         """
@@ -1908,7 +1910,7 @@ def _raw_iam_kms(
     namespace: str | None,
     report: Callable[..., None],
 ) -> tuple[RawResource, ...]:
-    """Find the raw IAM and KMS resources one generation published.
+    """Find the raw AWS and Crossplane resources one generation published.
 
     Only the generation's own directories are read, so resources another owner
     already has in the output never stop this one, and a resource this change
@@ -1919,11 +1921,13 @@ def _raw_iam_kms(
     if refused:
         described = ", ".join(resource.describe() for resource in refused)
         logger.warning(
-            "output %s generates raw IAM or KMS resources: %s", output.name, described
+            "output %s generates raw AWS or Crossplane resources: %s",
+            output.name,
+            described,
         )
         report(
             "raw-iam-kms-refused",
-            f"{output.name}: refused raw IAM or KMS resources: {described}",
+            f"{output.name}: refused raw AWS or Crossplane resources: {described}",
             output=output.name,
             resources=[
                 {

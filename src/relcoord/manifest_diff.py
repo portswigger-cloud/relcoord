@@ -42,9 +42,9 @@ from manifest_builder import __version__ as MANIFEST_BUILDER_VERSION
 
 from relcoord.raw_iam_kms import (
     REMEDY,
-    SYSTEM_ONLY_API_GROUPS,
     RawResource,
     system_name,
+    system_only_groups,
 )
 from relcoord.validator import Finding, OutputValidation, SourceFiles
 
@@ -681,7 +681,7 @@ def render_raw_iam_kms_refusal(
     refused: Sequence[tuple[str, Sequence[RawResource]]],
     system_repository: str | None,
 ) -> str:
-    """Render the raw IAM and KMS resources a change was refused for.
+    """Render the raw AWS and Crossplane resources a change was refused for.
 
     It opens the comment, above the validation verdicts: this is not a finding
     to weigh but the reason the change will not deploy, so it is the first thing
@@ -690,14 +690,14 @@ def render_raw_iam_kms_refusal(
     rows = [(output, resource) for output, found in refused for resource in found]
     if not rows:
         return ""
-    groups = ", ".join(f"`{group}`" for group in sorted(SYSTEM_ONLY_API_GROUPS))
+    groups = system_only_groups(lambda group: f"`{group}`")
     verdict = (
         f"**Refused** — only `{system_name(system_repository)}` may deploy "
         f"resources in {groups}, so this change will not be deployed."
     )
     shown = rows[:MAX_VALIDATION_FINDINGS]
     lines = [
-        "### Raw IAM and KMS resources",
+        "### Raw AWS and Crossplane resources",
         "",
         verdict,
         "",
@@ -747,8 +747,8 @@ def build_comment_body(
     longer than GitHub accepts; ``omitted_context_diff`` reports whether the
     comment leaves the reader needing the full diff.
 
-    ``validation`` is whatever decides whether the change deploys: a raw IAM
-    and KMS refusal from :func:`render_raw_iam_kms_refusal` and
+    ``validation`` is whatever decides whether the change deploys: a raw AWS
+    and Crossplane refusal from :func:`render_raw_iam_kms_refusal` and
     manifest-validator's verdicts from :func:`render_validation_summary`. It
     opens the comment: whether the change is deployable is read before the
     diff, and its findings stay collapsed so they cost a reader who only wants

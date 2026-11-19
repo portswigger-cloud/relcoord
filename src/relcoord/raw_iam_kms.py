@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
-"""Keep raw IAM and KMS resources to the system repository.
+"""Keep raw AWS and Crossplane resources to the system repository.
 
-A Crossplane IAM role, policy or KMS key is an AWS identity or a key, and the
-only repository trusted to declare one directly is the system repository. Every
+A Crossplane AWS resource reaches AWS directly: an IAM role, policy or KMS key
+is an identity or a key, a bucket or queue policy grants access as surely as
+IAM does, and a ``ProviderConfig`` says which AWS identity Crossplane acts as.
+Crossplane's own definitions go further still: a Composition or Function
+decides what a composite becomes, and an EnvironmentConfig feeds it. The only
+repository trusted to declare any of these is the system repository. Every
 other repository asks for what it needs through a composite resource such as a
 ``KMSPermission``, whose Composition decides which raw resources it becomes.
 
@@ -18,7 +22,7 @@ how a ``KMSPermission`` legitimately ends up as raw resources.
 from __future__ import annotations
 
 import tomllib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,19 +31,25 @@ import yaml
 from relcoord.git import github_repo_from_url
 from relcoord.validator import read_tree
 
-#: API groups only the system repository may generate resources in, in any
-#: version and of any kind. The ``.m.`` groups are Crossplane v2's namespaced
-#: managed resources; the others are the cluster-scoped ones of Crossplane v1,
-#: which manifest-builder cannot always tell are cluster-scoped and so would
-#: write into a namespace directory rather than refuse. The provider's own
-#: configuration (``ProviderConfig`` in ``aws.m.upbound.io``) and its other
-#: services are outside these groups and outside this rule.
+#: API groups only the system repository may generate resources in, together
+#: with every group under them (``iam.aws.m.upbound.io`` is under
+#: ``aws.m.upbound.io``), in any version and of any kind. The AWS provider's
+#: groups are one per service plus the provider's own configuration: the
+#: ``.m.`` ones are Crossplane v2's namespaced managed resources, the others the
+#: cluster-scoped ones of Crossplane v1, which manifest-builder cannot always
+#: tell are cluster-scoped and so would write into a namespace directory rather
+#: than refuse.
+SYSTEM_ONLY_API_GROUP_FAMILIES = frozenset({"aws.m.upbound.io", "aws.upbound.io"})
+
+#: API groups only the system repository may generate resources in, these
+#: groups exactly, in any version and of any kind. They define and run what
+#: composites become: XRDs, Compositions and EnvironmentConfigs, packages such
+#: as Providers and Functions, and Operations.
 SYSTEM_ONLY_API_GROUPS = frozenset(
     {
-        "iam.aws.m.upbound.io",
-        "kms.aws.m.upbound.io",
-        "iam.aws.upbound.io",
-        "kms.aws.upbound.io",
+        "apiextensions.crossplane.io",
+        "pkg.crossplane.io",
+        "ops.crossplane.io",
     }
 )
 
@@ -51,8 +61,9 @@ YAML_LOADER: type[yaml.SafeLoader] = getattr(yaml, "CSafeLoader", yaml.SafeLoade
 
 #: What a refused change can do instead, closing every refusal.
 REMEDY = (
-    "Ask for KMS access with a KMSPermission instead, or have the platform team "
-    "add the IAM resources to system. Removing these resources is always allowed."
+    "Ask for AWS access through a composite resource such as a KMSPermission "
+    "instead, or have the platform team add these resources to system. Removing "
+    "these resources is always allowed."
 )
 
 
@@ -96,7 +107,7 @@ def may_generate_raw_iam_kms(
     config_repo: str,
     system_repository: str | None,
 ) -> bool:
-    """Whether a generation may emit resources in :data:`SYSTEM_ONLY_API_GROUPS`.
+    """Whether a generation may emit the resources only system may generate.
 
     Only a system-mode generation of the configured system repository, asked
     for by that repository, may. System mode alone is not enough: it is a
@@ -182,10 +193,19 @@ def refusal_message(
         f"{resource.describe()} in {resource.file}" for resource in resources
     )
     return (
-        f"{output}: only {system_name(system_repository)} may deploy raw IAM or "
-        f"KMS resources ({', '.join(sorted(SYSTEM_ONLY_API_GROUPS))}), and this "
-        f"change generates {listed}. {REMEDY}"
+        f"{output}: only {system_name(system_repository)} may deploy raw AWS or "
+        f"Crossplane resources (in {system_only_groups()}), and this change "
+        f"generates {listed}. {REMEDY}"
     )
+
+
+def system_only_groups(quote: Callable[[str], str] = str) -> str:
+    """Name the groups only the system repository may generate resources in."""
+    families = ", ".join(
+        quote(group) for group in sorted(SYSTEM_ONLY_API_GROUP_FAMILIES)
+    )
+    groups = ", ".join(quote(group) for group in sorted(SYSTEM_ONLY_API_GROUPS))
+    return f"{families} or a group under them, or {groups}"
 
 
 def system_name(system_repository: str | None) -> str:
@@ -197,7 +217,11 @@ def system_name(system_repository: str | None) -> str:
 
 def _system_only(api_version: str) -> bool:
     group, _, _version = api_version.strip().rpartition("/")
-    return group.lower() in SYSTEM_ONLY_API_GROUPS
+    group = group.lower()
+    return group in SYSTEM_ONLY_API_GROUPS or any(
+        group == family or group.endswith(f".{family}")
+        for family in SYSTEM_ONLY_API_GROUP_FAMILIES
+    )
 
 
 def _objects(

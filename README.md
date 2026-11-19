@@ -308,15 +308,28 @@ its `checks`, the content `digest` that was scanned, whether the verdict was
 that produced them. A finding whose `accepted` is set did not fail the verdict,
 and says why.
 
-## Raw IAM and KMS resources
+## Raw AWS and Crossplane resources
 
-Only the system repository may generate Crossplane IAM and KMS resources
-directly: anything in `iam.aws.m.upbound.io` or `kms.aws.m.upbound.io`, or in
-the cluster-scoped `iam.aws.upbound.io` and `kms.aws.upbound.io`, of any kind
-and version. Every other repository asks for what it needs through a composite
-resource, such as a `KMSPermission`, whose Composition decides which IAM and KMS
-resources it becomes. The provider's `ProviderConfig` and its other services
-(`s3`, `route53`, ...) are in other groups and not affected.
+Only the system repository may generate Crossplane AWS resources or Crossplane's
+own definitions directly: anything, of any kind and version, in `aws.m.upbound.io`
+or `aws.upbound.io` or a group under either, or in exactly
+`apiextensions.crossplane.io`, `pkg.crossplane.io` or `ops.crossplane.io`.
+
+| Group | What lives there |
+| --- | --- |
+| `aws.m.upbound.io` and every group under it | Crossplane v2's namespaced AWS resources, one group per service (`iam.aws.m.upbound.io`, `kms.aws.m.upbound.io`, `s3.aws.m.upbound.io`, ...), and the provider's `ProviderConfig` |
+| `aws.upbound.io` and every group under it | The same for Crossplane v1, cluster-scoped |
+| `apiextensions.crossplane.io` | `CompositeResourceDefinition`, `Composition`, `EnvironmentConfig` |
+| `pkg.crossplane.io` | `Provider`, `Function`, `Configuration` and their runtime configuration |
+| `ops.crossplane.io` | Crossplane v2 `Operation`s, which run functions against other resources |
+
+An IAM role or KMS key is an identity or a key; a bucket, queue or repository
+policy grants access as IAM does; a `ProviderConfig` says which AWS identity
+Crossplane acts as; and a Composition, Function or EnvironmentConfig decides
+what a composite becomes. Every other repository asks for what it needs through
+a composite resource, such as a `KMSPermission`, whose Composition (system's)
+decides which raw resources it becomes. Composite resources in other groups
+(`portswigger.io`, ...) and resources of other providers are not affected.
 
 The exemption is a system-mode request to generate the configured
 `system-repository`, from a verified token issued to that same repository: the
@@ -335,9 +348,12 @@ manifest-builder leaves it, every document of every file and every item of a
 change that removes its own raw resources is deployed like any other. A file
 that cannot be read as YAML is refused rather than passed.
 
-`/v1/change` checks each output as it is generated, before anything is pushed,
-and fails with `raw_iam_kms_not_allowed` (422) naming each resource and its
-file. `/v1/diffcomment` puts the same list at the top of its comment, posts it,
+`/v1/change` checks each output as it is generated, before anything generated
+for that output is pushed, and fails with `raw_iam_kms_not_allowed` (422) naming
+each resource and its file. In a rollout the refused output and every stage after
+it are not pushed, but stages before it may already have been: a change that is
+refused only on a production output can leave its development outputs deployed,
+as any other stage failure does. `/v1/diffcomment` puts the same list at the top of its comment, posts it,
 and then fails the same way, so the check that asked for the diff fails as the
 merge would. A comment GitHub refuses does not change that answer: the request
 still fails with the refusal, and says the comment could not be posted. Both stream a `raw-iam-kms-refused` progress event per output. This

@@ -1031,7 +1031,7 @@ def _report_processing_failure(
         return 422, "manifest_validation_failed", str(exc)
     if isinstance(exc, RawIamKmsError):
         logger.warning(
-            "Refused raw IAM or KMS resources in %s for repo %s at commit %s: %s",
+            "Refused raw AWS or Crossplane resources in %s for repo %s at commit %s: %s",
             action,
             repo,
             commit,
