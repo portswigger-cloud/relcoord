@@ -29,6 +29,7 @@ from relcoord.change import (
     GitTransportError,
     ManifestValidationError,
     ProgressSink,
+    RawIamKmsError,
     RolloutStageError,
     ignore_progress,
     join_names,
@@ -47,6 +48,7 @@ from relcoord.git import (
     github_repo_from_url,
     is_ssh_style_git_uri,
 )
+from relcoord.raw_iam_kms import verified_repository
 from relcoord.service import ImageVersionService
 from relcoord.store import ImageInfoStore
 from relcoord.tracing import mark_error, set_attributes, span
@@ -72,6 +74,7 @@ class ChangeProcessor(Protocol):
         outputs: Sequence[str] = ...,
         *,
         section: str | None = ...,
+        source_repository: str | None = ...,
         progress: ProgressSink = ...,
     ) -> object: ...
 
@@ -87,6 +90,7 @@ class DiffProcessor(Protocol):
         *,
         section: str | None = ...,
         pull_request: int | None = ...,
+        source_repository: str | None = ...,
         progress: ProgressSink = ...,
     ) -> object: ...
 
@@ -126,6 +130,8 @@ class _ChangePlan:
     """Outputs this change may deploy to, empty for every configured output."""
     section: str | None = None
     """Section of the system repository that says which outputs to deploy to."""
+    source_repository: str | None = None
+    """The repository the verified token was issued to, not the requested one."""
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,8 @@ class _DiffPlan:
     """Outputs this diff may report on, empty for every configured output."""
     section: str | None = None
     """Section of the system repository that says which outputs to report on."""
+    source_repository: str | None = None
+    """The repository the verified token was issued to, not the requested one."""
 
 
 class _SystemNotAllowedError(Exception):
@@ -162,6 +170,7 @@ class NoopChangeProcessor:
         outputs: Sequence[str] = (),
         *,
         section: str | None = None,
+        source_repository: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         message = (
@@ -319,6 +328,7 @@ def create_app(
             manifest_image=manifest_image,
             outputs=_permitted_outputs(payload, principal),
             section=section,
+            source_repository=verified_repository(principal),
         )
 
     async def change(request: Request) -> Response:
@@ -386,6 +396,7 @@ def create_app(
                 plan.system,
                 plan.outputs,
                 section=plan.section,
+                source_repository=plan.source_repository,
             )
         except ChangeProcessingError as exc:
             status_code, error, message = _report_change_failure(request, plan, exc)
@@ -455,6 +466,7 @@ def create_app(
                 plan.outputs,
                 pull_request=plan.pull_request,
                 section=plan.section,
+                source_repository=plan.source_repository,
             )
         except ChangeProcessingError as exc:
             status_code, error, message = _report_diff_failure(request, plan, exc)
@@ -803,6 +815,7 @@ def _plan_diff(payload: dict[str, Any], principal: object) -> _DiffPlan:
         pull_request=pull_request,
         outputs=_permitted_outputs(payload, principal),
         section=_change_section(payload, system),
+        source_repository=verified_repository(principal),
     )
 
 
@@ -1016,6 +1029,15 @@ def _report_processing_failure(
             exc,
         )
         return 422, "manifest_validation_failed", str(exc)
+    if isinstance(exc, RawIamKmsError):
+        logger.warning(
+            "Refused raw IAM or KMS resources in %s for repo %s at commit %s: %s",
+            action,
+            repo,
+            commit,
+            exc,
+        )
+        return 422, "raw_iam_kms_not_allowed", str(exc)
     if isinstance(exc, RolloutStageError):
         logger.warning(
             "Rollout stopped while processing %s for repo %s at commit %s: %s",
@@ -1073,6 +1095,7 @@ def _change_events(
                 plan.outputs,
                 progress=progress,
                 section=plan.section,
+                source_repository=plan.source_repository,
             ),
             complete=lambda result: _change_completion(plan, result),
             failure=lambda exc: _report_change_failure(request, plan, exc),
@@ -1102,6 +1125,7 @@ def _diff_events(
                 pull_request=plan.pull_request,
                 progress=progress,
                 section=plan.section,
+                source_repository=plan.source_repository,
             ),
             complete=lambda result: _diff_completion(plan, result),
             failure=lambda exc: _report_diff_failure(request, plan, exc),

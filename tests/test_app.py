@@ -20,6 +20,7 @@ from relcoord.app import (
     RequestTokenValidator,
     create_app,
 )
+from relcoord.auth import ValidatedClaims
 from relcoord.change import (
     ChangeProcessingError,
     ChangeProgress,
@@ -29,6 +30,7 @@ from relcoord.change import (
     GitTransportError,
     ManifestValidationError,
     ProgressSink,
+    RawIamKmsError,
     RolloutStageError,
     ignore_progress,
 )
@@ -287,6 +289,7 @@ def test_change_passes_image_reference_to_processor() -> None:
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
@@ -362,6 +365,7 @@ def test_change_processes_deploy_config_when_processor_is_configured(
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
@@ -417,6 +421,7 @@ def test_change_processor_logs_from_worker_thread(
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             logging.getLogger("relcoord.change").info(
@@ -463,6 +468,7 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
@@ -541,6 +547,7 @@ def test_change_reports_missing_deploy_config(
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise DeployConfigError("missing .deploy")
@@ -587,6 +594,7 @@ def test_change_reports_credential_error_without_traceback(
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise CredentialError(
@@ -641,6 +649,7 @@ def test_change_reports_git_transport_error_without_traceback(
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise GitTransportError(
@@ -691,6 +700,7 @@ def test_change_reports_a_stopped_rollout_without_traceback(
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise RolloutStageError(
@@ -745,6 +755,7 @@ def _config_path_recording_client() -> tuple[TestClient, list[str]]:
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             config_paths.append(config_path)
@@ -823,6 +834,7 @@ def _section_recording_client() -> tuple[TestClient, list[str | None]]:
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             sections.append(section)
@@ -924,6 +936,7 @@ def _system_recording_client(
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             systems.append(system)
@@ -1033,6 +1046,7 @@ def _outputs_recording_client(
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             selections.append(tuple(outputs))
@@ -1347,6 +1361,7 @@ class ReportingProcessor:
         outputs: Sequence[str] = (),
         *,
         section: str | None = None,
+        source_repository: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         for step in self._steps:
@@ -1472,6 +1487,7 @@ class BlockingProcessor:
         outputs: Sequence[str] = (),
         *,
         section: str | None = None,
+        source_repository: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         progress(ChangeProgress(phase="workspace", message="created workspace"))
@@ -1780,6 +1796,7 @@ class _RecordingDiffProcessor:
         *,
         pull_request: int | None = None,
         section: str | None = None,
+        source_repository: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         self.calls.append((repo, commit, config_path, system, pull_request))
@@ -2325,6 +2342,7 @@ def test_change_reports_a_failed_validation_without_a_stack_trace(
             outputs: Sequence[str] = (),
             *,
             section: str | None = None,
+            source_repository: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise ManifestValidationError(message)
@@ -2353,3 +2371,158 @@ def test_change_reports_a_failed_validation_without_a_stack_trace(
     }
     assert "Manifest validation stopped change" in caplog.text
     assert "Traceback (most recent call last)" not in caplog.text
+
+
+class _ClaimsValidator:
+    """Authenticates every request as a GitHub Actions token from ``repository``."""
+
+    def __init__(self, repository: str, allow_system: bool = False) -> None:
+        self._principal = ValidatedClaims(
+            role="tenant",
+            claims={
+                "iss": "https://token.actions.githubusercontent.com",
+                "repository": repository,
+            },
+            allow_system=allow_system,
+        )
+
+    def validate(self, authorization_header: str | None) -> object:
+        return self._principal
+
+
+class _SourceRecorder:
+    """A change and diff processor recording the source repository it is given."""
+
+    def __init__(self, failure: ChangeProcessingError | None = None) -> None:
+        self.sources: list[str | None] = []
+        self._failure = failure
+
+    def process(
+        self,
+        repo: str,
+        commit: str,
+        image: str | None,
+        config_path: str = ".deploy",
+        system: bool = False,
+        outputs: Sequence[str] = (),
+        *,
+        section: str | None = None,
+        source_repository: str | None = None,
+        progress: ProgressSink = ignore_progress,
+    ) -> object:
+        self.sources.append(source_repository)
+        if self._failure is not None:
+            raise self._failure
+        return type("Result", (), {"generated_count": 0, "outputs": ()})()
+
+    def diff(
+        self,
+        repo: str,
+        commit: str,
+        config_path: str = ".deploy",
+        system: bool = False,
+        outputs: Sequence[str] = (),
+        *,
+        section: str | None = None,
+        pull_request: int | None = None,
+        source_repository: str | None = None,
+        progress: ProgressSink = ignore_progress,
+    ) -> object:
+        self.sources.append(source_repository)
+        if self._failure is not None:
+            raise self._failure
+        return _stub_diff_result()
+
+
+def _source_client(
+    token_validator: RequestTokenValidator, processor: _SourceRecorder
+) -> TestClient:
+    return TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=token_validator,
+            change_processor=processor,
+            diff_processor=processor,
+        )
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/change", "/v1/diffcomment"])
+@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
+def test_the_source_repository_is_the_tokens_never_the_requests(
+    endpoint: str, accept: str
+) -> None:
+    processor = _SourceRecorder()
+    client = _source_client(_ClaimsValidator("acme/idfrog"), processor)
+
+    response = client.post(
+        endpoint,
+        # A tenant naming the system repository is still the tenant.
+        json={"config_repo": "https://github.com/acme/system", "commit": "deadbeef"},
+        headers={"accept": accept},
+    )
+
+    assert response.status_code in {200, 202}
+    assert processor.sources == ["acme/idfrog"]
+
+
+def test_an_unauthenticated_request_has_no_source_repository() -> None:
+    processor = _SourceRecorder()
+    client = _source_client(NoopTokenValidator(), processor)
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "https://github.com/acme/system", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 202
+    assert processor.sources == [None]
+
+
+REFUSED = (
+    "fe-dev: only acme/system may deploy raw IAM or KMS resources (...), and this "
+    "change generates Role idfrog/idfrog-irsa (iam.aws.m.upbound.io/v1beta1) in "
+    "idfrog/role-idfrog-irsa.yaml."
+)
+
+
+def test_a_change_refused_raw_iam_kms_is_unprocessable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _source_client(
+        _ClaimsValidator("acme/idfrog"), _SourceRecorder(RawIamKmsError(REFUSED))
+    )
+    caplog.set_level(logging.WARNING, logger="relcoord.app")
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "https://github.com/acme/idfrog", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"error": "raw_iam_kms_not_allowed", "message": REFUSED}
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_a_diff_refused_raw_iam_kms_ends_its_stream_with_an_error() -> None:
+    client = _source_client(
+        _ClaimsValidator("acme/idfrog"), _SourceRecorder(RawIamKmsError(REFUSED))
+    )
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/idfrog",
+            "commit": "deadbeef",
+            "pull_request": 7,
+        },
+        headers={"accept": "text/event-stream"},
+    )
+
+    events = parse_sse(response.text)
+    assert [name for name, _ in events] == ["accepted", "error"]
+    assert events[1][1] == {
+        "status": 422,
+        "error": "raw_iam_kms_not_allowed",
+        "message": REFUSED,
+    }
