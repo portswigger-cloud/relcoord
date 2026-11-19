@@ -3,6 +3,7 @@
 import json
 import logging
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,11 @@ from relcoord.eks import TOKEN_PREFIX, EksTokenAuth
 from relcoord.kubernetes import (
     MANIFEST_ID_ANNOTATION,
     DeploymentDetectionError,
+    Goal,
     KubernetesDeploymentDetector,
+    _complete,
+    _Hold,
+    _pending,
     _symmetric_jitter,
     cluster_client,
 )
@@ -99,6 +104,14 @@ def annotated(name: str, manifest_id: str | None) -> dict[str, object]:
     return {"metadata": {"name": name, "annotations": annotations}}
 
 
+def pod_template(probed: bool) -> dict[str, Any]:
+    containers: list[dict[str, Any]] = [{"name": "app"}, {"name": "sidecar"}]
+    if probed:
+        for container in containers:
+            container["readinessProbe"] = {"httpGet": {"path": "/ready"}}
+    return {"spec": {"containers": containers}}
+
+
 def deployment(
     name: str,
     manifest_id: str | None,
@@ -111,6 +124,8 @@ def deployment(
     available_replicas: int | None = None,
     paused: bool = False,
     conditions: list[dict[str, Any]] | None = None,
+    probed: bool = False,
+    min_ready_seconds: int = 0,
 ) -> dict[str, Any]:
     """A Deployment that has finished rolling out, unless told otherwise."""
     annotations = {} if manifest_id is None else {MANIFEST_ID_ANNOTATION: manifest_id}
@@ -120,7 +135,12 @@ def deployment(
             "annotations": annotations,
             "generation": generation,
         },
-        "spec": {"replicas": replicas, "paused": paused},
+        "spec": {
+            "replicas": replicas,
+            "paused": paused,
+            "minReadySeconds": min_ready_seconds,
+            "template": pod_template(probed),
+        },
         "status": {
             "observedGeneration": (
                 generation if observed_generation is None else observed_generation
@@ -150,6 +170,9 @@ def statefulset(
     partition: int | None = None,
     current_revision: str = "db-7f4",
     update_revision: str | None = None,
+    probed: bool = False,
+    min_ready_seconds: int = 0,
+    available_replicas: int | None = None,
 ) -> dict[str, Any]:
     """A StatefulSet that has finished rolling out, unless told otherwise."""
     annotations = {} if manifest_id is None else {MANIFEST_ID_ANNOTATION: manifest_id}
@@ -162,12 +185,20 @@ def statefulset(
             "annotations": annotations,
             "generation": generation,
         },
-        "spec": {"replicas": replicas, "updateStrategy": strategy},
+        "spec": {
+            "replicas": replicas,
+            "updateStrategy": strategy,
+            "minReadySeconds": min_ready_seconds,
+            "template": pod_template(probed),
+        },
         "status": {
             "observedGeneration": (
                 generation if observed_generation is None else observed_generation
             ),
             "readyReplicas": replicas if ready_replicas is None else ready_replicas,
+            "availableReplicas": (
+                replicas if available_replicas is None else available_replicas
+            ),
             "updatedReplicas": (
                 replicas if updated_replicas is None else updated_replicas
             ),
@@ -195,6 +226,7 @@ def detector(
     *,
     timeout_seconds: float = 5,
     watch_timeout_seconds: float = 5,
+    settle_seconds: float = 0,
     throttle_attempts: int = 10,
     throttle_initial_delay_seconds: float = 1.0,
     sleep: Any = None,
@@ -209,6 +241,7 @@ def detector(
         timeout_seconds=timeout_seconds,
         watch_timeout_seconds=watch_timeout_seconds,
         retry_delay_seconds=0,
+        settle_seconds=settle_seconds,
         throttle_attempts=throttle_attempts,
         throttle_initial_delay_seconds=throttle_initial_delay_seconds,
         # Backing off for real would only make the suite slow; the tests that
@@ -519,6 +552,140 @@ def test_detector_reports_why_a_replica_set_cannot_create_pods() -> None:
     # Transient on its own, so it explains the wait rather than ending it.
     assert "exceeded quota" in message
     assert "timed out after" in message
+
+
+def watching_for_settling(handler, *, settle_seconds: float = 0.3) -> float:
+    """Wait for a Deployment and return how long that took."""
+    began = time.monotonic()
+    detector(handler, settle_seconds=settle_seconds).wait_for_success(
+        created_or_modified={
+            Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+        },
+        removed=set(),
+    )
+    return time.monotonic() - began
+
+
+def test_detector_holds_a_deployment_without_probes_for_the_settle_window() -> None:
+    elapsed = watching_for_settling(deployments_handler(deployment("api", MANIFEST_ID)))
+
+    assert elapsed >= 0.3
+
+
+@pytest.mark.parametrize(
+    "vouched_for",
+    [
+        deployment("api", MANIFEST_ID, probed=True),
+        deployment("api", MANIFEST_ID, min_ready_seconds=5),
+        # Nothing to crash when nothing is meant to run.
+        deployment("api", MANIFEST_ID, replicas=0),
+    ],
+    ids=["readiness-probes", "min-ready-seconds", "no-replicas"],
+)
+def test_detector_trusts_a_deployment_whose_readiness_is_vouched_for(
+    vouched_for: dict[str, Any],
+) -> None:
+    assert watching_for_settling(deployments_handler(vouched_for)) < 0.3
+
+
+def test_detector_settles_a_deployment_with_a_probe_missing_from_one_container() -> (
+    None
+):
+    partly = deployment("api", MANIFEST_ID, probed=True)
+    del partly["spec"]["template"]["spec"]["containers"][1]["readinessProbe"]
+
+    assert watching_for_settling(deployments_handler(partly)) >= 0.3
+
+
+def test_detector_starts_the_settle_window_over_when_a_deployment_stops_being_ready() -> (
+    None
+):
+    # What a crash loop looks like: available for a moment, then not, again.
+    ref = Ref("Deployment", "default", "api", "apps/v1")
+    unvouched = Goal(
+        description="a rollout", progress=lambda _obj: _complete(settle=True)
+    )
+    subject = detector(lambda _request: httpx.Response(500), settle_seconds=0.3)
+    hold = _Hold()
+    began = time.monotonic()
+
+    assert not subject._settled(ref, unvouched, _complete(settle=True), began, hold)
+    time.sleep(0.2)
+    assert not subject._settled(ref, unvouched, _pending("crashed"), began, hold)
+    assert hold.since is None
+    assert not subject._settled(ref, unvouched, _complete(settle=True), began, hold)
+    time.sleep(0.2)
+    # Longer ago than the window, but the window started over at the crash.
+    assert not subject._settled(ref, unvouched, _complete(settle=True), began, hold)
+    time.sleep(0.15)
+    assert subject._settled(ref, unvouched, _complete(settle=True), began, hold)
+
+
+def test_detector_times_out_on_a_deployment_that_never_stays_ready() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[request.url.path])
+        flapping = [
+            ("MODIFIED", deployment("api", MANIFEST_ID)),
+            ("MODIFIED", deployment("api", MANIFEST_ID, available_replicas=0)),
+        ]
+        if "watch" not in request.url.params:
+            return httpx.Response(
+                200, json=listing(deployment("api", MANIFEST_ID, available_replicas=0))
+            )
+        return httpx.Response(200, content=watch_stream(*flapping))
+
+    with pytest.raises(DeploymentDetectionError, match="timed out"):
+        detector(handler, timeout_seconds=1, settle_seconds=30).wait_for_success(
+            created_or_modified={
+                Ref("Deployment", "default", "api", "apps/v1"): MANIFEST_ID
+            },
+            removed=set(),
+        )
+
+
+def test_detector_holds_a_statefulset_without_probes_for_the_settle_window() -> None:
+    began = time.monotonic()
+    detector(
+        statefulsets_handler(statefulset("db", MANIFEST_ID)), settle_seconds=0.3
+    ).wait_for_success(
+        created_or_modified={
+            Ref("StatefulSet", "default", "db", "apps/v1"): MANIFEST_ID
+        },
+        removed=set(),
+    )
+
+    assert time.monotonic() - began >= 0.3
+
+
+def test_detector_trusts_a_statefulset_with_probes() -> None:
+    began = time.monotonic()
+    detector(
+        statefulsets_handler(statefulset("db", MANIFEST_ID, probed=True)),
+        settle_seconds=0.3,
+    ).wait_for_success(
+        created_or_modified={
+            Ref("StatefulSet", "default", "db", "apps/v1"): MANIFEST_ID
+        },
+        removed=set(),
+    )
+
+    assert time.monotonic() - began < 0.3
+
+
+def test_detector_waits_for_a_statefulset_s_pods_to_be_available_for_min_ready_seconds() -> (
+    None
+):
+    handler = statefulsets_handler(
+        statefulset("db", MANIFEST_ID, min_ready_seconds=5, available_replicas=1),
+        statefulset("db", MANIFEST_ID, min_ready_seconds=5),
+    )
+
+    began = time.monotonic()
+    wait_for_statefulset(handler)
+
+    # Trusted once available, so no settle window on top of the controller's.
+    assert time.monotonic() - began < 1
 
 
 def test_detector_waits_for_a_statefulset_to_replace_its_pods(
