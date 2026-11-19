@@ -2480,7 +2480,7 @@ def test_an_unauthenticated_request_has_no_source_repository() -> None:
 
 
 REFUSED = (
-    "fe-dev: only acme/system may deploy raw IAM or KMS resources (...), and this "
+    "fe-dev: only acme/system may deploy raw AWS or Crossplane resources (...), and this "
     "change generates Role idfrog/idfrog-irsa (iam.aws.m.upbound.io/v1beta1) in "
     "idfrog/role-idfrog-irsa.yaml."
 )

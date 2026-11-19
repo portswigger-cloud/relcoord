@@ -681,7 +681,7 @@ def render_raw_iam_kms_refusal(
     refused: Sequence[tuple[str, Sequence[RawResource]]],
     system_repository: str | None,
 ) -> str:
-    """Render the raw IAM and KMS resources a change was refused for.
+    """Render the raw AWS and Crossplane resources a change was refused for.
 
     It opens the comment, above the validation verdicts: this is not a finding
     to weigh but the reason the change will not deploy, so it is the first thing
@@ -693,11 +693,12 @@ def render_raw_iam_kms_refusal(
     groups = ", ".join(f"`{group}`" for group in sorted(SYSTEM_ONLY_API_GROUPS))
     verdict = (
         f"**Refused** — only `{system_name(system_repository)}` may deploy "
-        f"resources in {groups}, so this change will not be deployed."
+        f"resources in {groups} or a group under them, so this change will not be "
+        "deployed."
     )
     shown = rows[:MAX_VALIDATION_FINDINGS]
     lines = [
-        "### Raw IAM and KMS resources",
+        "### Raw AWS and Crossplane resources",
         "",
         verdict,
         "",
@@ -747,8 +748,8 @@ def build_comment_body(
     longer than GitHub accepts; ``omitted_context_diff`` reports whether the
     comment leaves the reader needing the full diff.
 
-    ``validation`` is whatever decides whether the change deploys: a raw IAM
-    and KMS refusal from :func:`render_raw_iam_kms_refusal` and
+    ``validation`` is whatever decides whether the change deploys: a raw AWS
+    and Crossplane refusal from :func:`render_raw_iam_kms_refusal` and
     manifest-validator's verdicts from :func:`render_validation_summary`. It
     opens the comment: whether the change is deployable is read before the
     diff, and its findings stay collapsed so they cost a reader who only wants

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
-"""Only the system repository may generate raw IAM and KMS resources.
+"""Only the system repository may generate raw AWS and Crossplane resources.
 
 The end-to-end tests here run manifest-builder for real, against config and
 manifests repositories that are git repositories on disk, so what is checked is
@@ -107,16 +107,35 @@ def _document(api_version: str, kind: str, name: str = "x") -> str:
         ("kms.aws.m.upbound.io/v1beta1", "Key"),
         ("kms.aws.m.upbound.io/v1beta1", "Alias"),
         ("kms.aws.m.upbound.io/v1beta1", "Grant"),
+        # Policies of other services grant access as IAM does.
+        ("s3.aws.m.upbound.io/v1beta1", "BucketPolicy"),
+        ("sqs.aws.m.upbound.io/v1beta1", "QueuePolicy"),
+        ("ecr.aws.m.upbound.io/v1beta1", "RepositoryPolicy"),
+        ("s3.aws.m.upbound.io/v1beta1", "Bucket"),
+        ("dynamodb.aws.m.upbound.io/v1beta1", "Table"),
+        # The provider's configuration says which AWS identity Crossplane uses.
+        ("aws.m.upbound.io/v1beta1", "ProviderConfig"),
+        ("aws.m.upbound.io/v1beta1", "ClusterProviderConfig"),
         # Crossplane v1's cluster-scoped equivalents.
         ("iam.aws.upbound.io/v1beta1", "Role"),
         ("iam.aws.upbound.io/v1beta1", "RolePolicyAttachment"),
         ("kms.aws.upbound.io/v1beta1", "Key"),
         ("kms.aws.upbound.io/v1beta1", "Alias"),
+        ("aws.upbound.io/v1beta1", "ProviderConfig"),
+        # What decides and runs what a composite becomes.
+        ("apiextensions.crossplane.io/v1", "CompositeResourceDefinition"),
+        ("apiextensions.crossplane.io/v1", "Composition"),
+        ("apiextensions.crossplane.io/v1beta1", "EnvironmentConfig"),
+        ("pkg.crossplane.io/v1", "Provider"),
+        ("pkg.crossplane.io/v1", "Function"),
+        ("pkg.crossplane.io/v1beta1", "DeploymentRuntimeConfig"),
+        ("ops.crossplane.io/v1alpha1", "Operation"),
         # The API server would not know this group; refusing it costs nothing.
         ("IAM.aws.m.upbound.io/v1beta1", "Role"),
+        ("PKG.crossplane.io/v1", "Function"),
     ],
 )
-def test_every_iam_and_kms_kind_in_any_version_is_found(
+def test_every_aws_and_crossplane_kind_in_any_version_is_found(
     api_version: str, kind: str
 ) -> None:
     found = find_raw_resources({"ns/x.yaml": _document(api_version, kind).encode()})
@@ -127,16 +146,23 @@ def test_every_iam_and_kms_kind_in_any_version_is_found(
 @pytest.mark.parametrize(
     ("api_version", "kind"),
     [
+        # Composites are how every other repository asks for AWS.
         ("portswigger.io/v1alpha1", "KMSPermission"),
-        # The provider's configuration is not IAM or KMS.
-        ("aws.m.upbound.io/v1beta1", "ProviderConfig"),
-        ("aws.upbound.io/v1beta1", "ProviderConfig"),
-        ("s3.aws.m.upbound.io/v1beta1", "Bucket"),
-        ("route53.aws.m.upbound.io/v1beta1", "Record"),
+        ("platform.portswigger.io/v1alpha1", "IrsaRole"),
         ("rbac.authorization.k8s.io/v1", "Role"),
         ("v1", "ConfigMap"),
         ("apps/v1", "Deployment"),
+        ("external-secrets.io/v1", "ExternalSecret"),
+        ("grafana.integreatly.org/v1beta1", "GrafanaDashboard"),
+        # Only the groups themselves and the groups under them, nothing that
+        # merely ends with the same letters or starts with the same group.
+        ("xaws.m.upbound.io/v1beta1", "Role"),
         ("iam.aws.m.upbound.io.example.com/v1", "Role"),
+        ("crossplane.io/v1", "Thing"),
+        ("upbound.io/v1", "Thing"),
+        # Other Crossplane groups and other providers are outside the rule.
+        ("protection.crossplane.io/v1beta1", "Usage"),
+        ("postgresql.sql.crossplane.io/v1alpha1", "Role"),
     ],
 )
 def test_other_api_groups_are_left_alone(api_version: str, kind: str) -> None:
@@ -317,7 +343,9 @@ def test_a_refusal_names_each_resource_and_what_to_do_instead() -> None:
         SYSTEM_REPOSITORY,
     )
 
-    assert message.startswith("fe-dev: only acme/system may deploy raw IAM or KMS")
+    assert message.startswith(
+        "fe-dev: only acme/system may deploy raw AWS or Crossplane"
+    )
     assert (
         "Role idfrog/idfrog-irsa (iam.aws.m.upbound.io/v1beta1) in "
         "idfrog/role-idfrog-irsa.yaml" in message
@@ -336,7 +364,9 @@ def test_the_comment_tables_refused_resources_without_breaking_its_rows() -> Non
 
     body = render_raw_iam_kms_refusal([("fe-dev", (hostile,))], SYSTEM_REPOSITORY)
 
-    assert body.startswith("### Raw IAM and KMS resources\n\n**Refused** — only `acme")
+    assert body.startswith(
+        "### Raw AWS and Crossplane resources\n\n**Refused** — only `acme"
+    )
     assert "| fe-dev | Role a\\|b c (iam.aws.m.upbound.io/v1beta1) |" in body
     assert body.rstrip().endswith("Removing these resources is always allowed.")
     assert render_raw_iam_kms_refusal([], SYSTEM_REPOSITORY) == ""
@@ -518,7 +548,9 @@ def test_a_tenant_change_generating_raw_iam_is_refused_and_pushes_nothing(
         ).process(repo, commit, None, source_repository=TENANT, progress=progress)
 
     message = str(raised.value)
-    assert message.startswith("fe-dev: only acme/system may deploy raw IAM or KMS")
+    assert message.startswith(
+        "fe-dev: only acme/system may deploy raw AWS or Crossplane"
+    )
     assert "Role idfrog/idfrog-irsa (iam.aws.m.upbound.io/v1beta1)" in message
     assert "in idfrog/role-idfrog-irsa.yaml" in message
     assert "RolePolicy idfrog/idfrog-kms (iam.aws.m.upbound.io/v1beta1)" in message
@@ -780,7 +812,7 @@ def test_a_tenant_diff_comments_the_refusal_and_then_fails(
 
     [(_, pull_request, body)] = commenter.posted
     assert pull_request == 7
-    assert body.index("### Raw IAM and KMS resources") < body.index("diff --git")
+    assert body.index("### Raw AWS and Crossplane resources") < body.index("diff --git")
     assert "| fe-dev | Role idfrog/idfrog-irsa (iam.aws.m.upbound.io/v1beta1) |" in body
     assert "| fe-prod | Role idfrog/idfrog-irsa" in body
     assert "KMSPermission" in body
@@ -812,7 +844,7 @@ def test_a_tenant_diff_without_raw_iam_says_nothing_about_it(
         system_repository=SYSTEM_REPOSITORY, outputs=_outputs(remote, "fe-dev")
     ).diff(repo, commit, source_repository=TENANT)
 
-    assert "Raw IAM" not in result.comment.body
+    assert "Raw AWS" not in result.comment.body
     assert "kmspermission-idfrog-signing.yaml" in result.comment.body
 
 
@@ -827,7 +859,7 @@ def test_a_system_diff_with_raw_iam_is_not_refused(
         system_repository=SYSTEM_REPOSITORY, outputs=_outputs(remote, "fe-dev")
     ).diff(SYSTEM_REPOSITORY, commit, system=True, source_repository=SYSTEM)
 
-    assert "Raw IAM" not in result.comment.body
+    assert "Raw AWS" not in result.comment.body
     assert "role-idfrog-irsa.yaml" in result.comment.body
 
 
@@ -853,7 +885,7 @@ def test_a_system_token_diff_of_another_repository_as_system_is_refused(
         )
 
     [(_, _, body)] = commenter.posted
-    assert "### Raw IAM and KMS resources" in body
+    assert "### Raw AWS and Crossplane resources" in body
 
 
 @dataclass

@@ -308,15 +308,27 @@ its `checks`, the content `digest` that was scanned, whether the verdict was
 that produced them. A finding whose `accepted` is set did not fail the verdict,
 and says why.
 
-## Raw IAM and KMS resources
+## Raw AWS and Crossplane resources
 
-Only the system repository may generate Crossplane IAM and KMS resources
-directly: anything in `iam.aws.m.upbound.io` or `kms.aws.m.upbound.io`, or in
-the cluster-scoped `iam.aws.upbound.io` and `kms.aws.upbound.io`, of any kind
-and version. Every other repository asks for what it needs through a composite
-resource, such as a `KMSPermission`, whose Composition decides which IAM and KMS
-resources it becomes. The provider's `ProviderConfig` and its other services
-(`s3`, `route53`, ...) are in other groups and not affected.
+Only the system repository may generate Crossplane AWS resources or Crossplane's
+own definitions directly: anything in one of these API groups or a group under
+it, of any kind and version.
+
+| Group | What lives there |
+| --- | --- |
+| `aws.m.upbound.io` | Crossplane v2's namespaced AWS resources, one group per service (`iam.aws.m.upbound.io`, `kms.aws.m.upbound.io`, `s3.aws.m.upbound.io`, ...), and the provider's `ProviderConfig` |
+| `aws.upbound.io` | The same for Crossplane v1, cluster-scoped |
+| `apiextensions.crossplane.io` | `CompositeResourceDefinition`, `Composition`, `EnvironmentConfig` |
+| `pkg.crossplane.io` | `Provider`, `Function`, `Configuration` and their runtime configuration |
+| `ops.crossplane.io` | Crossplane v2 `Operation`s, which run functions against other resources |
+
+An IAM role or KMS key is an identity or a key; a bucket, queue or repository
+policy grants access as IAM does; a `ProviderConfig` says which AWS identity
+Crossplane acts as; and a Composition, Function or EnvironmentConfig decides
+what a composite becomes. Every other repository asks for what it needs through
+a composite resource, such as a `KMSPermission`, whose Composition (system's)
+decides which raw resources it becomes. Composite resources in other groups
+(`portswigger.io`, ...) and resources of other providers are not affected.
 
 The exemption is a system-mode request to generate the configured
 `system-repository`, from a verified token issued to that same repository: the
