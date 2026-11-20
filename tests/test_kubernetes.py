@@ -1648,7 +1648,13 @@ def test_detector_ignores_a_stale_aggregated_api_the_change_does_not_use(
             removed=set(),
         )
 
-    assert not any("metrics.k8s.io" in request.url.path for request in requested)
+    # Discovery and the one object: nothing under metrics.k8s.io, whose 503
+    # would have failed the wait had anything asked it.
+    assert [request.url.path for request in requested] == [
+        "/api",
+        "/apis",
+        "/api/v1/namespaces/default/configmaps",
+    ]
     assert (
         "cluster example-dev reports API group version(s) metrics.k8s.io/v1beta1 "
         "as stale; treating them as unavailable"
