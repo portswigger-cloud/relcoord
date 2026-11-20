@@ -3,6 +3,7 @@
 import json
 import logging
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,14 @@ from typing import Any
 import certifi
 import httpx
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
+from opentelemetry.trace import StatusCode
 
+from relcoord import tracing
 from relcoord.config import OutputSettings
 from relcoord.eks import TOKEN_PREFIX, EksTokenAuth
 from relcoord.kubernetes import (
@@ -23,7 +31,12 @@ from relcoord.kubernetes import (
 
 MANIFEST_ID = "0123456789abcdef"
 
+# The per-group discovery documents an API server without aggregated discovery
+# serves, answering /api and /apis with plain JSON whatever the request accepts.
+# Most tests here run against these, so they cover the fallback;
+# aggregated_discovery() is the same catalogue in the aggregated form.
 DISCOVERY = {
+    "/api": {"kind": "APIVersions", "versions": ["v1"]},
     "/api/v1": {
         "resources": [
             {
@@ -1314,3 +1327,546 @@ def test_detector_keeps_a_kind_several_versions_share_unambiguous() -> None:
         "/apis/resources.teleport.dev/v6/namespaces/teleport-permissions/teleportroles"
     )
     assert listed == [expected]
+
+
+# A per-group discovery document's path, which aggregated discovery replaces.
+GROUP_VERSION_PATH = re.compile(r"/api/[^/]+|/apis/[^/]+/[^/]+")
+AGGREGATED_CONTENT_TYPE = (
+    "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList"
+)
+
+
+def aggregated_resource(
+    resource: str,
+    kind: str,
+    *,
+    scope: str = "Namespaced",
+    verbs: tuple[str, ...] = ("get", "list", "watch"),
+) -> dict[str, Any]:
+    return {
+        "resource": resource,
+        "responseKind": {"group": "", "version": "", "kind": kind},
+        "scope": scope,
+        "verbs": list(verbs),
+    }
+
+
+def aggregated_version(
+    version: str, *resources: dict[str, Any], freshness: str = "Current"
+) -> dict[str, Any]:
+    return {"version": version, "resources": list(resources), "freshness": freshness}
+
+
+def aggregated_group(name: str, *versions: dict[str, Any]) -> dict[str, Any]:
+    return {"metadata": {"name": name}, "versions": list(versions)}
+
+
+def discovery_list(*groups: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": "APIGroupDiscoveryList",
+        "apiVersion": "apidiscovery.k8s.io/v2",
+        "metadata": {},
+        "items": list(groups),
+    }
+
+
+def aggregated_discovery(*extra_groups: dict[str, Any]) -> dict[str, Any]:
+    """DISCOVERY's catalogue as aggregated discovery serves it, plus rbac.
+
+    Each group lists its versions in order of preference, the way the API
+    server does, so apps/v1 comes before apps/v1beta1.
+    """
+    workloads = (
+        aggregated_resource("deployments", "Deployment"),
+        aggregated_resource("statefulsets", "StatefulSet"),
+    )
+    return {
+        "/api": discovery_list(
+            aggregated_group(
+                "",
+                aggregated_version(
+                    "v1",
+                    aggregated_resource("namespaces", "Namespace", scope="Cluster"),
+                    aggregated_resource("configmaps", "ConfigMap"),
+                    # Create-only, so there is no object of it to watch.
+                    aggregated_resource("bindings", "Binding", verbs=("create",)),
+                ),
+            )
+        ),
+        "/apis": discovery_list(
+            aggregated_group(
+                "apps",
+                aggregated_version("v1", *workloads),
+                aggregated_version("v1beta1", *workloads),
+            ),
+            aggregated_group(
+                "rbac.authorization.k8s.io",
+                aggregated_version(
+                    "v1",
+                    aggregated_resource("clusterroles", "ClusterRole", scope="Cluster"),
+                    aggregated_resource("roles", "Role"),
+                ),
+            ),
+            *extra_groups,
+        ),
+    }
+
+
+def aggregated_response(document: dict[str, Any]) -> httpx.Response:
+    return httpx.Response(
+        200,
+        content=json.dumps(document).encode(),
+        headers={"content-type": AGGREGATED_CONTENT_TYPE},
+    )
+
+
+def aggregating_handler(
+    discovery: dict[str, Any],
+    requested: list[httpx.Request],
+    manifest_id: str | None = MANIFEST_ID,
+):
+    """Serve discovery aggregated, and every other GET as an up-to-date object.
+
+    Anything under a group-version path is refused with a 503, the way an
+    aggregated API whose service is down answers, so a test fails if discovery
+    falls back to the per-group documents.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request)
+        path = request.url.path
+        if path in discovery:
+            return aggregated_response(discovery[path])
+        if GROUP_VERSION_PATH.fullmatch(path):
+            return httpx.Response(503, text="service unavailable")
+        name = request.url.params["fieldSelector"].removeprefix("metadata.name=")
+        return httpx.Response(200, json=listing(annotated(name, manifest_id)))
+
+    return handler
+
+
+def test_detector_discovers_with_two_requests_when_the_cluster_aggregates() -> None:
+    requested: list[httpx.Request] = []
+
+    detector(aggregating_handler(aggregated_discovery(), requested)).wait_for_success(
+        created_or_modified={
+            Ref("ConfigMap", "default", "settings"): MANIFEST_ID,
+            Ref("Role", "default", "reader", "rbac.authorization.k8s.io/v1"): (
+                MANIFEST_ID
+            ),
+        },
+        removed=set(),
+    )
+
+    assert [request.url.path for request in requested] == [
+        "/api",
+        "/apis",
+        "/api/v1/namespaces/default/configmaps",
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/default/roles",
+    ]
+    for request in requested[:2]:
+        accept = request.headers["accept"]
+        assert accept.startswith(AGGREGATED_CONTENT_TYPE)
+        # Plain JSON stays acceptable, which is what lets an API server
+        # without aggregated discovery answer the same request.
+        assert accept.endswith(",application/json")
+
+
+@pytest.mark.parametrize(
+    ("ref", "expected"),
+    [
+        # The core group: no name, served under /api.
+        (Ref("Namespace", None, "team"), "/api/v1/namespaces"),
+        (Ref("ConfigMap", "default", "x"), "/api/v1/namespaces/default/configmaps"),
+        (
+            Ref("ClusterRole", None, "x", "rbac.authorization.k8s.io/v1"),
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles",
+        ),
+        # Reached through the preferred version, whichever one the ref names.
+        (
+            Ref("Deployment", "default", "x", "apps/v1beta1"),
+            "/apis/apps/v1/namespaces/default/deployments",
+        ),
+    ],
+)
+def test_detector_maps_aggregated_discovery_onto_resource_paths(
+    ref: Ref, expected: str
+) -> None:
+    requested: list[httpx.Request] = []
+    # A Deployment's goal includes its rollout, which a bare annotated object
+    # does not report; listing a finished one keeps this about the path.
+    handler = aggregating_handler(aggregated_discovery(), requested)
+
+    def finished(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/deployments"):
+            requested.append(request)
+            return httpx.Response(200, json=listing(deployment("x", MANIFEST_ID)))
+        return handler(request)
+
+    detector(finished).wait_for_success(
+        created_or_modified={ref: MANIFEST_ID}, removed=set()
+    )
+
+    assert requested[-1].url.path == expected
+
+
+@pytest.mark.parametrize(
+    ("ref", "scope"),
+    [
+        # Namespace is cluster-scoped and ConfigMap namespaced; a ref of the
+        # other scope is not the same resource.
+        (Ref("Namespace", "default", "team"), "namespaced"),
+        (Ref("ConfigMap", None, "settings"), "cluster-scoped"),
+        # Served, but only for creating: there is no object to watch.
+        (Ref("Binding", "default", "x"), "namespaced"),
+    ],
+)
+def test_detector_reports_an_aggregated_kind_of_another_scope_or_unwatchable(
+    ref: Ref, scope: str
+) -> None:
+    requested: list[httpx.Request] = []
+
+    with pytest.raises(
+        DeploymentDetectionError, match=f"serves no {scope} resource of kind"
+    ):
+        detector(
+            aggregating_handler(aggregated_discovery(), requested), timeout_seconds=0
+        ).wait_for_success(created_or_modified={ref: MANIFEST_ID}, removed=set())
+
+
+def test_detector_finds_a_kind_only_a_non_preferred_aggregated_version_serves() -> None:
+    """The Teleport operator's group, aggregated: v6 is preferred, v1 has V8."""
+    teleport = aggregated_group(
+        "resources.teleport.dev",
+        aggregated_version("v6", aggregated_resource("teleportroles", "TeleportRole")),
+        aggregated_version("v5", aggregated_resource("teleportroles", "TeleportRole")),
+        aggregated_version(
+            "v1", aggregated_resource("teleportrolesv8", "TeleportRoleV8")
+        ),
+    )
+    requested: list[httpx.Request] = []
+
+    detector(
+        aggregating_handler(aggregated_discovery(teleport), requested)
+    ).wait_for_success(
+        created_or_modified={
+            Ref("TeleportRoleV8", "tp", "a", "resources.teleport.dev/v1"): MANIFEST_ID,
+            Ref("TeleportRole", "tp", "b", "resources.teleport.dev/v5"): MANIFEST_ID,
+        },
+        removed=set(),
+    )
+
+    assert [request.url.path for request in requested[2:]] == [
+        "/apis/resources.teleport.dev/v6/namespaces/tp/teleportroles",
+        "/apis/resources.teleport.dev/v1/namespaces/tp/teleportrolesv8",
+    ]
+
+
+def test_detector_falls_back_to_per_group_discovery_without_aggregation() -> None:
+    """An API server answering with plain JSON is read one group-version at a time."""
+    requested: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request)
+        path = request.url.path
+        if path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[path])
+        return httpx.Response(200, json=listing(annotated("settings", MANIFEST_ID)))
+
+    detector(handler).wait_for_success(
+        created_or_modified={Ref("ConfigMap", "default", "settings"): MANIFEST_ID},
+        removed=set(),
+    )
+
+    assert [request.url.path for request in requested] == [
+        "/api",
+        "/api/v1",
+        # Fetched once: the group list the fallback reads is the response to
+        # the request that asked for aggregated discovery.
+        "/apis",
+        "/apis/apps/v1",
+        "/apis/apps/v1beta1",
+        "/api/v1/namespaces/default/configmaps",
+    ]
+    assert requested[0].headers["accept"].startswith(AGGREGATED_CONTENT_TYPE)
+
+
+def test_detector_reads_an_aggregated_document_whatever_its_content_type() -> None:
+    """A document naming itself aggregated is not read as an empty group list."""
+    discovery = aggregated_discovery()
+    requested: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request)
+        path = request.url.path
+        if path in discovery:
+            return httpx.Response(200, json=discovery[path])
+        return httpx.Response(200, json=listing(annotated("x", MANIFEST_ID)))
+
+    detector(handler).wait_for_success(
+        created_or_modified={
+            Ref("ClusterRole", None, "x", "rbac.authorization.k8s.io/v1"): MANIFEST_ID
+        },
+        removed=set(),
+    )
+
+    assert [request.url.path for request in requested] == [
+        "/api",
+        "/apis",
+        "/apis/rbac.authorization.k8s.io/v1/clusterroles",
+    ]
+
+
+def metrics_group(freshness: str) -> dict[str, Any]:
+    """metrics.k8s.io, an aggregated API that metrics-server serves."""
+    return aggregated_group(
+        "metrics.k8s.io",
+        aggregated_version(
+            "v1beta1",
+            aggregated_resource("pods", "PodMetrics"),
+            freshness=freshness,
+        ),
+    )
+
+
+def test_detector_ignores_a_stale_aggregated_api_the_change_does_not_use(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A down metrics-server does not fail a change to anything else.
+
+    Per-group discovery asked metrics.k8s.io for its resources, got a 503, and
+    failed the rollout. Aggregated discovery marks the group-version stale
+    instead, and nothing asks the unavailable service anything.
+    """
+    requested: list[httpx.Request] = []
+
+    with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
+        detector(
+            aggregating_handler(aggregated_discovery(metrics_group("Stale")), requested)
+        ).wait_for_success(
+            created_or_modified={Ref("ConfigMap", "default", "settings"): MANIFEST_ID},
+            removed=set(),
+        )
+
+    # Discovery and the one object: nothing under metrics.k8s.io, whose 503
+    # would have failed the wait had anything asked it.
+    assert [request.url.path for request in requested] == [
+        "/api",
+        "/apis",
+        "/api/v1/namespaces/default/configmaps",
+    ]
+    assert (
+        "cluster example-dev reports API group version(s) metrics.k8s.io/v1beta1 "
+        "as stale; treating them as unavailable"
+    ) in caplog.messages
+
+
+def test_detector_waits_for_a_stale_group_the_change_needs_to_come_back() -> None:
+    rounds = 0
+    sleeps: list[float] = []
+    requested: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal rounds
+        if request.url.path == "/apis":
+            rounds += 1
+        # Stale through the first discovery and the immediate rediscovery that
+        # follows it, so the wait has to sleep before the group comes back.
+        freshness = "Stale" if rounds < 3 else "Current"
+        return aggregating_handler(
+            aggregated_discovery(metrics_group(freshness)), requested
+        )(request)
+
+    detector(handler, sleep=sleeps.append).wait_for_success(
+        created_or_modified={
+            Ref("PodMetrics", "default", "api", "metrics.k8s.io/v1beta1"): MANIFEST_ID
+        },
+        removed=set(),
+    )
+
+    assert rounds == 3
+    assert sleeps == [2.0]
+    assert requested[-1].url.path == (
+        "/apis/metrics.k8s.io/v1beta1/namespaces/default/pods"
+    )
+
+
+def test_detector_reports_the_stale_group_a_kind_it_never_found_is_in() -> None:
+    requested: list[httpx.Request] = []
+
+    with pytest.raises(DeploymentDetectionError) as excinfo:
+        detector(
+            aggregating_handler(
+                aggregated_discovery(metrics_group("Stale")), requested
+            ),
+            timeout_seconds=0,
+        ).wait_for_success(
+            created_or_modified={
+                Ref("PodMetrics", "default", "a", "metrics.k8s.io/v1beta1"): (
+                    MANIFEST_ID
+                )
+            },
+            removed=set(),
+        )
+
+    message = str(excinfo.value)
+    assert "serves no namespaced resource of kind PodMetrics" in message
+    assert "reports metrics.k8s.io/v1beta1 as stale" in message
+
+
+def test_detector_does_not_blame_a_stale_group_for_a_kind_of_another_group() -> None:
+    requested: list[httpx.Request] = []
+
+    with pytest.raises(DeploymentDetectionError) as excinfo:
+        detector(
+            aggregating_handler(
+                aggregated_discovery(metrics_group("Stale")), requested
+            ),
+            timeout_seconds=0,
+        ).wait_for_success(
+            created_or_modified={Ref("Widget", "default", "a", "example.com/v1"): "x"},
+            removed=set(),
+        )
+
+    assert "stale" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("status", [401, 403, 503])
+def test_detector_fails_rather_than_discovering_nothing_when_refused(
+    status: int,
+) -> None:
+    """A refused /apis is a failure, not a cluster that serves no groups."""
+    discovery = aggregated_discovery()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/apis":
+            return httpx.Response(status, text="refused")
+        return aggregated_response(discovery[request.url.path])
+
+    with pytest.raises(
+        DeploymentDetectionError, match=f"GET /apis failed with status {status}"
+    ):
+        detector(handler).wait_for_success(
+            created_or_modified={Ref("ConfigMap", "default", "settings"): MANIFEST_ID},
+            removed=set(),
+        )
+
+
+def test_detector_rejects_an_aggregated_document_without_items() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return aggregated_response(
+            {"kind": "APIGroupDiscoveryList", "apiVersion": "apidiscovery.k8s.io/v2"}
+        )
+
+    with pytest.raises(DeploymentDetectionError, match="without an item list"):
+        detector(handler).wait_for_success(
+            created_or_modified={Ref("ConfigMap", "default", "settings"): MANIFEST_ID},
+            removed=set(),
+        )
+
+
+def test_detector_asks_for_aggregation_again_when_retrying_a_throttled_root() -> None:
+    discovery = aggregated_discovery()
+    requested: list[httpx.Request] = []
+    inner = aggregating_handler(discovery, requested)
+    throttled = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal throttled
+        if request.url.path == "/apis" and not throttled:
+            throttled = True
+            requested.append(request)
+            return httpx.Response(429, headers={"Retry-After": "1"})
+        return inner(request)
+
+    detector(handler).wait_for_success(
+        created_or_modified={Ref("ConfigMap", "default", "settings"): MANIFEST_ID},
+        removed=set(),
+    )
+
+    roots = [request for request in requested if request.url.path == "/apis"]
+    assert len(roots) == 2
+    assert all(
+        request.headers["accept"].startswith(AGGREGATED_CONTENT_TYPE)
+        for request in roots
+    )
+
+
+@pytest.fixture
+def spans(monkeypatch: pytest.MonkeyPatch):
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tracing, "_tracer", provider.get_tracer("test"))
+    yield exporter
+    provider.shutdown()
+
+
+def test_detector_traces_and_logs_each_discovery_round(
+    spans: InMemorySpanExporter, caplog: pytest.LogCaptureFixture
+) -> None:
+    requested: list[httpx.Request] = []
+
+    with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
+        detector(
+            aggregating_handler(aggregated_discovery(metrics_group("Stale")), requested)
+        ).wait_for_success(
+            created_or_modified={Ref("ConfigMap", "default", "settings"): MANIFEST_ID},
+            removed=set(),
+        )
+
+    (discovered,) = [
+        span
+        for span in spans.get_finished_spans()
+        if span.name == "discover api resources"
+    ]
+    assert dict(discovered.attributes or {}) == {
+        "relcoord.output": "example-dev",
+        "relcoord.discovery.format": "aggregated",
+        "relcoord.discovery.requests": 2,
+        # Namespace, ConfigMap, Deployment, StatefulSet, ClusterRole, Role.
+        "relcoord.discovery.kinds": 6,
+        "relcoord.discovery.stale": ("metrics.k8s.io/v1beta1",),
+    }
+    assert discovered.end_time is not None and discovered.start_time is not None
+    (line,) = [m for m in caplog.messages if m.startswith("discovered ")]
+    assert line.startswith("discovered 6 kind(s) in cluster example-dev in ")
+    assert line.endswith("s: aggregated discovery, 2 request(s)")
+
+
+def test_detector_traces_a_fallback_round_with_its_request_count(
+    spans: InMemorySpanExporter,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in DISCOVERY:
+            return httpx.Response(200, json=DISCOVERY[path])
+        return httpx.Response(200, json=listing(annotated("settings", MANIFEST_ID)))
+
+    detector(handler).wait_for_success(
+        created_or_modified={Ref("ConfigMap", "default", "settings"): MANIFEST_ID},
+        removed=set(),
+    )
+
+    (discovered,) = spans.get_finished_spans()
+    attributes = dict(discovered.attributes or {})
+    assert attributes["relcoord.discovery.format"] == "legacy"
+    assert attributes["relcoord.discovery.requests"] == 5
+    assert "relcoord.discovery.stale" not in attributes
+
+
+def test_detector_records_a_failed_discovery_on_its_span(
+    spans: InMemorySpanExporter,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="forbidden")
+
+    with pytest.raises(DeploymentDetectionError):
+        detector(handler).wait_for_success(
+            created_or_modified={Ref("ConfigMap", "default", "settings"): MANIFEST_ID},
+            removed=set(),
+        )
+
+    (discovered,) = spans.get_finished_spans()
+    assert discovered.name == "discover api resources"
+    assert discovered.status.status_code is StatusCode.ERROR
