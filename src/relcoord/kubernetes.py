@@ -23,7 +23,7 @@ import random
 import ssl
 import time
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import boto3
@@ -32,6 +32,7 @@ import httpx
 from relcoord.auth import KUBERNETES_TOKEN_PATH
 from relcoord.config import OutputSettings
 from relcoord.eks import EksTokenAuth
+from relcoord.tracing import set_attributes, span
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,25 @@ WATCH_TIMEOUT_SECONDS = 300.0
 WATCH_RETRY_SECONDS = 1.0
 # How long to wait between discovery rounds while a kind is not served yet.
 DISCOVERY_RETRY_SECONDS = 2.0
+# Aggregated discovery, GA since Kubernetes 1.30, describes every group, version
+# and resource /api or /apis serves in a single response, where the documents
+# before it took one request per group-version. The request names it first and
+# plain JSON second, so an API server that does not offer it answers with those
+# older documents instead, and discovery falls back to reading them.
+AGGREGATED_DISCOVERY_ACCEPT = (
+    "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,"
+    "application/json"
+)
+AGGREGATED_DISCOVERY_GROUP = "apidiscovery.k8s.io"
+AGGREGATED_DISCOVERY_VERSION = "v2"
+AGGREGATED_DISCOVERY_KIND = "APIGroupDiscoveryList"
+# How an aggregated discovery document marks a group-version whose API service
+# it could not reach, such as a metrics-server that is down: what it lists for
+# it is the last thing it heard, not what the cluster serves now.
+STALE_FRESHNESS = "Stale"
+# The scopes an aggregated discovery document gives a resource, against the
+# per-group documents' namespaced flag.
+_NAMESPACED_BY_SCOPE = {"Namespaced": True, "Cluster": False}
 CONNECT_TIMEOUT_SECONDS = 10.0
 # A 429 is the API server asking to slow down — most often because its storage
 # layer is briefly (re)initialising — rather than a request that will never
@@ -247,6 +267,9 @@ class KubernetesDeploymentDetector:
         self._jitter = jitter if jitter is not None else _symmetric_jitter
         self._owns_client = owns_client
         self._resources_by_kind: dict[str, list[KubernetesResource]] | None = None
+        # The group-versions the latest discovery round found stale, so that a
+        # kind that never turns up can say which of them it may be waiting on.
+        self._stale_api_versions: tuple[str, ...] = ()
 
     @classmethod
     def for_output(
@@ -492,6 +515,7 @@ class KubernetesDeploymentDetector:
                     f"cluster {self._cluster_name or '<unnamed>'} serves no "
                     f"{scope} resource of kind {ref.kind}{_of_api_version(ref)}"
                     f" (waited {time.monotonic() - began:.0f}s)"
+                    f"{self._stale_note(ref)}"
                 )
             logger.info(
                 "cluster %s does not serve %s yet; discovering again",
@@ -533,17 +557,90 @@ class KubernetesDeploymentDetector:
         group = _api_group(ref.api_version)
         return [resource for resource in resources if resource.group == group]
 
+    def _stale_note(self, ref: KubernetesObjectRef) -> str:
+        """Name the stale group-versions a kind that never turned up may be in.
+
+        A stale group-version's resources are left out of discovery, so a kind
+        it serves reads as not served at all; this says why, where the ref's
+        group is one of them. A ref without an apiVersion could be in any.
+        """
+        group = _api_group(ref.api_version) if ref.api_version else None
+        stale = [
+            api_version
+            for api_version in self._stale_api_versions
+            if group is None or _api_group(api_version) == group
+        ]
+        if not stale:
+            return ""
+        return (
+            f"; the cluster reports {', '.join(stale)} as stale, which usually "
+            "means the API service behind it is unavailable"
+        )
+
     def _resources_by_kind_cached(self) -> dict[str, list[KubernetesResource]]:
         if self._resources_by_kind is None:
             self._resources_by_kind = self._discover_resources()
         return self._resources_by_kind
 
     def _discover_resources(self) -> dict[str, list[KubernetesResource]]:
-        resources: dict[str, list[KubernetesResource]] = {}
-        core = self._get("/api/v1")
-        _add_resources(resources, "/api/v1", core)
+        """Ask the cluster which resources it serves, keyed by kind.
 
-        apis = self._get("/apis")
+        Each round is a span of its own and logs how long it took, so that the
+        time a wait spends finding out what a cluster serves can be told apart
+        from the time it spends waiting for the change's objects. From a cluster
+        in another region that setup is a round trip per request, which is why
+        the request count is recorded alongside it.
+        """
+        began = time.monotonic()
+        discovery = _Discovery()
+        cluster = self._cluster_name or "<unnamed>"
+        with span(
+            "discover api resources", **{"relcoord.output": self._cluster_name or None}
+        ):
+            self._discover_core(discovery)
+            self._discover_groups(discovery)
+            set_attributes(
+                **{
+                    "relcoord.discovery.format": discovery.format,
+                    "relcoord.discovery.requests": discovery.requests,
+                    "relcoord.discovery.kinds": len(discovery.resources),
+                    "relcoord.discovery.stale": discovery.stale or None,
+                }
+            )
+        if discovery.stale:
+            logger.warning(
+                "cluster %s reports API group version(s) %s as stale; treating "
+                "them as unavailable",
+                cluster,
+                ", ".join(discovery.stale),
+            )
+        logger.info(
+            "discovered %d kind(s) in cluster %s in %.2fs: %s discovery, %d request(s)",
+            len(discovery.resources),
+            cluster,
+            time.monotonic() - began,
+            discovery.format,
+            discovery.requests,
+        )
+        self._stale_api_versions = tuple(discovery.stale)
+        return discovery.resources
+
+    def _discover_core(self, discovery: _Discovery) -> None:
+        document, aggregated = self._discovery_root("/api", discovery)
+        if aggregated:
+            _add_aggregated_resources(discovery, "/api", document)
+            return
+        # The older /api document only names the core group's versions, and v1
+        # is the one there is.
+        _add_resources(
+            discovery.resources, "/api/v1", self._discovery_get("/api/v1", discovery)
+        )
+
+    def _discover_groups(self, discovery: _Discovery) -> None:
+        apis, aggregated = self._discovery_root("/apis", discovery)
+        if aggregated:
+            _add_aggregated_resources(discovery, "/apis", apis)
+            return
         for group in apis.get("groups", []):
             group_name = group.get("name")
             for version in _group_versions(group):
@@ -551,14 +648,49 @@ class KubernetesDeploymentDetector:
                 if not isinstance(group_name, str) or not isinstance(version_name, str):
                     continue
                 path_prefix = f"/apis/{group_name}/{version_name}"
-                _add_resources(resources, path_prefix, self._get(path_prefix))
-        return resources
+                _add_resources(
+                    discovery.resources,
+                    path_prefix,
+                    self._discovery_get(path_prefix, discovery),
+                )
+
+    def _discovery_root(
+        self, path: str, discovery: _Discovery
+    ) -> tuple[dict[str, Any], bool]:
+        """Fetch /api or /apis, and say whether it came back aggregated.
+
+        A failure here fails discovery, as any other request does, rather than
+        reading as a cluster serving nothing: that is the answer a request the
+        cluster refused would otherwise give.
+        """
+        response = self._get_response(
+            path, headers={"Accept": AGGREGATED_DISCOVERY_ACCEPT}
+        )
+        discovery.requests += 1
+        document = _json_object(path, response)
+        aggregated = _is_aggregated_discovery(response, document)
+        discovery.formats.add("aggregated" if aggregated else "legacy")
+        return document, aggregated
+
+    def _discovery_get(self, path: str, discovery: _Discovery) -> dict[str, Any]:
+        discovery.requests += 1
+        return self._get(path)
 
     def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+        return _json_object(path, self._get_response(path, params=params))
+
+    def _get_response(
+        self,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """GET a path, retrying while throttled, raising unless it succeeded."""
         delay = self._throttle_initial_delay_seconds
         for attempt in range(1, self._throttle_attempts + 1):
             try:
-                response = self._client.get(path, params=params)
+                response = self._client.get(path, params=params, headers=headers)
             except httpx.RequestError as exc:
                 raise DeploymentDetectionError(
                     f"Kubernetes API GET {path} failed: {exc}"
@@ -589,17 +721,7 @@ class KubernetesDeploymentDetector:
                     f"Kubernetes API GET {path} failed with status "
                     f"{exc.response.status_code}: {exc.response.text}"
                 ) from exc
-            try:
-                data = response.json()
-            except ValueError as exc:
-                raise DeploymentDetectionError(
-                    f"Kubernetes API GET {path} returned invalid JSON"
-                ) from exc
-            if not isinstance(data, dict):
-                raise DeploymentDetectionError(
-                    f"Kubernetes API GET {path} did not return a JSON object"
-                )
-            return data
+            return response
         raise AssertionError("throttle retry loop exhausted without returning")
 
     def _throttle_delay(self, response: httpx.Response, fallback: float) -> float:
@@ -616,6 +738,129 @@ class KubernetesDeploymentDetector:
             directed = _retry_after_body(response)
         chosen = fallback if directed is None else max(directed, 0.0)
         return min(chosen, self._throttle_max_delay_seconds)
+
+
+@dataclass
+class _Discovery:
+    """What one discovery round has found so far, and what it took to find."""
+
+    resources: dict[str, list[KubernetesResource]] = field(default_factory=dict)
+    requests: int = 0
+    # "aggregated" and/or "legacy", one per root (/api, /apis) as answered.
+    formats: set[str] = field(default_factory=set)
+    # The group-versions left out as stale, as apiVersion strings.
+    stale: list[str] = field(default_factory=list)
+
+    @property
+    def format(self) -> str:
+        return "+".join(sorted(self.formats))
+
+
+def _json_object(path: str, response: httpx.Response) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise DeploymentDetectionError(
+            f"Kubernetes API GET {path} returned invalid JSON"
+        ) from exc
+    if not isinstance(data, dict):
+        raise DeploymentDetectionError(
+            f"Kubernetes API GET {path} did not return a JSON object"
+        )
+    return data
+
+
+def _is_aggregated_discovery(
+    response: httpx.Response, document: dict[str, Any]
+) -> bool:
+    """Whether /api or /apis answered with an aggregated discovery document.
+
+    The content type says so in its parameters, which is how kubectl tells. The
+    document naming its own kind is accepted too, so that a proxy rewriting the
+    content type cannot have an aggregated document read as the older kind,
+    which would find no groups in it and report a cluster serving nothing.
+    """
+    media_type, *parameters = response.headers.get("content-type", "").split(";")
+    named: dict[str, str] = {}
+    for parameter in parameters:
+        key, _, value = parameter.partition("=")
+        named[key.strip().lower()] = value.strip()
+    if (
+        media_type.strip().lower() == "application/json"
+        and named.get("g") == AGGREGATED_DISCOVERY_GROUP
+        and named.get("v") == AGGREGATED_DISCOVERY_VERSION
+        and named.get("as") == AGGREGATED_DISCOVERY_KIND
+    ):
+        return True
+    return (
+        document.get("kind") == AGGREGATED_DISCOVERY_KIND
+        and document.get("apiVersion")
+        == f"{AGGREGATED_DISCOVERY_GROUP}/{AGGREGATED_DISCOVERY_VERSION}"
+    )
+
+
+def _add_aggregated_resources(
+    discovery: _Discovery, root: str, document: dict[str, Any]
+) -> None:
+    """Add the resources an aggregated discovery document lists.
+
+    /api lists the core group, which has no name and is served under /api, and
+    /apis every other group. Each group lists its versions in its order of
+    preference, so reading them in turn reaches a kind several versions share
+    through the preferred one first, as ``_group_versions`` arranges for the
+    per-group documents, and ``_add_resource`` drops the later duplicates.
+
+    A stale group-version is left out entirely: the API server could not reach
+    the service behind it, so what it lists is not what the cluster serves now.
+    A change that needs one of its kinds waits for it to come back the way it
+    waits for any kind not served yet, and every other change is unaffected.
+    """
+    groups = document.get("items")
+    if not isinstance(groups, list):
+        raise DeploymentDetectionError(
+            f"Kubernetes API GET {root} returned an {AGGREGATED_DISCOVERY_KIND} "
+            "without an item list"
+        )
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        if root == "/api":
+            group_name = ""
+        else:
+            group_name = _child(group, "metadata").get("name")
+            if not isinstance(group_name, str) or not group_name:
+                continue
+        versions = group.get("versions")
+        for version in versions if isinstance(versions, list) else []:
+            if not isinstance(version, dict):
+                continue
+            version_name = version.get("version")
+            if not isinstance(version_name, str) or not version_name:
+                continue
+            api_version = f"{group_name}/{version_name}" if group_name else version_name
+            if version.get("freshness") == STALE_FRESHNESS:
+                discovery.stale.append(api_version)
+                continue
+            path_prefix = (
+                f"/apis/{api_version}" if group_name else f"/api/{version_name}"
+            )
+            resources = version.get("resources")
+            for resource in resources if isinstance(resources, list) else []:
+                if not isinstance(resource, dict):
+                    continue
+                scope = resource.get("scope")
+                _add_resource(
+                    discovery.resources,
+                    path_prefix,
+                    name=resource.get("resource"),
+                    kind=_child(resource, "responseKind").get("kind"),
+                    namespaced=(
+                        _NAMESPACED_BY_SCOPE.get(scope)
+                        if isinstance(scope, str)
+                        else None
+                    ),
+                    verbs=resource.get("verbs"),
+                )
 
 
 def _group_versions(group: dict[str, Any]) -> list[dict[str, Any]]:
@@ -969,35 +1214,56 @@ def _add_resources(
     resource_list: dict[str, Any],
 ) -> None:
     for resource in resource_list.get("resources", []):
-        name = resource.get("name")
-        kind = resource.get("kind")
-        namespaced = resource.get("namespaced")
-        verbs = resource.get("verbs", [])
-        if (
-            not isinstance(name, str)
-            or "/" in name
-            or not isinstance(kind, str)
-            or not isinstance(namespaced, bool)
-            or "watch" not in verbs
-        ):
-            continue
-        candidate = KubernetesResource(
-            path_prefix=path_prefix,
-            name=name,
-            namespaced=namespaced,
+        _add_resource(
+            resources,
+            path_prefix,
+            name=resource.get("name"),
+            kind=resource.get("kind"),
+            namespaced=resource.get("namespaced"),
+            verbs=resource.get("verbs", []),
         )
-        already_known = resources.setdefault(kind, [])
-        # Several versions of one group may serve the same resource, and those
-        # are the same resource: keep the first, which _group_versions ordered
-        # to be the group's preferred version, so a kind stays unambiguous.
-        if any(
-            known.name == candidate.name
-            and known.namespaced == candidate.namespaced
-            and known.group == candidate.group
-            for known in already_known
-        ):
-            continue
-        already_known.append(candidate)
+
+
+def _add_resource(
+    resources: dict[str, list[KubernetesResource]],
+    path_prefix: str,
+    *,
+    name: Any,
+    kind: Any,
+    namespaced: Any,
+    verbs: Any,
+) -> None:
+    """Add one discovered resource, if it is one an object can be watched in.
+
+    A name with a slash in it is a subresource, such as deployments/scale, which
+    no manifest is an object of.
+    """
+    if (
+        not isinstance(name, str)
+        or "/" in name
+        or not isinstance(kind, str)
+        or not isinstance(namespaced, bool)
+        or not isinstance(verbs, list)
+        or "watch" not in verbs
+    ):
+        return
+    candidate = KubernetesResource(
+        path_prefix=path_prefix,
+        name=name,
+        namespaced=namespaced,
+    )
+    already_known = resources.setdefault(kind, [])
+    # Several versions of one group may serve the same resource, and those
+    # are the same resource: keep the first, which _group_versions ordered
+    # to be the group's preferred version, so a kind stays unambiguous.
+    if any(
+        known.name == candidate.name
+        and known.namespaced == candidate.namespaced
+        and known.group == candidate.group
+        for known in already_known
+    ):
+        return
+    already_known.append(candidate)
 
 
 def _api_group(api_version: str) -> str:

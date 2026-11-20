@@ -621,6 +621,22 @@ cluster has given up on, one that is paused or one whose rollout exceeded its
 progress deadline, fails the wait immediately rather than waiting out the
 timeout.
 
+To know where to list and watch an object of a given kind, relcoord first asks
+the cluster which resources it serves. It uses aggregated discovery
+(`apidiscovery.k8s.io/v2`, GA since Kubernetes 1.30), which describes the whole
+catalogue in one request to `/api` and one to `/apis`. An API server that does
+not offer it answers those requests with the older documents, and relcoord then
+reads them one group-version at a time as before, which from a cluster in another
+region is a round trip each. A group-version aggregated discovery marks `Stale`,
+typically an aggregated API such as `metrics.k8s.io` whose service is down, is
+left out and logged as a warning: a change that does not use it is not held up,
+and one that does waits for it to come back like any kind not served yet, until
+the timeout. A refused or failing discovery request still fails the wait. Each
+round of discovery is a `discover api resources` span, carrying the format, the
+number of requests and any stale group-versions, and logs a `discovered N kind(s)
+in cluster ... in Ns` line, so the setup can be told apart from the wait for
+the objects themselves.
+
 The connection properties live on the output whose deployment they describe.
 With deployment detection enabled, every output must explicitly set
 `connection-type` to either `eks` or `local`:
