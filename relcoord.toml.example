@@ -182,5 +182,9 @@ jwks-uri = "https://kubernetes.default.svc/openid/v1/jwks"
 # namespaces and cluster-scoped directories. Defaults to false.
 allow_system = false
 
+# Set namespace to generate a change from this role into that namespace rather
+# than the one named after its config repository.
+# namespace = "auth"
+
 [role.claims]
 sub = "system:serviceaccount:default:default"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -34,6 +35,8 @@ KUBERNETES_CA_CERT_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca
 KUBERNETES_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 SIGNING_KEY_CACHE_MAX_SIZE = 32
 SIGNING_KEY_CACHE_TTL_SECONDS = 3600
+# A Kubernetes namespace name: an RFC 1123 label.
+NAMESPACE_PATTERN = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
 PUBLIC_KEY_ALGORITHMS: tuple[str, ...] = tuple(
     name
     for name, algorithm in algorithms.get_default_algorithms().items()
@@ -57,6 +60,8 @@ class RoleConfig:
     allow_system: bool = False
     outputs: tuple[str, ...] = ()
     """Outputs a change from this role may deploy to, empty for every output."""
+    namespace: str | None = None
+    """Namespace a change from this role generates into, None for its repository's name."""
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> RoleConfig:
@@ -70,6 +75,7 @@ class RoleConfig:
             data, "allow_system", context=f"role '{name}'", alias="allow-system"
         )
         outputs = _role_outputs(data, context=f"role '{name}'")
+        namespace = _role_namespace(data, context=f"role '{name}'")
 
         raw_claims = data.get("claims", {})
         if not isinstance(raw_claims, dict):
@@ -91,6 +97,7 @@ class RoleConfig:
             claims=claims,
             allow_system=allow_system,
             outputs=outputs,
+            namespace=namespace,
         )
 
 
@@ -101,6 +108,8 @@ class ValidatedClaims:
     allow_system: bool = False
     outputs: tuple[str, ...] = ()
     """Outputs a change from this role may deploy to, empty for every output."""
+    namespace: str | None = None
+    """Namespace a change from this role generates into, None for its repository's name."""
 
     @property
     def subject(self) -> str:
@@ -237,6 +246,7 @@ class TokenValidator:
                 claims=claims,
                 allow_system=role.allow_system,
                 outputs=role.outputs,
+                namespace=role.namespace,
             )
         raise AuthError(
             f"token did not validate against any configured role: {last_error}"
@@ -489,6 +499,20 @@ def _role_outputs(data: dict[str, Any], *, context: str) -> tuple[str, ...]:
             "every configured output"
         )
     return tuple(names)
+
+
+def _role_namespace(data: dict[str, Any], *, context: str) -> str | None:
+    """Parse the namespace a role's changes generate into.
+
+    Without one, a change generates into the namespace named after its config
+    repository, which is what every role did before this existed.
+    """
+    value = _optional_string(data, "namespace", context=context)
+    if value is not None and not NAMESPACE_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"{context} namespace {value!r} is not a valid Kubernetes namespace name"
+        )
+    return value
 
 
 def _optional_bool(

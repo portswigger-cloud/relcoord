@@ -87,6 +87,7 @@ def _role(
     claims: dict[str, str] | None = None,
     allow_system: bool = False,
     outputs: tuple[str, ...] = (),
+    namespace: str | None = None,
 ) -> RoleConfig:
     return RoleConfig(
         name=name,
@@ -96,6 +97,7 @@ def _role(
         claims=claims or {"sub": "system:serviceaccount:default:default"},
         allow_system=allow_system,
         outputs=outputs,
+        namespace=namespace,
     )
 
 
@@ -171,6 +173,17 @@ def test_validator_reports_no_outputs_for_an_unrestricted_role(
     claims = validator.validate(token)
 
     assert claims.outputs == ()
+
+
+def test_validator_exposes_namespace_from_role(
+    private_pem: str, signing_key: PyJWK
+) -> None:
+    validator = _make_validator([_role(namespace="auth")], signing_key)
+    token = _make_token(private_pem)
+
+    claims = validator.validate(token)
+
+    assert claims.namespace == "auth"
 
 
 def _role_mapping(**extra: object) -> dict[str, object]:
@@ -608,3 +621,17 @@ def test_read_endpoints_do_not_require_token(signing_key: PyJWK) -> None:
 
     assert health.status_code == 200
     assert latest.status_code == 200
+
+
+def test_role_config_parses_a_namespace() -> None:
+    assert RoleConfig.from_mapping(_role_mapping(namespace="auth")).namespace == "auth"
+
+
+def test_role_config_defaults_to_no_namespace() -> None:
+    assert RoleConfig.from_mapping(_role_mapping()).namespace is None
+
+
+@pytest.mark.parametrize("namespace", ["Auth", "auth_ns", "-auth", "auth/x", "a" * 64])
+def test_role_config_rejects_an_invalid_namespace(namespace: str) -> None:
+    with pytest.raises(ValueError, match="not a valid Kubernetes namespace name"):
+        RoleConfig.from_mapping(_role_mapping(namespace=namespace))
