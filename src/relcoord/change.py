@@ -113,6 +113,16 @@ class DeployConfigError(ChangeProcessingError):
     pass
 
 
+class NamespaceMismatchError(DeployConfigError):
+    """Raised when a deploy config generates outside the namespace it is generated as.
+
+    manifest-builder writes a config block's explicit ``namespace`` wherever it
+    says, but only diffs and commits the directory of the namespace it was asked
+    to generate, so without this a change into another namespace reports that
+    nothing changed and deploys nothing.
+    """
+
+
 class SystemRepositoryError(ChangeProcessingError):
     """Raised when the configured system repository has no plugins directory.
 
@@ -343,6 +353,7 @@ class ChangeProcessor:
         *,
         section: str | None = None,
         source_repository: str | None = None,
+        namespace: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> ChangeResult:
         """Generate and push one config commit.
@@ -350,6 +361,8 @@ class ChangeProcessor:
         ``source_repository`` is the repository the request's verified token was
         issued to, None without one. Together with ``system`` it decides whether
         the change may generate raw AWS and Crossplane resources; ``repo`` never does.
+        ``namespace`` is the one the request's role generates into, None for the
+        namespace named after ``repo``.
         """
         with span(
             "change.process",
@@ -367,6 +380,7 @@ class ChangeProcessor:
                 system,
                 outputs,
                 section,
+                namespace,
                 may_generate_raw_iam_kms(
                     system=system,
                     source_repository=source_repository,
@@ -385,6 +399,7 @@ class ChangeProcessor:
         system: bool,
         outputs: Sequence[str],
         section: str | None,
+        role_namespace: str | None,
         raw_iam_kms_allowed: bool,
         progress: ProgressSink,
     ) -> ChangeResult:
@@ -422,7 +437,7 @@ class ChangeProcessor:
                 _checkout_commit(repo, commit, source_checkout, self.idcat)
             with span("load deploy config"):
                 deploy_config, namespace = _deploy_config_and_namespace(
-                    source_checkout, repo, commit, config_path, system
+                    source_checkout, repo, commit, config_path, system, role_namespace
                 )
                 declared = declared_targets(deploy_config)
                 _check_section_selection(section, declared, self.system_repository)
@@ -780,6 +795,9 @@ class ChangeProcessor:
                 plugins=plugins,
                 **selection,
             )
+        _check_generated_namespace(
+            output, output_path, namespace, _written_paths(generation_result)
+        )
         generation_result = _discount_moved_objects(generation_result)
         generated = _written_paths(generation_result)
         created_or_modified = _sorted_refs(generation_result.created_or_modified)
@@ -1394,6 +1412,7 @@ class DiffCommentProcessor:
         section: str | None = None,
         pull_request: int | None = None,
         source_repository: str | None = None,
+        namespace: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> DiffResult:
         """Generate one config commit and report its diff.
@@ -1419,6 +1438,7 @@ class DiffCommentProcessor:
                 outputs,
                 section,
                 pull_request,
+                namespace,
                 may_generate_raw_iam_kms(
                     system=system,
                     source_repository=source_repository,
@@ -1437,6 +1457,7 @@ class DiffCommentProcessor:
         outputs: Sequence[str],
         section: str | None,
         pull_request: int | None,
+        role_namespace: str | None,
         raw_iam_kms_allowed: bool,
         progress: ProgressSink,
     ) -> DiffResult:
@@ -1477,7 +1498,7 @@ class DiffCommentProcessor:
                 return self._rebase_required(repo, commit, pull_request, report, exc)
             with span("load deploy config"):
                 deploy_config, namespace = _deploy_config_and_namespace(
-                    source_checkout, repo, commit, config_path, system
+                    source_checkout, repo, commit, config_path, system, role_namespace
                 )
                 declared = declared_targets(deploy_config)
                 _check_section_selection(section, declared, self.system_repository)
@@ -1688,6 +1709,9 @@ class DiffCommentProcessor:
                     plugins=plugins,
                     **selection,
                 )
+            _check_generated_namespace(
+                output, output_path, namespace, _written_paths(generation_result)
+            )
             generation_result = _discount_moved_objects(generation_result)
             generated = _written_paths(generation_result)
             logger.info(
@@ -2167,7 +2191,12 @@ def _resolve_output_settings(
 
 
 def _deploy_config_and_namespace(
-    source_checkout: Path, repo: str, commit: str, config_path: str, system: bool
+    source_checkout: Path,
+    repo: str,
+    commit: str,
+    config_path: str,
+    system: bool,
+    role_namespace: str | None = None,
 ) -> tuple[Path, str | None]:
     if system:
         # System mode: config lives at the repository root and manifest-builder
@@ -2181,7 +2210,7 @@ def _deploy_config_and_namespace(
         raise DeployConfigError(
             f"commit {commit} in {repo} does not contain a {config_path} directory"
         )
-    return deploy_config, _namespace_from_repo(repo)
+    return deploy_config, role_namespace or _namespace_from_repo(repo)
 
 
 def _manifests_diff(manifests_checkout: Path, base_commit: str) -> ManifestDiff:
@@ -3143,6 +3172,46 @@ def _checkout_system_plugins(
             f"{PLUGINS_DIRECTORY}/ directory"
         )
     return ExternalPlugins(path=path, source=f"{repository}@{commit}")
+
+
+def _check_generated_namespace(
+    output: OutputSettings,
+    output_path: Path,
+    namespace: str | None,
+    written: Iterable[Path],
+) -> None:
+    """Refuse an output that wrote into another namespace than it was generated as.
+
+    manifest-builder writes each file under the directory of its namespace, and
+    only that namespace's directory and its owner file are diffed and committed,
+    so a file under any other would be silently dropped. System mode generates
+    every namespace and is not checked.
+    """
+    if namespace is None:
+        return
+    owner_file = Path("owners") / f"{namespace}.toml"
+    stray: dict[str, list[str]] = {}
+    for path in sorted(written):
+        relative = path.relative_to(output_path)
+        if (
+            len(relative.parts) < 2
+            or relative.parts[0] == namespace
+            or relative == owner_file
+        ):
+            continue
+        stray.setdefault(relative.parts[0], []).append(str(relative))
+    if not stray:
+        return
+    elsewhere = "; ".join(
+        f"namespace '{root}' ({', '.join(paths)})" for root, paths in stray.items()
+    )
+    raise NamespaceMismatchError(
+        f"{output.name}: the deploy config generates into {elsewhere}, but this "
+        f"change generates into namespace '{namespace}', so only files there are "
+        f'deployed. Set namespace = "{namespace}" in the deploy config, or give '
+        "the relcoord role this change authenticates as the namespace it should "
+        "generate into."
+    )
 
 
 def _namespace_from_repo(repo: str) -> str:

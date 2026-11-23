@@ -18,6 +18,7 @@ from relcoord.change import (
     CredentialError,
     DeployConfigError,
     DiffCommentProcessor,
+    NamespaceMismatchError,
 )
 from relcoord.config import OutputSettings
 from relcoord.git import GitCredentialError
@@ -79,6 +80,7 @@ def _fake_git(
     written: int = 1,
     targets: bool = False,
     before_generate: Callable[[Path], object] | None = None,
+    written_namespace: str | None = None,
 ) -> None:
     """Replace the git and manifest-builder work with recorded fakes.
 
@@ -88,6 +90,8 @@ def _fake_git(
     ``diffs`` says it per checkout directory name, for a change that reaches
     some of the configured repositories and not others. ``before_generate`` is
     called with each output directory as its generation starts.
+    ``written_namespace`` puts the written files under that namespace's
+    directory, as manifest-builder does, rather than at the output's root.
     """
     recorded = calls if calls is not None else []
 
@@ -135,7 +139,8 @@ def _fake_git(
         )
         return GenerationResult(
             written_paths={
-                output_path / f"api{index}.yaml" for index in range(written)
+                output_path / (written_namespace or "") / f"api{index}.yaml"
+                for index in range(written)
             },
             created_or_modified=set(),
             removed=set(),
@@ -869,3 +874,30 @@ def test_diff_traces_concurrent_work_under_the_request_span(
     for span in pooled:
         assert span.parent is not None
         assert span.parent.span_id == request.context.span_id
+
+
+def test_diff_generates_into_the_roles_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    _fake_git(monkeypatch, tmp_path, calls=calls, written_namespace="auth")
+
+    DiffCommentProcessor(manifests_repository=MANIFESTS_REPO).diff(
+        CONFIG_REPO, "deadbeef", namespace="auth"
+    )
+
+    assert ("generate", ".deploy", Path("manifests"), True, None, "auth", {}) in calls
+
+
+def test_diff_refuses_a_config_generating_into_another_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(monkeypatch, tmp_path, written_namespace="auth")
+    commenter = Commenter()
+
+    with pytest.raises(NamespaceMismatchError, match="namespace 'config'"):
+        DiffCommentProcessor(
+            manifests_repository=MANIFESTS_REPO, commenter=commenter
+        ).diff(CONFIG_REPO, "deadbeef", pull_request=7)
+
+    assert commenter.calls == []
