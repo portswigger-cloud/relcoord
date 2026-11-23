@@ -75,6 +75,7 @@ class ChangeProcessor(Protocol):
         *,
         section: str | None = ...,
         source_repository: str | None = ...,
+        namespace: str | None = ...,
         progress: ProgressSink = ...,
     ) -> object: ...
 
@@ -91,6 +92,7 @@ class DiffProcessor(Protocol):
         section: str | None = ...,
         pull_request: int | None = ...,
         source_repository: str | None = ...,
+        namespace: str | None = ...,
         progress: ProgressSink = ...,
     ) -> object: ...
 
@@ -132,6 +134,8 @@ class _ChangePlan:
     """Section of the system repository that says which outputs to deploy to."""
     source_repository: str | None = None
     """The repository the verified token was issued to, not the requested one."""
+    namespace: str | None = None
+    """Namespace the role generates into, None for the config repository's name."""
 
 
 @dataclass(frozen=True)
@@ -149,6 +153,8 @@ class _DiffPlan:
     """Section of the system repository that says which outputs to report on."""
     source_repository: str | None = None
     """The repository the verified token was issued to, not the requested one."""
+    namespace: str | None = None
+    """Namespace the role generates into, None for the config repository's name."""
 
 
 class _SystemNotAllowedError(Exception):
@@ -171,6 +177,7 @@ class NoopChangeProcessor:
         *,
         section: str | None = None,
         source_repository: str | None = None,
+        namespace: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         message = (
@@ -329,6 +336,7 @@ def create_app(
             outputs=_permitted_outputs(payload, principal),
             section=section,
             source_repository=verified_repository(principal),
+            namespace=_principal_namespace(principal),
         )
 
     async def change(request: Request) -> Response:
@@ -397,6 +405,7 @@ def create_app(
                 plan.outputs,
                 section=plan.section,
                 source_repository=plan.source_repository,
+                namespace=plan.namespace,
             )
         except ChangeProcessingError as exc:
             status_code, error, message = _report_change_failure(request, plan, exc)
@@ -467,6 +476,7 @@ def create_app(
                 pull_request=plan.pull_request,
                 section=plan.section,
                 source_repository=plan.source_repository,
+                namespace=plan.namespace,
             )
         except ChangeProcessingError as exc:
             status_code, error, message = _report_diff_failure(request, plan, exc)
@@ -672,6 +682,12 @@ def _principal_outputs(principal: object) -> tuple[str, ...]:
     return tuple(outputs) if isinstance(outputs, tuple | list) else ()
 
 
+def _principal_namespace(principal: object) -> str | None:
+    """Return the namespace the authenticated role generates into, if it names one."""
+    namespace = getattr(principal, "namespace", None)
+    return namespace if isinstance(namespace, str) else None
+
+
 def _permitted_outputs(payload: dict[str, Any], principal: object) -> tuple[str, ...]:
     """Resolve which outputs this request is allowed to deploy to.
 
@@ -816,6 +832,7 @@ def _plan_diff(payload: dict[str, Any], principal: object) -> _DiffPlan:
         outputs=_permitted_outputs(payload, principal),
         section=_change_section(payload, system),
         source_repository=verified_repository(principal),
+        namespace=_principal_namespace(principal),
     )
 
 
@@ -1096,6 +1113,7 @@ def _change_events(
                 progress=progress,
                 section=plan.section,
                 source_repository=plan.source_repository,
+                namespace=plan.namespace,
             ),
             complete=lambda result: _change_completion(plan, result),
             failure=lambda exc: _report_change_failure(request, plan, exc),
@@ -1126,6 +1144,7 @@ def _diff_events(
                 progress=progress,
                 section=plan.section,
                 source_repository=plan.source_repository,
+                namespace=plan.namespace,
             ),
             complete=lambda result: _diff_completion(plan, result),
             failure=lambda exc: _report_diff_failure(request, plan, exc),
