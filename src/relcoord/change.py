@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
-import contextvars
 import logging
 import shutil
 import tempfile
@@ -63,6 +62,12 @@ from relcoord.manifest_diff import (
     manifest_diff,
     render_raw_iam_kms_refusal,
     render_validation_summary,
+)
+from relcoord.output_workers import (
+    Generation,
+    OutputWorkers,
+    generate_batch,
+    submit_in_context,
 )
 from relcoord.raw_iam_kms import (
     RawResource,
@@ -303,8 +308,8 @@ class ChangeStage:
 
 
 # Generates one output of a stage into a manifests checkout, given the output,
-# its stage and, as manifests_checkout=, the checkout; everything else about the
-# change is bound already.
+# its stage, as manifests_checkout= the checkout and, as generation=, where to
+# generate it; everything else about the change is bound already.
 type GenerateOutput = Callable[..., tuple[OutputResult, GenerationResult]]
 
 
@@ -324,6 +329,12 @@ class ChangeProcessor:
     """Validator every generated tree is gated on, absent without [validator]."""
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     """How many manifests repositories of a stage are generated at once."""
+    output_workers: OutputWorkers | None = None
+    """Worker processes the outputs of one repository generate on side by side.
+
+    None, the default, generates them one after another in this process. See
+    :mod:`relcoord.output_workers`.
+    """
     generate_while_waiting: bool = False
     """Generate while a rollout stage waits for its deployments.
 
@@ -483,6 +494,7 @@ class ChangeProcessor:
                         report=report,
                     ),
                     checkout_by_repository=checkout_by_repository,
+                    deploy_config=deploy_config,
                     repo=repo,
                     commit=commit,
                     report=report,
@@ -689,34 +701,47 @@ class ChangeProcessor:
         """Generate one stage's outputs of one manifests repository.
 
         The outputs share the checkout and each commits on top of the one before
-        it, so they are generated in order; repositories are independent of one
-        another and run concurrently.
+        it, in configured order; with output workers they generate side by side
+        first, see :func:`relcoord.output_workers.generate_batch`. Repositories
+        are independent of one another and run concurrently.
         """
         if clone:
             self._clone_manifests(repository, manifests_checkout, report)
-        results: list[tuple[OutputResult, GenerationResult]] = []
-        for output in outputs:
-            results.append(
-                self._generate_output(
-                    output,
-                    stage,
-                    deploy_config=deploy_config,
-                    manifests_checkout=manifests_checkout,
-                    declares_targets=declares_targets,
-                    image=image,
-                    namespace=namespace,
-                    plugins=plugins,
-                    raw_iam_kms_allowed=raw_iam_kms_allowed,
-                    report=report,
-                )
+
+        def generate_one(
+            output: OutputSettings, generation: Generation
+        ) -> tuple[OutputResult, GenerationResult]:
+            return self._generate_output(
+                output,
+                stage,
+                deploy_config=deploy_config,
+                manifests_checkout=manifests_checkout,
+                declares_targets=declares_targets,
+                image=image,
+                namespace=namespace,
+                plugins=plugins,
+                raw_iam_kms_allowed=raw_iam_kms_allowed,
+                report=report,
+                generation=generation,
             )
-            # Validation on a change is disabled for now: nothing is gated on
-            # the verdict yet, so calling out here only adds latency and a way
-            # for a change to fail. The diffcomment path still validates.
-            # Restore this line (and validator= in make_change_processor) to
-            # bring it back.
-            # self._validate(output, manifests_checkout, report)
-        return results
+
+        results = generate_batch(
+            outputs,
+            manifests_checkout,
+            generate_one,
+            workers=self.output_workers,
+            config=deploy_config,
+            local_generate=_generate_locally,
+            repository=repository,
+        )
+        # Validation on a change is disabled for now: nothing is gated on the
+        # verdict yet, so calling out here only adds latency and a way for a
+        # change to fail. The diffcomment path still validates. Restore this
+        # (and validator= in make_change_processor) to bring it back, per output
+        # once the batch is committed.
+        # for output, _ in results:
+        #     self._validate(output, manifests_checkout, report)
+        return [result for _, result in results]
 
     def _generate_output(
         self,
@@ -731,6 +756,7 @@ class ChangeProcessor:
         plugins: ExternalPlugins | None,
         raw_iam_kms_allowed: bool,
         report: Callable[..., None],
+        generation: Generation | None = None,
     ) -> tuple[OutputResult, GenerationResult]:
         """Let manifest-builder write one output into the manifests checkout.
 
@@ -738,10 +764,16 @@ class ChangeProcessor:
         stage pushes, so the one check covers a stage generated whole and one
         generated while the stage before it waits: either way an output that
         fails it raises before anything it generated is pushed.
+
+        ``generation`` says where the output is generated, which is the checkout
+        itself unless output workers generate it in a scratch repository of its
+        own; the result names the checkout either way.
         """
+        if generation is None:
+            generation = Generation(root=manifests_checkout, generate=_generate_locally)
         repo_root = Path("/")
         create_commit = True
-        output_path = manifests_checkout / output.directory
+        output_path = generation.root / output.directory
         output_path.mkdir(parents=True, exist_ok=True)
         selection = _generate_selection(output, declares_targets)
         logger.info(
@@ -770,7 +802,7 @@ class ChangeProcessor:
         with span(
             f"generate manifests {output.name}", **{"relcoord.output": output.name}
         ):
-            generation_result = generate(
+            generation_result = generation.generate(
                 deploy_config,
                 output_path,
                 repo_root=repo_root,
@@ -1034,6 +1066,7 @@ class ChangeProcessor:
         *,
         generate_output: GenerateOutput,
         checkout_by_repository: Mapping[str, Path],
+        deploy_config: Path,
         repo: str,
         commit: str,
         report: Callable[..., None],
@@ -1081,6 +1114,7 @@ class ChangeProcessor:
                         cloned,
                         generate_output=generate_output,
                         checkout_by_repository=checkout_by_repository,
+                        deploy_config=deploy_config,
                         report=report,
                     )
                     # A deployment already found missing has failed the stage, so
@@ -1116,6 +1150,7 @@ class ChangeProcessor:
                         waits=waits,
                         generate_output=generate_output,
                         checkout_by_repository=checkout_by_repository,
+                        deploy_config=deploy_config,
                         report=report,
                     )
                 observed = [entry for wait in waits for entry in wait.result()]
@@ -1137,12 +1172,13 @@ class ChangeProcessor:
         *,
         generate_output: GenerateOutput,
         checkout_by_repository: Mapping[str, Path],
+        deploy_config: Path,
         report: Callable[..., None],
         until: Callable[[], bool] | None = None,
     ) -> None:
         """Generate those of ``outputs`` not generated yet, a repository per task.
 
-        A repository's outputs are generated in turn into its one checkout, and
+        A repository's outputs are committed in turn into its one checkout, and
         repositories run concurrently, as they do for a stage generated whole.
         ``until`` is asked before each output and stops a repository's generation
         once it answers true; what was generated by then is kept.
@@ -1157,17 +1193,19 @@ class ChangeProcessor:
             checkout = checkout_by_repository[repository]
             if repository not in cloned:
                 self._clone_manifests(repository, checkout, report)
-            done: list[tuple[str, tuple[OutputResult, GenerationResult]]] = []
-            for output in repository_outputs:
-                if until is not None and until():
-                    break
-                done.append(
-                    (
-                        output.name,
-                        generate_output(output, stage, manifests_checkout=checkout),
-                    )
-                )
-            return done
+            done = generate_batch(
+                repository_outputs,
+                checkout,
+                lambda output, generation: generate_output(
+                    output, stage, manifests_checkout=checkout, generation=generation
+                ),
+                workers=self.output_workers,
+                config=deploy_config,
+                local_generate=_generate_locally,
+                repository=repository,
+                until=until,
+            )
+            return [(output.name, result) for output, result in done]
 
         finished = _run_concurrently(
             [
@@ -1233,6 +1271,7 @@ class ChangeProcessor:
         waits: Sequence[Future[list[tuple[str, float]]]],
         generate_output: GenerateOutput,
         checkout_by_repository: Mapping[str, Path],
+        deploy_config: Path,
         report: Callable[..., None],
     ) -> Exception | None:
         """Generate ``stage`` while ``waiting``'s deployments are waited for.
@@ -1268,6 +1307,7 @@ class ChangeProcessor:
                     cloned,
                     generate_output=generate_output,
                     checkout_by_repository=checkout_by_repository,
+                    deploy_config=deploy_config,
                     report=report,
                     until=waited,
                 )
@@ -1382,6 +1422,8 @@ class DiffCommentProcessor:
     """
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     """How many manifests repositories are diffed, and trees validated, at once."""
+    output_workers: OutputWorkers | None = None
+    """Worker processes the outputs of one repository generate on side by side."""
 
     def diff(
         self,
@@ -1625,8 +1667,9 @@ class DiffCommentProcessor:
         """Clone one manifests repository, generate its outputs and diff it.
 
         The outputs share the checkout and each commits on top of the one before
-        it, so they are generated in order; repositories are independent of one
-        another and run concurrently.
+        it, in configured order; with output workers they generate side by side
+        first, see :func:`relcoord.output_workers.generate_batch`. Repositories
+        are independent of one another and run concurrently.
         """
         output_diffs: list[OutputDiff] = []
         validations: list[Future[OutputValidation]] = []
@@ -1651,92 +1694,31 @@ class DiffCommentProcessor:
             )
         base_commit = _head_commit(manifests_checkout)
 
-        for output in outputs:
-            output_path = manifests_checkout / output.directory
-            output_path.mkdir(parents=True, exist_ok=True)
-            selection = _generate_selection(output, declares_targets)
-            logger.info(
-                "diff step 5/6: invoking manifest-builder generate("
-                "output=%s, deploy_config=%s, manifests_checkout=%s, "
-                "namespace=%s, plugins=%s, %s)",
-                output.name,
-                deploy_config,
-                output_path,
-                namespace,
-                _plugins_log_summary(plugins),
-                _selection_log_summary(selection),
-            )
-            report(
-                "generate",
-                _generating_message(output, declares_targets),
-                output=output.name,
-                repository=repository,
-                directory=str(output.directory),
-                **_selection_detail(selection),
-            )
-            with span(
-                f"generate manifests {output.name}",
-                **{"relcoord.output": output.name},
-            ):
-                generation_result = generate(
-                    deploy_config,
-                    output_path,
-                    repo_root=Path("/"),
-                    create_commit=True,
-                    image=None,
-                    namespace=namespace,
-                    plugins=plugins,
-                    **selection,
-                )
-            generation_result = _discount_moved_objects(generation_result)
-            generated = _written_paths(generation_result)
-            logger.info(
-                "diff step 5/6: manifest-builder generated %d file(s) for output %s",
-                len(generated),
-                output.name,
-            )
-            report(
-                "generated",
-                _generated_message(
-                    output,
-                    len(generated),
-                    _sorted_refs(generation_result.created_or_modified),
-                    _sorted_refs(generation_result.removed),
-                ),
-                output=output.name,
-                repository=repository,
-                generated=len(generated),
-            )
-            output_diffs.append(
-                OutputDiff(
-                    name=output.name,
-                    repository=output.repository,
-                    directory=output.directory,
-                    generated_count=len(generated),
-                )
-            )
-            if not raw_iam_kms_allowed:
-                # Read before the next output commits into the checkout, as
-                # the validation tree is.
-                found = _raw_iam_kms(output, output_path, namespace, report)
-                if found:
-                    refused.append((output.name, found))
-            if self.validator is not None:
-                # The tree is read here, before the next output commits into
-                # the checkout, and only the request runs in the pool.
-                validations.append(
-                    _submit(
-                        validation_pool,
-                        partial(
-                            _validate_output_tree,
-                            self.validator,
-                            output,
-                            read_tree(output_path),
-                            report,
-                            _source_files(output, manifests_checkout, base_commit),
-                        ),
-                    )
-                )
+        generated = generate_batch(
+            tuple(outputs),
+            manifests_checkout,
+            partial(
+                self._diff_output,
+                base_commit=base_commit,
+                deploy_config=deploy_config,
+                declares_targets=declares_targets,
+                namespace=namespace,
+                plugins=plugins,
+                raw_iam_kms_allowed=raw_iam_kms_allowed,
+                validation_pool=validation_pool,
+                report=report,
+            ),
+            workers=self.output_workers,
+            config=deploy_config,
+            local_generate=_generate_locally,
+            repository=repository,
+        )
+        for _, (output_diff, found, validation) in generated:
+            output_diffs.append(output_diff)
+            if found is not None:
+                refused.append(found)
+            if validation is not None:
+                validations.append(validation)
 
         repository_diff = _manifests_diff(manifests_checkout, base_commit)
         if repository_diff.diff.strip():
@@ -1769,6 +1751,114 @@ class DiffCommentProcessor:
             validations=tuple(validations),
             refused=tuple(refused),
         )
+
+    def _diff_output(
+        self,
+        output: OutputSettings,
+        generation: Generation,
+        *,
+        base_commit: str,
+        deploy_config: Path,
+        declares_targets: bool,
+        namespace: str | None,
+        plugins: ExternalPlugins | None,
+        raw_iam_kms_allowed: bool,
+        validation_pool: ThreadPoolExecutor,
+        report: Callable[..., None],
+    ) -> tuple[
+        OutputDiff,
+        tuple[str, tuple[RawResource, ...]] | None,
+        Future[OutputValidation] | None,
+    ]:
+        """Generate one output of a diff and read what it generated.
+
+        ``generation.root`` is where the output is generated: the repository's
+        checkout, or with output workers a scratch repository of the output's
+        own that is gone once the batch is committed. Either way the generated
+        tree is read here, before anything else commits into it, and only the
+        validator request is left to the pool.
+        """
+        repository = output.repository
+        output_path = generation.root / output.directory
+        output_path.mkdir(parents=True, exist_ok=True)
+        selection = _generate_selection(output, declares_targets)
+        logger.info(
+            "diff step 5/6: invoking manifest-builder generate("
+            "output=%s, deploy_config=%s, manifests_checkout=%s, "
+            "namespace=%s, plugins=%s, %s)",
+            output.name,
+            deploy_config,
+            output_path,
+            namespace,
+            _plugins_log_summary(plugins),
+            _selection_log_summary(selection),
+        )
+        report(
+            "generate",
+            _generating_message(output, declares_targets),
+            output=output.name,
+            repository=repository,
+            directory=str(output.directory),
+            **_selection_detail(selection),
+        )
+        with span(
+            f"generate manifests {output.name}",
+            **{"relcoord.output": output.name},
+        ):
+            generation_result = generation.generate(
+                deploy_config,
+                output_path,
+                repo_root=Path("/"),
+                create_commit=True,
+                image=None,
+                namespace=namespace,
+                plugins=plugins,
+                **selection,
+            )
+        generation_result = _discount_moved_objects(generation_result)
+        generated = _written_paths(generation_result)
+        logger.info(
+            "diff step 5/6: manifest-builder generated %d file(s) for output %s",
+            len(generated),
+            output.name,
+        )
+        report(
+            "generated",
+            _generated_message(
+                output,
+                len(generated),
+                _sorted_refs(generation_result.created_or_modified),
+                _sorted_refs(generation_result.removed),
+            ),
+            output=output.name,
+            repository=repository,
+            generated=len(generated),
+        )
+        output_diff = OutputDiff(
+            name=output.name,
+            repository=output.repository,
+            directory=output.directory,
+            generated_count=len(generated),
+        )
+        refused: tuple[str, tuple[RawResource, ...]] | None = None
+        if not raw_iam_kms_allowed:
+            found = _raw_iam_kms(output, output_path, namespace, report)
+            if found:
+                refused = (output.name, found)
+        validation: Future[OutputValidation] | None = None
+        if self.validator is not None:
+            validation = _submit(
+                validation_pool,
+                partial(
+                    _validate_output_tree,
+                    self.validator,
+                    output,
+                    read_tree(output_path),
+                    report,
+                    _source_files(output, generation.root, base_commit),
+                ),
+            )
+        return output_diff, refused, validation
 
     def _comment(
         self,
@@ -1877,15 +1967,16 @@ class DiffCommentProcessor:
         )
 
 
-def _submit[T](pool: ThreadPoolExecutor, task: Callable[[], T]) -> Future[T]:
-    """Run a task in a pool inside a copy of the caller's context.
+_submit = submit_in_context
 
-    Pool threads do not inherit context variables, and the current trace span
-    is one, so without the copy a task's spans would start traces of their own
-    rather than nest under the request they belong to.
+
+def _generate_locally(*args: Any, **kwargs: Any) -> GenerationResult:
+    """manifest-builder's generate, in relcoord's own process.
+
+    Looked up when called rather than bound once, so that what ``generate``
+    names here is what runs.
     """
-    context = contextvars.copy_context()
-    return pool.submit(lambda: context.run(task))
+    return generate(*args, **kwargs)
 
 
 def _run_concurrently[T](tasks: Sequence[Callable[[], T]], max_workers: int) -> list[T]:

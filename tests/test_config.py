@@ -475,6 +475,40 @@ def test_settings_rejects_invalid_max_concurrency(
         Settings.from_toml(config)
 
 
+def test_settings_parses_max_output_concurrency(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("max-output-concurrency = 3\n")
+
+    assert Settings.from_toml(config).max_output_concurrency == 3
+
+
+def test_settings_generates_outputs_one_after_another_by_default(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("")
+
+    assert Settings.from_toml(config).max_output_concurrency == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "error", "message"),
+    [
+        ("0", ValueError, "max-output-concurrency must be at least 1"),
+        ("true", TypeError, "max-output-concurrency must be an integer"),
+        ('"2"', TypeError, "max-output-concurrency must be an integer"),
+    ],
+)
+def test_settings_rejects_invalid_max_output_concurrency(
+    tmp_path: Path, value: str, error: type[Exception], message: str
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(f"max-output-concurrency = {value}\n")
+
+    with pytest.raises(error, match=message):
+        Settings.from_toml(config)
+
+
 def test_settings_defaults_log_level_to_info(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text("")

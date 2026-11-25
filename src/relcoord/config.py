@@ -304,6 +304,11 @@ class RolloutSettings:
 # pool of helm renders inside each generation, so this multiplies with that.
 DEFAULT_MAX_CONCURRENCY = 4
 
+# How many outputs of one manifests repository a change or diff generates at
+# once, each in a worker process of its own. 1 generates them one after another
+# in relcoord's own process, as relcoord always has.
+DEFAULT_MAX_OUTPUT_CONCURRENCY = 1
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -318,6 +323,8 @@ class Settings:
     rollouts: list[RolloutSettings] = field(default_factory=list)
     detect_deployment: bool = False
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    max_output_concurrency: int = DEFAULT_MAX_OUTPUT_CONCURRENCY
+    """How many outputs sharing a manifests repository generate at once."""
     generate_while_waiting: bool = False
     """Generate while a rollout stage waits, rather than only between stages."""
     persistence: PersistenceSettings | None = None
@@ -420,6 +427,9 @@ class Settings:
             detect_deployment=detect_deployment,
             max_concurrency=_positive_int_or_default(
                 data, "max-concurrency", cls.max_concurrency
+            ),
+            max_output_concurrency=_positive_int_or_default(
+                data, "max-output-concurrency", cls.max_output_concurrency
             ),
             generate_while_waiting=generate_while_waiting,
             persistence=(

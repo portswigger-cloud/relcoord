@@ -23,6 +23,7 @@ from relcoord.config import Settings
 from relcoord.dynamodb_store import DynamoDBImageInfoStore
 from relcoord.github import GithubIssueCommenter
 from relcoord.in_memory_store import InMemoryImageInfoStore
+from relcoord.output_workers import OutputWorkers
 from relcoord.retrying_store import RetryingImageInfoStore
 from relcoord.store import ImageInfoStore
 from relcoord.surreal_store import SurrealImageInfoStore
@@ -54,8 +55,10 @@ def make_server_config(settings: Settings) -> HypercornConfig:
 async def run(settings: Settings, disable_auth: bool) -> None:
     config = make_server_config(settings)
     token_validator = _build_token_validator(settings, disable_auth)
-    change_processor = make_change_processor(settings)
-    diff_processor = make_diff_processor(settings)
+    # One limit for changes and diffs alike, so it bounds relcoord as a whole.
+    output_workers = make_output_workers(settings)
+    change_processor = make_change_processor(settings, output_workers)
+    diff_processor = make_diff_processor(settings, output_workers)
     store = await make_store(settings)
     tracer_provider = configure_tracing(settings.tracing)
     try:
@@ -111,8 +114,20 @@ async def make_store(settings: Settings) -> ImageInfoStore:
     )
 
 
+def make_output_workers(settings: Settings) -> OutputWorkers | None:
+    """The worker processes outputs sharing a repository generate on, if enabled."""
+    if settings.max_output_concurrency <= 1:
+        return None
+    logger.info(
+        "generating up to %d outputs of a manifests repository at once",
+        settings.max_output_concurrency,
+    )
+    return OutputWorkers(settings.max_output_concurrency)
+
+
 def make_change_processor(
     settings: Settings,
+    output_workers: OutputWorkers | None = None,
 ) -> ManifestChangeProcessor:
     if settings.manifests_repository is None and not settings.outputs:
         raise RuntimeError(
@@ -126,6 +141,7 @@ def make_change_processor(
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
         max_concurrency=settings.max_concurrency,
+        output_workers=output_workers,
         generate_while_waiting=settings.generate_while_waiting,
         # Left unset while validation on a change is disabled; see
         # ChangeProcessor.process.
@@ -133,7 +149,9 @@ def make_change_processor(
     )
 
 
-def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
+def make_diff_processor(
+    settings: Settings, output_workers: OutputWorkers | None = None
+) -> DiffCommentProcessor:
     return DiffCommentProcessor(
         manifests_repository=settings.manifests_repository,
         system_repository=settings.system_repository,
@@ -142,6 +160,7 @@ def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
         commenter=GithubIssueCommenter(idcat=settings.idcat),
         validator=make_validator(settings),
         max_concurrency=settings.max_concurrency,
+        output_workers=output_workers,
     )
 
 

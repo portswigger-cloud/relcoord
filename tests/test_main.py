@@ -17,6 +17,7 @@ from relcoord.main import (
     configure_logging,
     make_change_processor,
     make_diff_processor,
+    make_output_workers,
     make_server_config,
     make_store,
 )
@@ -65,6 +66,28 @@ def test_processors_use_max_concurrency() -> None:
 
     assert make_change_processor(settings).max_concurrency == 2
     assert make_diff_processor(settings).max_concurrency == 2
+
+
+def test_processors_generate_outputs_one_after_another_by_default() -> None:
+    settings = Settings(manifests_repository="https://github.com/acme/manifests.git")
+
+    assert make_output_workers(settings) is None
+    assert make_change_processor(settings).output_workers is None
+    assert make_diff_processor(settings).output_workers is None
+
+
+def test_processors_share_one_output_worker_limit() -> None:
+    settings = Settings(
+        manifests_repository="https://github.com/acme/manifests.git",
+        max_output_concurrency=3,
+    )
+
+    workers = make_output_workers(settings)
+
+    assert workers is not None
+    assert workers.limit == 3
+    assert make_change_processor(settings, workers).output_workers is workers
+    assert make_diff_processor(settings, workers).output_workers is workers
 
 
 def test_make_change_processor_uses_generate_while_waiting() -> None:

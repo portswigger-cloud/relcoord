@@ -10,6 +10,13 @@ detect-deployment = false
 # How many manifests repositories a change or diff works on at once, and how
 # many validator requests a diff keeps in flight.
 max-concurrency = 4
+# How many outputs of one manifests repository are generated at once, each by a
+# worker process into a scratch repository of its own, and then committed in
+# configured order. The limit holds across every change and diff relcoord is
+# serving, so size CPU and memory for this many generations. 1, the default,
+# generates them one after another. The README's "Generating a repository's
+# outputs at once" says when a batch still generates one after another.
+# max-output-concurrency = 4
 # Generate while a rollout stage waits for its deployments: the next stage is
 # generated during the wait, and a system-mode change generates and pushes the
 # outputs its commit's paths point at before the rest of their stage. Requires
