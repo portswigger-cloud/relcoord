@@ -474,7 +474,7 @@ core. `max-output-concurrency` generates up to that many of a repository's
 outputs at once:
 
 ```toml
-max-output-concurrency = 4   # default 1: one after another, as before
+max-output-concurrency = 3   # default 1: one after another, as before
 ```
 
 With it above 1, each output of a batch (a stage's outputs of one repository, or
@@ -495,8 +495,9 @@ Processes rather than threads, because the per-output work is Python that holds
 the GIL, and because manifest-builder keeps per-process state (the plugin modules
 it imports afresh each run and the resource scopes they declare) that a second
 generation in the same process could race on. Workers are forked from a
-forkserver that has relcoord's modules loaded, live as long as their batch, and
-generate one output after another as relcoord's own process otherwise does. The
+forkserver that has relcoord's modules loaded, which keeps starting one cheap,
+and each lives for the one output it generates, so its memory is handed back as
+soon as that output is done. The
 helm chart cache is shared, which is safe across processes: a chart is unpacked
 into a staging directory and renamed into place.
 
@@ -505,7 +506,9 @@ A batch is generated one after another, as before, when:
 - two of its outputs write overlapping directories: the same directory, one
   inside the other, or the repository root;
 - an output's directory, or one on the way to it, is a symlink or a file in the
-  clone rather than a directory;
+  clone rather than a directory, or the output's directory holds a symlink (an
+  owner file linked from elsewhere, say), which a scratch repository checking
+  out that directory alone could not follow;
 - it has a single output.
 
 The first two are logged ("generating the outputs of ... one after another").
@@ -519,10 +522,14 @@ out of memory, fails its batch the same way rather than taking relcoord with it.
 
 The limit is relcoord's as a whole, shared by every change and diff and every
 repository being generated, so the CPU and memory relcoord needs grow with it,
-not with the traffic: plan for roughly one core and one worker's peak memory per
-output generated at once, on top of what relcoord needs anyway. A worker renders
-its output's helm charts on manifest-builder's own pool, as relcoord's process
-does.
+not with the traffic. Every generation takes a slot while it runs, including the
+ones a batch generates one after another in relcoord's own process once the
+setting is above 1. Plan for roughly one core and one generation's peak memory
+per slot, on top of what relcoord needs anyway. A worker renders its output's
+helm charts on manifest-builder's own pool, as relcoord's process does.
+[docs/output-concurrency.md](docs/output-concurrency.md) has the measurements,
+what the gain is worth against the cores it reserves, and how to enable it on a
+deployment.
 
 Progress events and traces stay per output: a `generate manifests <output>`
 span still covers each output, now overlapping the others', and includes
