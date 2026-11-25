@@ -57,7 +57,7 @@ from dulwich import porcelain
 from dulwich.diff_tree import tree_changes
 from dulwich.errors import NotGitRepository
 from dulwich.index import update_working_tree
-from dulwich.object_store import BaseObjectStore
+from dulwich.object_store import BaseObjectStore, iter_tree_contents
 from dulwich.objects import Commit, ObjectID, Tree
 from dulwich.refs import HEADREF
 from dulwich.repo import Repo
@@ -91,12 +91,15 @@ class OutputWorkerError(RuntimeError):
 
 
 class OutputWorkers:
-    """How many outputs may be generating in worker processes at any moment.
+    """How many outputs may be generating at any moment, across relcoord.
 
     One instance is shared by every change and diff relcoord serves, so the
     limit holds however many requests and repositories are being generated at
-    once: a generation waits for a slot before it starts, and the memory and CPU
-    relcoord needs grow with this number rather than with the traffic.
+    once. Every generation takes a slot before it starts and gives it back once
+    done: one in a worker process, whose process lives for that one output, and
+    one in relcoord's own process, as a batch that is generated one after
+    another is. The memory and CPU generation needs therefore grow with this
+    number rather than with the traffic.
     """
 
     def __init__(self, limit: int) -> None:
@@ -152,16 +155,18 @@ def generate_batch[O: _Output, T](
     committed to ``checkout``.
     """
     serial = Generation(root=checkout, generate=local_generate)
-    if workers is None or workers.limit <= 1 or len(outputs) <= 1:
+    if workers is None:
         return _serially(outputs, serial, generate_one, until)
-    unsafe = _overlap(outputs) or _not_a_directory(outputs, checkout)
+    if workers.limit <= 1 or len(outputs) <= 1:
+        return _serially(outputs, serial, generate_one, until, workers)
+    unsafe = _overlap(outputs) or _linked(outputs, checkout)
     if unsafe is not None:
         logger.info(
             "generating the outputs of %s one after another: %s",
             repository,
             unsafe,
         )
-        return _serially(outputs, serial, generate_one, until)
+        return _serially(outputs, serial, generate_one, until, workers)
     return _concurrently(
         outputs,
         checkout,
@@ -189,12 +194,27 @@ def _serially[O: _Output, T](
     generation: Generation,
     generate_one: Callable[[O, Generation], T],
     until: Callable[[], bool] | None,
+    workers: OutputWorkers | None = None,
 ) -> list[tuple[O, T]]:
+    """Generate in relcoord's own process, one output after another.
+
+    With ``workers``, each output takes a slot like a worker's generation does,
+    so the limit counts these as well.
+    """
     results: list[tuple[O, T]] = []
     for output in outputs:
         if until is not None and until():
             break
-        results.append((output, generate_one(output, generation)))
+        if workers is None:
+            results.append((output, generate_one(output, generation)))
+            continue
+        workers.acquire()
+        try:
+            if until is not None and until():
+                break
+            results.append((output, generate_one(output, generation)))
+        finally:
+            workers.release()
     return results
 
 
@@ -226,9 +246,10 @@ def _concurrently[O: _Output, T](
             ProcessPoolExecutor(
                 max_workers=width,
                 mp_context=_worker_context(),
-                # A worker generates one output after another, as relcoord's
-                # own process does without workers, and the pool goes with the
-                # batch, so its memory is handed back once the batch is done.
+                # A process per output, so a worker's memory goes with the slot
+                # it held rather than staying until the batch is done. Forking
+                # from the preloaded server keeps starting one cheap.
+                max_tasks_per_child=1,
                 initializer=_configure_worker_logging,
                 initargs=_worker_logging(),
             ) as processes,
@@ -625,22 +646,27 @@ def _overlap(outputs: Sequence[_Output]) -> str | None:
     return None
 
 
-def _not_a_directory(outputs: Sequence[_Output], checkout: Path) -> str | None:
-    """Say which output's directory, or a directory on the way to it, is not one.
+def _linked(outputs: Sequence[_Output], checkout: Path) -> str | None:
+    """Say which output's directory a symlink leads to, or leads out of, if any.
 
-    A symlink would let two outputs whose names differ write the same files,
-    which a scratch repository checking out the one directory cannot follow.
+    A scratch repository checks out the output's directory alone, so it cannot
+    follow a link elsewhere: not a directory on the way to the output's, which
+    would let two outputs whose names differ write the same files, and not a
+    link inside it, an owner file among them, which manifest-builder would read
+    through and find dangling.
     """
     repo = Repo(str(checkout))
     try:
-        tree = cast(Commit, repo[repo.head()]).tree
+        root = cast(Commit, repo[repo.head()]).tree
         for output in outputs:
-            current = tree
+            current = root
+            exists = True
             for part in PurePosixPath(_directory(output)).parts:
                 entries = cast(Tree, repo[current])
                 try:
                     mode, sha = entries[part.encode("utf-8")]
                 except KeyError:
+                    exists = False
                     break
                 if not stat.S_ISDIR(mode):
                     return (
@@ -648,6 +674,15 @@ def _not_a_directory(outputs: Sequence[_Output], checkout: Path) -> str | None:
                         f"through {part}, which is not a directory"
                     )
                 current = sha
+            if not exists:
+                continue
+            for entry in iter_tree_contents(repo.object_store, current):
+                if entry.mode is not None and stat.S_ISLNK(entry.mode):
+                    path = (entry.path or b"").decode("utf-8", errors="replace")
+                    return (
+                        f"{output.name}'s directory {_directory(output) or '.'} "
+                        f"holds a symlink, {path}"
+                    )
     finally:
         repo.close()
     return None

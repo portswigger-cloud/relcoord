@@ -835,3 +835,88 @@ def _without_config_commit(commit: Commit) -> list[str]:
 
 def _normalised(diff: str, name: str) -> str:
     return diff.replace(name, "<run>")
+
+
+def _land(
+    repositories: Repositories,
+    files: Mapping[str, str],
+    symlinks: Mapping[str, str] | None = None,
+) -> None:
+    """Push a commit to the manifests repository, as another writer would."""
+    symlinks = symlinks or {}
+    writer = repositories.tmp_path / "lander"
+    porcelain.clone(str(repositories.remote), str(writer), branch=b"main").close()
+    for name, target in symlinks.items():
+        (writer / name).parent.mkdir(parents=True, exist_ok=True)
+        (writer / name).symlink_to(target)
+    for name, content in files.items():
+        (writer / name).parent.mkdir(parents=True, exist_ok=True)
+        (writer / name).write_text(content)
+    repo = Repo(str(writer))
+    try:
+        porcelain.add(repo, [name.encode() for name in [*files, *symlinks]])
+        porcelain.commit(repo, b"land", author=AUTHOR, committer=AUTHOR)
+    finally:
+        repo.close()
+    porcelain.push(
+        str(writer), str(repositories.remote), b"refs/heads/main", errstream=BytesIO()
+    )
+    remote = Repo(str(repositories.remote))
+    try:
+        repositories.seed = remote.refs[MAIN]
+    finally:
+        remote.close()
+
+
+def test_each_output_gets_a_worker_process_of_its_own(
+    tmp_path: Path, workdir: Path
+) -> None:
+    repositories = Repositories(tmp_path)
+    commit = repositories.write_config()
+
+    _change(
+        repositories, repositories.outputs("a", "b", "c", "d"), commit, OutputWorkers(2)
+    )
+
+    pids = [run.pid for run in repositories.runs().values()]
+    # A worker's process goes once its output is done, so its memory goes with
+    # the slot instead of staying until the batch is.
+    assert len(set(pids)) == 4
+    assert os.getpid() not in pids
+
+
+def test_outputs_generated_one_after_another_count_against_the_limit(
+    tmp_path: Path, workdir: Path
+) -> None:
+    overlapping = Repositories(tmp_path, manifests="overlapping")
+    disjoint = Repositories(tmp_path, manifests="disjoint")
+    commit = overlapping.write_config(delays={name: 0.3 for name in "abwxyz"})
+    outputs = (
+        # a and a-inner overlap, so they generate in relcoord's own process.
+        overlapping.outputs("a", "a/inner") + disjoint.outputs("w", "x", "y", "z")
+    )
+
+    _change(overlapping, outputs, commit, OutputWorkers(2), max_concurrency=2)
+
+    runs = overlapping.runs()
+    assert {runs["a"].pid, runs["a-inner"].pid} == {os.getpid()}
+    assert _overlapping(runs) <= 2
+
+
+def test_a_linked_owner_file_in_an_output_generates_one_after_another(
+    tmp_path: Path, workdir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    repositories = Repositories(tmp_path)
+    _land(
+        repositories,
+        {"shared/owner.toml": 'owned = "shared"\n'},
+        symlinks={"a/owners/shared.toml": "../../shared/owner.toml"},
+    )
+    commit = repositories.write_config()
+
+    with caplog.at_level(logging.INFO, logger="relcoord.output_workers"):
+        _change(repositories, repositories.outputs("a", "b"), commit, OutputWorkers(2))
+
+    assert {run.pid for run in repositories.runs().values()} == {os.getpid()}
+    assert "holds a symlink, owners/shared.toml" in caplog.text
+    assert [_output_path(c) for c in repositories.history()] == ["a", "b"]
