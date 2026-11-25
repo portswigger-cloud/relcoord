@@ -527,8 +527,9 @@ ones a batch generates one after another in relcoord's own process once the
 setting is above 1. Plan for roughly one core and one generation's peak memory
 per slot, on top of what relcoord needs anyway. A worker renders its output's
 helm charts on manifest-builder's own pool, as relcoord's process does.
-[docs/output-concurrency.md](docs/output-concurrency.md) has the measurements
-and how to enable it on a deployment.
+[docs/output-concurrency.md](docs/output-concurrency.md) has the measurements,
+what the gain is worth against the cores it reserves, and how to enable it on a
+deployment.
 
 Progress events and traces stay per output: a `generate manifests <output>`
 span still covers each output, now overlapping the others', and includes

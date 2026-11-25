@@ -40,6 +40,26 @@ Live timings from before this setting existed, for reference only: generating
 the 17 targets took 43 s on platform-prod and 97 s on fe-prod before its CPU
 request was raised, and a whole system diff 105 s and 143 s.
 
+## What it is worth
+
+The gain is in generation, which is only part of a request:
+
+- A diff generates every target before it compares them, so generation is all
+  on its critical path. Offline, the whole diff came down by about a quarter at
+  3 (13.9 s to 10.7 s); scaled to platform-prod's 43 s of generation in a 105 s
+  diff, that suggests roughly 15–20 s saved, an estimate rather than a
+  measurement.
+- A rollout is mostly waiting for clusters to apply what was pushed, and with
+  `generate-while-waiting` each later stage is already generated during the wait
+  before it. What reliably comes off is the first stage's generation, a few
+  seconds; a later stage only gains where its generation outlasts that wait.
+
+Dedicated cores for it are not free. Requests are reserved whether or not a
+render is running, and the LimitRange below applies to every replica, so
+raising it to 3 cores and 2560Mi from 1 core and 1536Mi reserves 4 more vCPU and
+2 GiB more across two replicas, of the order of $100–150 a month on on-demand
+Graviton list prices. Measure before paying for that.
+
 ## Enabling it on a deployment
 
 For PortSwigger's relcoord on fe-prod, as a change to the system repository:
@@ -50,17 +70,20 @@ For PortSwigger's relcoord on fe-prod, as a change to the system repository:
    `platform/relcoord/relcoord.toml` while that instance renders the same
    commits. 3 rather than 4: offline it took a diff's generation most of the way
    (−40%, against −47% at 4) at one fewer core and about 400 MiB less.
-3. Raise the requests in `fe-prod/relcoord/extra/limitrange-relcoord.yaml`, today
-   `cpu: "1"` and `memory: 1536Mi` (sized from a 1.41 GiB peak generating one
-   output at a time), to at least `cpu: "3"` and `memory: 2560Mi`: a core per
-   slot, and 512 MiB for each slot beyond the first, which is above the
-   300–400 MiB measured offline. fe's Karpenter sizes nodes from requests and
-   its default NodePool allows larger instances, so no node change is needed;
-   with a 1 CPU request relcoord can land on a single-vCPU node, where the
-   setting gains nothing. Both replicas reserve what is requested.
-4. After the rollout, read the peak `container_memory_working_set_bytes` of
-   relcoord's container over a few system diffs and rollouts, and adjust the
-   memory request to that peak plus headroom.
+3. Leave the requests in `fe-prod/relcoord/extra/limitrange-relcoord.yaml` as
+   they are at first (`cpu: "1"`, `memory: 1536Mi`). relcoord has requests and
+   no limits, so the workers use whatever cores the node has spare, at no extra
+   cost; on a node with none spare they queue behind one another and gain
+   nothing. Measure as below.
+4. Only if the measured gain is worth the cost above, raise the requests to
+   `cpu: "3"` and `memory: 2560Mi`: a core per slot, and 512 MiB for each slot
+   beyond the first, above the 300–400 MiB measured offline. fe's Karpenter sizes
+   nodes from requests and its default NodePool allows larger instances, so no
+   node change is needed.
+5. Either way, read the peak `container_memory_working_set_bytes` of relcoord's
+   container over a few system diffs and rollouts. Up to 3 generations at once
+   use more memory than one, so a memory request still sized for one is the
+   first thing to check.
 
 ## Checking that it helped
 
