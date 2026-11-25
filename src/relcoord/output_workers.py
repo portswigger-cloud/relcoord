@@ -42,14 +42,15 @@ import multiprocessing
 import os
 import pickle
 import shutil
+import signal
 import stat
 import tempfile
 import threading
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
+from multiprocessing.connection import Connection
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 
@@ -66,6 +67,9 @@ from manifest_builder import GenerationResult
 logger = logging.getLogger(__name__)
 
 _GITLINK_MODE = 0o160000
+
+# How often a generation waiting for a slot asks whether it is still wanted.
+_SLOT_POLL_SECONDS = 0.1
 
 
 class _Output(Protocol):
@@ -108,8 +112,20 @@ class OutputWorkers:
         self.limit = limit
         self._slots = threading.BoundedSemaphore(limit)
 
-    def acquire(self) -> None:
-        self._slots.acquire()
+    def acquire(self, stop: Callable[[], bool] | None = None) -> bool:
+        """Take a slot, or give up and return False once ``stop`` answers true.
+
+        ``stop`` is asked while waiting, so a rollout stage whose wait is over,
+        or a batch with a failed output, does not sit behind another request's
+        generations for a slot it will not use.
+        """
+        if stop is None:
+            self._slots.acquire()
+            return True
+        while not self._slots.acquire(timeout=_SLOT_POLL_SECONDS):
+            if stop():
+                return False
+        return True
 
     def release(self) -> None:
         self._slots.release()
@@ -208,7 +224,8 @@ def _serially[O: _Output, T](
         if workers is None:
             results.append((output, generate_one(output, generation)))
             continue
-        workers.acquire()
+        if not workers.acquire(stop=until):
+            break
         try:
             if until is not None and until():
                 break
@@ -239,29 +256,24 @@ def _concurrently[O: _Output, T](
         width,
     )
     scratch = Path(tempfile.mkdtemp(prefix="outputs-", dir=checkout.parent))
+    context = _worker_context()
+    logging_setup = _worker_logging()
     failed = threading.Event()
+
+    def stop() -> bool:
+        return failed.is_set() or (until is not None and until())
+
     admitted: list[tuple[O, Path, Future[T]]] = []
     try:
-        with (
-            ProcessPoolExecutor(
-                max_workers=width,
-                mp_context=_worker_context(),
-                # A process per output, so a worker's memory goes with the slot
-                # it held rather than staying until the batch is done. Forking
-                # from the preloaded server keeps starting one cheap.
-                max_tasks_per_child=1,
-                initializer=_configure_worker_logging,
-                initargs=_worker_logging(),
-            ) as processes,
-            ThreadPoolExecutor(
-                max_workers=width, thread_name_prefix="relcoord-output"
-            ) as threads,
-        ):
+        with ThreadPoolExecutor(
+            max_workers=width, thread_name_prefix="relcoord-output"
+        ) as threads:
             # Outputs are admitted here, one at a time and in configured order,
             # so the ones a stop leaves out are always the last.
             for index, output in enumerate(outputs):
-                workers.acquire()
-                if failed.is_set() or (until is not None and until()):
+                if not workers.acquire(stop=stop):
+                    break
+                if stop():
                     workers.release()
                     break
                 root = scratch / str(index)
@@ -269,7 +281,8 @@ def _concurrently[O: _Output, T](
                     root=root,
                     generate=partial(
                         _generate_in_worker,
-                        processes,
+                        context,
+                        logging_setup,
                         output.name,
                         checkout,
                         base,
@@ -324,7 +337,8 @@ def _run_admitted[O: _Output, T](
 
 
 def _generate_in_worker(
-    processes: ProcessPoolExecutor,
+    context: multiprocessing.context.BaseContext,
+    logging_setup: tuple[int, str | None, str | None],
     name: str,
     checkout: Path,
     base: str,
@@ -333,18 +347,73 @@ def _generate_in_worker(
     *args: Any,
     **kwargs: Any,
 ) -> GenerationResult:
-    """Generate in a worker process, waiting for it on the calling thread."""
-    future = processes.submit(
-        _generate_in_scratch, checkout, base, root, directory, args, kwargs
+    """Generate in a worker process of the output's own, waiting for it here.
+
+    The process lives for this one output, and is joined before this returns,
+    so the slot the caller holds outlasts it: a worker's memory and CPU go with
+    the slot. A worker that dies is noticed at once, by its end of the pipe
+    closing with no result, and what it started is killed with it; only this
+    output fails for it.
+    """
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(  # ty: ignore[unresolved-attribute]
+        target=_worker_main,
+        args=(sender, logging_setup, checkout, base, root, directory, args, kwargs),
+        name=f"relcoord-output-{name}",
     )
+    process.start()
+    sender.close()
+    outcome: tuple[bool, Any] | None = None
     try:
-        return future.result()
-    except BrokenProcessPool as exc:
+        outcome = receiver.recv()
+    except EOFError:
+        pass
+    finally:
+        receiver.close()
+        if outcome is None:
+            _kill_group(process.pid)
+        process.join()
+    if outcome is None:
         raise OutputWorkerError(
-            f"a worker process ended before generating {name} finished, or one "
-            "generating alongside it did; the likely cause is the process being "
-            "killed for running out of memory"
-        ) from exc
+            f"the worker process generating {name} ended before it finished "
+            f"(exit code {process.exitcode}); the likely cause is the process "
+            "being killed for running out of memory"
+        )
+    succeeded, payload = outcome
+    if not succeeded:
+        raise cast(BaseException, payload)
+    return cast(GenerationResult, payload)
+
+
+def _worker_main(
+    sender: Connection,
+    logging_setup: tuple[int, str | None, str | None],
+    checkout: Path,
+    base: str,
+    root: Path,
+    directory: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Worker process entry point: generate, and send back the result or failure.
+
+    The worker leads a process group of its own, which helm and anything else
+    the generation starts join, so that what a worker that dies leaves behind
+    can be killed by group.
+    """
+    os.setpgrp()
+    _configure_worker_logging(*logging_setup)
+    try:
+        result = _generate_in_scratch(checkout, base, root, directory, args, kwargs)
+    except Exception as exc:
+        # Every failure goes back to relcoord, which reports it; it arrives in
+        # a form that survives the trip (see _transportable).
+        logger.debug("generation failed; sending the failure back", exc_info=True)
+        sender.send((False, exc))
+    else:
+        sender.send((True, result))
+    finally:
+        sender.close()
 
 
 def _generate_in_scratch(
@@ -752,6 +821,20 @@ def _worker_logging() -> tuple[int, str | None, str | None]:
     if formatter is None:
         return root.getEffectiveLevel(), None, None
     return root.getEffectiveLevel(), formatter._fmt, formatter.datefmt
+
+
+def _kill_group(pid: int) -> None:
+    """Kill the process group a dead worker led, and so what it left running.
+
+    Right after the worker died: anything it left keeps the group in use, so its
+    id cannot have been given to anything else, and a group with nothing left
+    in it is simply not found.
+    """
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError, PermissionError:
+        return
+    logger.info("killed what the dead worker %s left running", pid)
 
 
 def _configure_worker_logging(level: int, fmt: str | None, datefmt: str | None) -> None:

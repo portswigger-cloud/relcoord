@@ -58,6 +58,7 @@ MAIN = GitRef(b"refs/heads/main")
 # generating at once, take a while, fail, or kill its process.
 PROBE_PLUGIN = """
 import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +78,8 @@ class ProbeConfig:
     delays: dict = field(default_factory=dict)
     fail_on: list = field(default_factory=list)
     exit_on: list = field(default_factory=list)
+    spawn_on: list = field(default_factory=list)
+    await_files: dict = field(default_factory=dict)
 
 
 class ProbeBlock(ConfigBlock[ProbeConfig]):
@@ -100,6 +103,8 @@ class ProbeBlock(ConfigBlock[ProbeConfig]):
                 delays=item.get("delays", {}),
                 fail_on=item.get("fail_on", []),
                 exit_on=item.get("exit_on", []),
+                spawn_on=item.get("spawn_on", []),
+                await_files=item.get("await_files", {}),
             ))
 
     def iter_configs(self):
@@ -119,6 +124,15 @@ class ProbeBlock(ConfigBlock[ProbeConfig]):
                 if time.time() > start + 30:
                     raise RuntimeError(f"{config.cluster} generated alone")
                 time.sleep(0.01)
+        if config.cluster in config.spawn_on:
+            # Stands in for a helm process the generation is waiting on.
+            child = subprocess.Popen(["sleep", "60"])
+            (log / f"{config.cluster}.child").write_text(str(child.pid))
+        awaited = config.await_files.get(config.cluster)
+        while awaited and not (log / awaited).exists():
+            if time.time() > start + 30:
+                raise RuntimeError(f"{config.cluster} never saw {awaited}")
+            time.sleep(0.01)
         time.sleep(config.delays.get(config.cluster, 0))
         if config.cluster in config.exit_on:
             os._exit(3)
@@ -519,7 +533,9 @@ def test_a_worker_process_that_dies_fails_the_change_without_a_push(
     repositories = Repositories(tmp_path)
     commit = repositories.write_config(exit_on=["b"])
 
-    with pytest.raises(ChangeProcessingError, match="worker process ended"):
+    with pytest.raises(
+        ChangeProcessingError, match="worker process generating b ended"
+    ):
         _change(repositories, repositories.outputs("a", "b"), commit, OutputWorkers(2))
 
     assert repositories.history() == []
@@ -920,3 +936,93 @@ def test_a_linked_owner_file_in_an_output_generates_one_after_another(
     assert {run.pid for run in repositories.runs().values()} == {os.getpid()}
     assert "holds a symlink, owners/shared.toml" in caplog.text
     assert [_output_path(c) for c in repositories.history()] == ["a", "b"]
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_a_worker_that_dies_is_noticed_at_once_and_takes_what_it_started(
+    tmp_path: Path, workdir: Path
+) -> None:
+    repositories = Repositories(tmp_path)
+    # a starts a child process, as a generation starts helm, and then dies;
+    # b takes a while, and must not be waited for before a's death is reported.
+    commit = repositories.write_config(
+        spawn_on=["a"],
+        await_files={"a": "a.child"},
+        exit_on=["a"],
+        delays={"b": 5},
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ChangeProcessingError, match="generating a ended"):
+        _change(
+            repositories, repositories.outputs("a", "b", "c"), commit, OutputWorkers(2)
+        )
+
+    elapsed = time.monotonic() - started
+    child = int((repositories.log / "a.child").read_text())
+    try:
+        deadline = time.time() + 5
+        while _alive(child) and time.time() < deadline:
+            time.sleep(0.05)
+        assert not _alive(child), "a's child outlived it"
+    finally:
+        if _alive(child):
+            os.kill(child, 9)
+    runs = repositories.runs()
+    # a's death stopped c from starting; b, already generating, was let finish.
+    assert sorted(runs) == ["a", "b"]
+    assert runs["b"].end is not None
+    assert elapsed < 15
+    assert repositories.history() == []
+    assert _workspaces(workdir) == []
+
+
+def _never_generate(*args: Any, **kwargs: Any) -> Any:
+    raise AssertionError("nothing should have been generated")
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_a_batch_waiting_for_a_slot_stops_once_it_is_no_longer_wanted(
+    tmp_path: Path, limit: int
+) -> None:
+    checkout = tmp_path / "checkout"
+    porcelain.init(str(checkout)).close()
+    _commit_all(checkout, {"a/x.yaml": "x\n", "b/y.yaml": "y\n"}, b"base")
+    workers = OutputWorkers(limit)
+    # Other requests hold every slot.
+    for _ in range(limit):
+        workers.acquire()
+    over = threading.Event()
+    threading.Timer(0.3, over.set).start()
+    generated: list[str] = []
+    outputs = [
+        OutputSettings(name=name, repository="r", directory=Path(name))
+        for name in ("a", "b")
+    ]
+
+    started = time.monotonic()
+    results = output_workers.generate_batch(
+        outputs,
+        checkout,
+        lambda output, generation: generated.append(output.name),
+        workers=workers,
+        config=checkout,
+        local_generate=_never_generate,
+        repository="r",
+        until=over.is_set,
+    )
+
+    assert results == []
+    assert generated == []
+    assert time.monotonic() - started < 3
+    for _ in range(limit):
+        workers.release()
+    # No slot was kept by the batch that gave up.
+    assert all(workers.acquire(stop=lambda: True) for _ in range(limit))

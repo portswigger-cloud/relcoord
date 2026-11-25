@@ -518,7 +518,15 @@ generating finish, since a generation cannot be interrupted part way, and then
 fails the change or diff with the first failure in configured order, which is
 the one generating one after another would have reported. Nothing of a failed
 batch is committed or pushed. A worker that dies, for example killed for running
-out of memory, fails its batch the same way rather than taking relcoord with it.
+out of memory, fails its output the same way rather than taking relcoord with
+it. It is noticed as it happens, and what it was running, helm included, is
+killed with it: a worker leads a process group of its own, which everything it
+starts joins.
+
+A generation waiting for a slot gives up as soon as it is no longer wanted:
+when another output of its batch has failed, or, generating ahead of a rollout
+stage, when the stage it was generating during has been verified or has failed.
+Other requests holding every slot therefore never hold up a rollout's result.
 
 The limit is relcoord's as a whole, shared by every change and diff and every
 repository being generated, so the CPU and memory relcoord needs grow with it,
