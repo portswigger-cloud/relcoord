@@ -309,6 +309,16 @@ def _change(
     )
 
 
+def _workspaces(workdir: Path) -> list[Path]:
+    """What a change or diff left in the temporary directory.
+
+    multiprocessing keeps a directory of its own there for the forkserver's
+    socket (pymp-*), made once when the forkserver starts and kept for the life
+    of the process rather than of a request, so it is not a workspace.
+    """
+    return [path for path in workdir.iterdir() if not path.name.startswith("pymp-")]
+
+
 def _overlapping(runs: Mapping[str, Run]) -> int:
     """The most generations that ran at the same moment."""
     edges = sorted(
@@ -348,7 +358,7 @@ def test_outputs_generate_at_once_in_worker_processes(
     assert files["untouched/demo/keep.yaml"] == b"kind: Keep\n"
     assert files["README.md"] == b"manifests\n"
     assert [output.name for output in result.outputs] == ["a", "b", "c"]
-    assert list(workdir.iterdir()) == []
+    assert _workspaces(workdir) == []
 
 
 def test_outputs_generated_at_once_commit_what_one_after_another_does(
@@ -467,7 +477,7 @@ def test_a_failed_output_pushes_nothing_and_leaves_no_workspace(
         )
 
     assert repositories.history() == []
-    assert list(workdir.iterdir()) == []
+    assert _workspaces(workdir) == []
 
 
 def test_the_failure_raised_is_the_first_in_configured_order(
@@ -513,7 +523,7 @@ def test_a_worker_process_that_dies_fails_the_change_without_a_push(
         _change(repositories, repositories.outputs("a", "b"), commit, OutputWorkers(2))
 
     assert repositories.history() == []
-    assert list(workdir.iterdir()) == []
+    assert _workspaces(workdir) == []
 
 
 def test_workers_bound_generations_across_repositories(
@@ -648,7 +658,7 @@ def test_a_diff_generated_at_once_matches_one_generated_after_another(
     assert [v.output for v in concurrent.validations] == ["a", "b", "c"]
     assert trees["concurrent"] == trees["serial"]
     assert sorted(trees["concurrent"]) == ["a", "b", "c"]
-    assert list(workdir.iterdir()) == []
+    assert _workspaces(workdir) == []
 
 
 def test_generate_spans_overlap_under_the_request(
