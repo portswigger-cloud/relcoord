@@ -249,6 +249,10 @@ repository the role names: generating it replaces what is in its directory, so
 two repositories given the same namespace overwrite each other. System mode
 generates every namespace and ignores it.
 
+The names `system` and `owners` are refused when the configuration loads:
+manifest-builder keeps owner files in `owners/`, and generating a namespace
+named `system` would replace the system repository's own.
+
 A config that writes into any namespace other than the one it is generated as is
 refused with `invalid_deploy_config` (400), naming the files and both
 namespaces, rather than generating them and deploying nothing.

@@ -635,3 +635,9 @@ def test_role_config_defaults_to_no_namespace() -> None:
 def test_role_config_rejects_an_invalid_namespace(namespace: str) -> None:
     with pytest.raises(ValueError, match="not a valid Kubernetes namespace name"):
         RoleConfig.from_mapping(_role_mapping(namespace=namespace))
+
+
+@pytest.mark.parametrize("namespace", ["system", "owners"])
+def test_role_config_rejects_a_reserved_namespace(namespace: str) -> None:
+    with pytest.raises(ValueError, match="reserved by manifest-builder"):
+        RoleConfig.from_mapping(_role_mapping(namespace=namespace))
