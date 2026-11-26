@@ -39,6 +39,7 @@ from relcoord.change import (
     ChangeProcessingError,
     ChangeProcessor,
     DiffCommentProcessor,
+    NamespaceMismatchError,
 )
 from relcoord.config import (
     IdcatSettings,
@@ -1026,3 +1027,69 @@ def test_a_batch_waiting_for_a_slot_stops_once_it_is_no_longer_wanted(
         workers.release()
     # No slot was kept by the batch that gave up.
     assert all(workers.acquire(stop=lambda: True) for _ in range(limit))
+
+
+def _write_tenant_config(repositories: Repositories, namespace: str) -> str:
+    """Commit a .deploy config whose probe writes into ``namespace``."""
+    settings = {"name": "probe", "namespace": namespace, "log": str(repositories.log)}
+    lines = ["[[probe]]"] + [
+        f"{key} = {_toml(value)}" for key, value in settings.items()
+    ]
+    commit = _commit_all(
+        repositories.config,
+        {
+            ".deploy/config.toml": "\n".join(lines) + "\n",
+            ".deploy/plugins/probe.py": PROBE_PLUGIN,
+        },
+        b"tenant probe config",
+    )
+    return commit.decode()
+
+
+def test_a_change_generated_at_once_into_the_roles_namespace_is_pushed(
+    tmp_path: Path, workdir: Path
+) -> None:
+    repositories = Repositories(tmp_path)
+    commit = _write_tenant_config(repositories, "fresh")
+
+    ChangeProcessor(
+        outputs=repositories.outputs("a", "b"), output_workers=OutputWorkers(2)
+    ).process(str(repositories.config), commit, None, namespace="fresh")
+
+    runs = repositories.runs()
+    assert sorted(runs) == ["a", "b"]
+    assert os.getpid() not in {run.pid for run in runs.values()}
+    files = repositories.files()
+    assert "a/fresh/configmap-probe.yaml" in files
+    assert "b/fresh/configmap-probe.yaml" in files
+    assert _workspaces(workdir) == []
+
+
+def test_a_change_generated_at_once_into_another_namespace_pushes_nothing(
+    tmp_path: Path, workdir: Path
+) -> None:
+    repositories = Repositories(tmp_path)
+    commit = _write_tenant_config(repositories, "fresh")
+
+    with pytest.raises(NamespaceMismatchError, match="namespace 'other'"):
+        ChangeProcessor(
+            outputs=repositories.outputs("a", "b"), output_workers=OutputWorkers(2)
+        ).process(str(repositories.config), commit, None, namespace="other")
+
+    assert repositories.history() == []
+    assert _workspaces(workdir) == []
+
+
+def test_a_diff_generated_at_once_into_another_namespace_is_refused(
+    tmp_path: Path, workdir: Path
+) -> None:
+    repositories = Repositories(tmp_path)
+    commit = _write_tenant_config(repositories, "fresh")
+
+    with pytest.raises(NamespaceMismatchError, match="namespace 'other'"):
+        DiffCommentProcessor(
+            outputs=repositories.outputs("a", "b"), output_workers=OutputWorkers(2)
+        ).diff(str(repositories.config), commit, namespace="other")
+
+    assert repositories.history() == []
+    assert _workspaces(workdir) == []

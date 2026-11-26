@@ -29,6 +29,7 @@ from relcoord.change import (
     DeployConfigError,
     GitTransportError,
     ManifestValidationError,
+    NamespaceMismatchError,
     ProgressSink,
     RawIamKmsError,
     RolloutStageError,
@@ -290,6 +291,7 @@ def test_change_passes_image_reference_to_processor() -> None:
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
@@ -366,6 +368,7 @@ def test_change_processes_deploy_config_when_processor_is_configured(
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
@@ -422,6 +425,7 @@ def test_change_processor_logs_from_worker_thread(
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             logging.getLogger("relcoord.change").info(
@@ -469,6 +473,7 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
@@ -548,6 +553,7 @@ def test_change_reports_missing_deploy_config(
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise DeployConfigError("missing .deploy")
@@ -595,6 +601,7 @@ def test_change_reports_credential_error_without_traceback(
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise CredentialError(
@@ -650,6 +657,7 @@ def test_change_reports_git_transport_error_without_traceback(
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise GitTransportError(
@@ -701,6 +709,7 @@ def test_change_reports_a_stopped_rollout_without_traceback(
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise RolloutStageError(
@@ -756,6 +765,7 @@ def _config_path_recording_client() -> tuple[TestClient, list[str]]:
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             config_paths.append(config_path)
@@ -835,6 +845,7 @@ def _section_recording_client() -> tuple[TestClient, list[str | None]]:
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             sections.append(section)
@@ -937,6 +948,7 @@ def _system_recording_client(
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             systems.append(system)
@@ -1047,6 +1059,7 @@ def _outputs_recording_client(
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             selections.append(tuple(outputs))
@@ -1362,6 +1375,7 @@ class ReportingProcessor:
         *,
         section: str | None = None,
         source_repository: str | None = None,
+        namespace: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         for step in self._steps:
@@ -1488,6 +1502,7 @@ class BlockingProcessor:
         *,
         section: str | None = None,
         source_repository: str | None = None,
+        namespace: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         progress(ChangeProgress(phase="workspace", message="created workspace"))
@@ -1797,6 +1812,7 @@ class _RecordingDiffProcessor:
         pull_request: int | None = None,
         section: str | None = None,
         source_repository: str | None = None,
+        namespace: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         self.calls.append((repo, commit, config_path, system, pull_request))
@@ -2343,6 +2359,7 @@ def test_change_reports_a_failed_validation_without_a_stack_trace(
             *,
             section: str | None = None,
             source_repository: str | None = None,
+            namespace: str | None = None,
             progress: ProgressSink = ignore_progress,
         ) -> object:
             raise ManifestValidationError(message)
@@ -2376,7 +2393,12 @@ def test_change_reports_a_failed_validation_without_a_stack_trace(
 class _ClaimsValidator:
     """Authenticates every request as a GitHub Actions token from ``repository``."""
 
-    def __init__(self, repository: str, allow_system: bool = False) -> None:
+    def __init__(
+        self,
+        repository: str,
+        allow_system: bool = False,
+        namespace: str | None = None,
+    ) -> None:
         self._principal = ValidatedClaims(
             role="tenant",
             claims={
@@ -2384,6 +2406,7 @@ class _ClaimsValidator:
                 "repository": repository,
             },
             allow_system=allow_system,
+            namespace=namespace,
         )
 
     def validate(self, authorization_header: str | None) -> object:
@@ -2395,6 +2418,7 @@ class _SourceRecorder:
 
     def __init__(self, failure: ChangeProcessingError | None = None) -> None:
         self.sources: list[str | None] = []
+        self.namespaces: list[str | None] = []
         self._failure = failure
 
     def process(
@@ -2408,9 +2432,11 @@ class _SourceRecorder:
         *,
         section: str | None = None,
         source_repository: str | None = None,
+        namespace: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         self.sources.append(source_repository)
+        self.namespaces.append(namespace)
         if self._failure is not None:
             raise self._failure
         return type("Result", (), {"generated_count": 0, "outputs": ()})()
@@ -2426,9 +2452,11 @@ class _SourceRecorder:
         section: str | None = None,
         pull_request: int | None = None,
         source_repository: str | None = None,
+        namespace: str | None = None,
         progress: ProgressSink = ignore_progress,
     ) -> object:
         self.sources.append(source_repository)
+        self.namespaces.append(namespace)
         if self._failure is not None:
             raise self._failure
         return _stub_diff_result()
@@ -2477,6 +2505,53 @@ def test_an_unauthenticated_request_has_no_source_repository() -> None:
 
     assert response.status_code == 202
     assert processor.sources == [None]
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/change", "/v1/diffcomment"])
+@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
+def test_the_namespace_is_the_roles(endpoint: str, accept: str) -> None:
+    processor = _SourceRecorder()
+    client = _source_client(
+        _ClaimsValidator("acme/auth-org-hub", namespace="auth"), processor
+    )
+
+    response = client.post(
+        endpoint,
+        json={"config_repo": "https://github.com/acme/auth-org-hub", "commit": "x"},
+        headers={"accept": accept},
+    )
+
+    assert response.status_code in {200, 202}
+    assert processor.namespaces == ["auth"]
+
+
+def test_a_role_naming_no_namespace_leaves_it_to_the_repository_name() -> None:
+    processor = _SourceRecorder()
+    client = _source_client(_ClaimsValidator("acme/auth-org-hub"), processor)
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "https://github.com/acme/auth-org-hub", "commit": "x"},
+    )
+
+    assert response.status_code == 202
+    assert processor.namespaces == [None]
+
+
+def test_a_config_generating_into_another_namespace_is_a_bad_request() -> None:
+    message = "fe-dev: the deploy config generates into namespace 'auth' (...)"
+    client = _source_client(
+        _ClaimsValidator("acme/auth-org-hub"),
+        _SourceRecorder(NamespaceMismatchError(message)),
+    )
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "https://github.com/acme/auth-org-hub", "commit": "x"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_deploy_config", "message": message}
 
 
 REFUSED = (

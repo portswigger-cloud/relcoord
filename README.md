@@ -226,6 +226,34 @@ as is naming outputs with `manifests-repository` rather than `[[output]]`
 entries. A typo there would otherwise narrow a pipeline to nothing rather than
 fail at the request.
 
+### Generating into a namespace of the role's choosing
+
+A config repository generates into the namespace named after it: a change from
+`example/grafana-resources` is generated as namespace `grafana-resources`, and
+only that namespace's directory of each output is committed and deployed. A role
+can name another one, for a repository whose namespace is not its name:
+
+```toml
+[[role]]
+name = "auth-org-hub"
+audience = "relcoord.platform-prod.portswigger.io"
+issuer = "https://token.actions.githubusercontent.com"
+claims = { repository = "example/auth-org-hub", ref = "refs/heads/main" }
+outputs = ["fe-dev", "fe-prod"]
+namespace = "auth"
+```
+
+A change from this role is generated as namespace `auth`, and config entries
+that leave out their `namespace` get that one. The namespace belongs to the
+repository the role names: generating it replaces what is in its directory, so
+two repositories given the same namespace overwrite each other. System mode
+generates every namespace and ignores it.
+
+A config that writes into any namespace other than the one it is generated as is
+refused with `invalid_deploy_config` (400), naming the files and both
+namespaces, rather than generating them and deploying nothing.
+`/v1/diffcomment` is refused the same way.
+
 ## Manifest validation
 
 With a `[validator]` section, every generated tree is validated by

@@ -27,6 +27,7 @@ from relcoord.change import (
     DeployConfigError,
     DeploymentDetectionError,
     GitTransportError,
+    NamespaceMismatchError,
     RolloutStageError,
     SystemRepositoryError,
 )
@@ -1292,6 +1293,172 @@ def test_namespace_from_repo(repo: str, namespace: str) -> None:
     assert change._namespace_from_repo(repo) == namespace
 
 
+def test_deploy_config_namespace_is_the_roles_when_it_names_one(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".deploy").mkdir()
+
+    _, namespace = change._deploy_config_and_namespace(
+        tmp_path,
+        "https://github.com/acme/auth-org-hub",
+        "deadbeef",
+        ".deploy",
+        False,
+        "auth",
+    )
+
+    assert namespace == "auth"
+
+
+def test_deploy_config_namespace_defaults_to_the_repository_name(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".deploy").mkdir()
+
+    _, namespace = change._deploy_config_and_namespace(
+        tmp_path, "https://github.com/acme/auth-org-hub", "deadbeef", ".deploy", False
+    )
+
+    assert namespace == "auth-org-hub"
+
+
+def test_system_mode_generates_as_system_whatever_the_role_namespace(
+    tmp_path: Path,
+) -> None:
+    _, namespace = change._deploy_config_and_namespace(
+        tmp_path, "https://github.com/acme/system", "deadbeef", ".deploy", True, "auth"
+    )
+
+    assert namespace is None
+
+
+def _namespace_output() -> OutputSettings:
+    return OutputSettings(
+        name="fe-dev",
+        repository="https://github.com/acme/manifests.git",
+        directory=Path("fe-dev"),
+    )
+
+
+def test_generated_namespace_check_accepts_the_namespace_and_its_owner_file(
+    tmp_path: Path,
+) -> None:
+    change._check_generated_namespace(
+        _namespace_output(),
+        tmp_path,
+        "auth",
+        {
+            tmp_path / "auth" / "deployment-api.yaml",
+            tmp_path / "owners" / "auth.toml",
+        },
+    )
+
+
+def test_generated_namespace_check_ignores_system_mode(tmp_path: Path) -> None:
+    change._check_generated_namespace(
+        _namespace_output(),
+        tmp_path,
+        None,
+        {tmp_path / "auth" / "deployment-api.yaml", tmp_path / "cluster" / "crd.yaml"},
+    )
+
+
+def test_generated_namespace_check_refuses_files_in_another_namespace(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(NamespaceMismatchError) as excinfo:
+        change._check_generated_namespace(
+            _namespace_output(),
+            tmp_path,
+            "auth-org-hub",
+            {
+                tmp_path / "auth" / "deployment-auth-org-hub.yaml",
+                tmp_path / "auth" / "service-auth-org-hub.yaml",
+                tmp_path / "owners" / "auth-org-hub.toml",
+            },
+        )
+
+    assert str(excinfo.value) == (
+        "fe-dev: the deploy config generates into namespace 'auth' "
+        "(auth/deployment-auth-org-hub.yaml, auth/service-auth-org-hub.yaml), "
+        "but this change generates into namespace 'auth-org-hub', so only files "
+        'there are deployed. Set namespace = "auth-org-hub" in the deploy config, '
+        "or give the relcoord role this change authenticates as the namespace it "
+        "should generate into."
+    )
+
+
+def _fake_namespace_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    written_namespace: str,
+    calls: list[tuple[object, ...]],
+) -> None:
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path, output_path: Path, *, namespace: str | None, **kwargs
+    ) -> GenerationResult:
+        calls.append(("generate", namespace))
+        return GenerationResult(
+            written_paths={output_path / written_namespace / "deployment-api.yaml"},
+            created_or_modified={
+                Ref(kind="Deployment", namespace=written_namespace, name="api")
+            },
+            removed=set(),
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(
+        change,
+        "_push_repository",
+        lambda repo_path, remote, idcat: calls.append(("push", remote)),
+    )
+
+
+def test_change_processor_generates_into_the_roles_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    _fake_namespace_change(monkeypatch, tmp_path, "auth", calls)
+
+    ChangeProcessor("https://github.com/acme/manifests.git").process(
+        "https://github.com/acme/auth-org-hub.git",
+        "deadbeef",
+        None,
+        namespace="auth",
+    )
+
+    assert calls == [
+        ("generate", "auth"),
+        ("push", "https://github.com/acme/manifests.git"),
+    ]
+
+
+def test_change_processor_refuses_a_config_generating_into_another_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    _fake_namespace_change(monkeypatch, tmp_path, "auth", calls)
+
+    with pytest.raises(NamespaceMismatchError, match="namespace 'auth-org-hub'"):
+        ChangeProcessor("https://github.com/acme/manifests.git").process(
+            "https://github.com/acme/auth-org-hub.git", "deadbeef", None
+        )
+
+    assert calls == [("generate", "auth-org-hub")]
+
+
 def test_checkout_commit_materializes_requested_commit(tmp_path: Path) -> None:
     source = tmp_path / "source-repo"
     repo = porcelain.init(source)
@@ -1588,7 +1755,7 @@ def test_change_processor_does_not_treat_an_object_moved_between_files_as_remove
         # The Namespace file moved: manifest-builder sees it deleted at the old
         # path and added at the new one.
         return GenerationResult(
-            written_paths={args[1] / "cluster" / "namespace.yaml"},
+            written_paths={args[1] / "config" / "namespace.yaml"},
             created_or_modified={namespace},
             removed={namespace, stale},
             manifest_ids={namespace: "ns-content"},
