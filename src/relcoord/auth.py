@@ -37,6 +37,10 @@ SIGNING_KEY_CACHE_MAX_SIZE = 32
 SIGNING_KEY_CACHE_TTL_SECONDS = 3600
 # A Kubernetes namespace name: an RFC 1123 label.
 NAMESPACE_PATTERN = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
+# Names manifest-builder gives a meaning of their own in a manifests tree: the
+# owners directory, and system's owner file, which generating a namespace named
+# system would replace.
+RESERVED_NAMESPACES = frozenset({"owners", "system"})
 PUBLIC_KEY_ALGORITHMS: tuple[str, ...] = tuple(
     name
     for name, algorithm in algorithms.get_default_algorithms().items()
@@ -511,6 +515,10 @@ def _role_namespace(data: dict[str, Any], *, context: str) -> str | None:
     if value is not None and not NAMESPACE_PATTERN.fullmatch(value):
         raise ValueError(
             f"{context} namespace {value!r} is not a valid Kubernetes namespace name"
+        )
+    if value in RESERVED_NAMESPACES:
+        raise ValueError(
+            f"{context} namespace {value!r} is reserved by manifest-builder"
         )
     return value
 
