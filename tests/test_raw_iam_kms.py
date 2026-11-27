@@ -122,6 +122,15 @@ def _document(api_version: str, kind: str, name: str = "x") -> str:
         ("kms.aws.upbound.io/v1beta1", "Key"),
         ("kms.aws.upbound.io/v1beta1", "Alias"),
         ("aws.upbound.io/v1beta1", "ProviderConfig"),
+        # provider-sql logs in to a database as its admin, namespaced and not.
+        ("postgresql.sql.m.crossplane.io/v1alpha1", "Role"),
+        ("postgresql.sql.m.crossplane.io/v1alpha1", "Grant"),
+        ("postgresql.sql.m.crossplane.io/v1alpha1", "ProviderConfig"),
+        ("postgresql.sql.m.crossplane.io/v1alpha1", "ClusterProviderConfig"),
+        ("postgresql.sql.crossplane.io/v1alpha1", "Role"),
+        ("postgresql.sql.crossplane.io/v1alpha1", "Extension"),
+        ("mysql.sql.m.crossplane.io/v1alpha1", "User"),
+        ("mssql.sql.crossplane.io/v1alpha1", "Grant"),
         # What decides and runs what a composite becomes.
         ("apiextensions.crossplane.io/v1", "CompositeResourceDefinition"),
         ("apiextensions.crossplane.io/v1", "Composition"),
@@ -160,9 +169,11 @@ def test_every_aws_and_crossplane_kind_in_any_version_is_found(
         ("iam.aws.m.upbound.io.example.com/v1", "Role"),
         ("crossplane.io/v1", "Thing"),
         ("upbound.io/v1", "Thing"),
+        ("nosql.crossplane.io/v1", "Thing"),
+        ("postgresql.sql.crossplane.io.example.com/v1", "Role"),
         # Other Crossplane groups and other providers are outside the rule.
         ("protection.crossplane.io/v1beta1", "Usage"),
-        ("postgresql.sql.crossplane.io/v1alpha1", "Role"),
+        ("portswigger.io/v1alpha1", "PostgresDatabase"),
         # The Crossplane groups are refused exactly, not the groups under them.
         ("example.pkg.crossplane.io/v1", "Thing"),
         ("sub.apiextensions.crossplane.io/v1", "Thing"),
