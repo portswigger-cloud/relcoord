@@ -5,11 +5,14 @@
 A Crossplane AWS resource reaches AWS directly: an IAM role, policy or KMS key
 is an identity or a key, a bucket or queue policy grants access as surely as
 IAM does, and a ``ProviderConfig`` says which AWS identity Crossplane acts as.
-Crossplane's own definitions go further still: a Composition or Function
-decides what a composite becomes, and an EnvironmentConfig feeds it. The only
-repository trusted to declare any of these is the system repository. Every
-other repository asks for what it needs through a composite resource such as a
-``KMSPermission``, whose Composition decides which raw resources it becomes.
+A provider-sql resource reaches a database directly, logging in as its admin:
+a ``Role`` or ``Grant`` decides who may do what in it. Crossplane's own
+definitions go further still: a Composition or Function decides what a
+composite becomes, and an EnvironmentConfig feeds it. The only repository
+trusted to declare any of these is the system repository. Every other
+repository asks for what it needs through a composite resource such as a
+``KMSPermission`` or a ``PostgresDatabase``, whose Composition decides which raw
+resources it becomes.
 
 This is a check on what a config repository generates, made here because
 relcoord is the one place that knows which repository a manifest came from:
@@ -38,8 +41,19 @@ from relcoord.validator import read_tree
 #: ``.m.`` ones are Crossplane v2's namespaced managed resources, the others the
 #: cluster-scoped ones of Crossplane v1, which manifest-builder cannot always
 #: tell are cluster-scoped and so would write into a namespace directory rather
-#: than refuse.
-SYSTEM_ONLY_API_GROUP_FAMILIES = frozenset({"aws.m.upbound.io", "aws.upbound.io"})
+#: than refuse. provider-sql's are one per database engine
+#: (``postgresql.sql.crossplane.io``, ``mysql.sql.crossplane.io``, ...), each
+#: with its ``ProviderConfig``, again with namespaced ``.m.`` ones: a
+#: ``PostgresDatabase`` leaves its admin login in its own namespace, which a raw
+#: ``Role`` or ``Grant`` there could use as the admin.
+SYSTEM_ONLY_API_GROUP_FAMILIES = frozenset(
+    {
+        "aws.m.upbound.io",
+        "aws.upbound.io",
+        "sql.crossplane.io",
+        "sql.m.crossplane.io",
+    }
+)
 
 #: API groups only the system repository may generate resources in, these
 #: groups exactly, in any version and of any kind. They define and run what
@@ -61,9 +75,9 @@ YAML_LOADER: type[yaml.SafeLoader] = getattr(yaml, "CSafeLoader", yaml.SafeLoade
 
 #: What a refused change can do instead, closing every refusal.
 REMEDY = (
-    "Ask for AWS access through a composite resource such as a KMSPermission "
-    "instead, or have the platform team add these resources to system. Removing "
-    "these resources is always allowed."
+    "Ask for AWS access or a database through a composite resource such as a "
+    "KMSPermission or PostgresDatabase instead, or have the platform team add "
+    "these resources to system. Removing these resources is always allowed."
 )
 
 

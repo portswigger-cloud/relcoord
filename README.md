@@ -343,21 +343,26 @@ and says why.
 ## Raw AWS and Crossplane resources
 
 Only the system repository may generate Crossplane AWS resources or Crossplane's
-own definitions directly: anything, of any kind and version, in `aws.m.upbound.io`
-or `aws.upbound.io` or a group under either, or in exactly
+own definitions directly: anything, of any kind and version, in `aws.m.upbound.io`,
+`aws.upbound.io`, `sql.m.crossplane.io` or `sql.crossplane.io` or a group under one
+of them, or in exactly
 `apiextensions.crossplane.io`, `pkg.crossplane.io` or `ops.crossplane.io`.
 
 | Group | What lives there |
 | --- | --- |
 | `aws.m.upbound.io` and every group under it | Crossplane v2's namespaced AWS resources, one group per service (`iam.aws.m.upbound.io`, `kms.aws.m.upbound.io`, `s3.aws.m.upbound.io`, ...), and the provider's `ProviderConfig` |
 | `aws.upbound.io` and every group under it | The same for Crossplane v1, cluster-scoped |
+| `sql.m.crossplane.io` and every group under it | provider-sql's namespaced resources, one group per database engine (`postgresql.sql.m.crossplane.io`, ...): roles, grants, databases and the `ProviderConfig` that logs in as the database's admin |
+| `sql.crossplane.io` and every group under it | The same, cluster-scoped |
 | `apiextensions.crossplane.io` | `CompositeResourceDefinition`, `Composition`, `EnvironmentConfig` |
 | `pkg.crossplane.io` | `Provider`, `Function`, `Configuration` and their runtime configuration |
 | `ops.crossplane.io` | Crossplane v2 `Operation`s, which run functions against other resources |
 
 An IAM role or KMS key is an identity or a key; a bucket, queue or repository
 policy grants access as IAM does; a `ProviderConfig` says which AWS identity
-Crossplane acts as; and a Composition, Function or EnvironmentConfig decides
+Crossplane acts as; a provider-sql `Role` or `Grant` acts in a database as its
+admin, whose login a `PostgresDatabase` keeps in its own namespace; and a
+Composition, Function or EnvironmentConfig decides
 what a composite becomes. Every other repository asks for what it needs through
 a composite resource, such as a `KMSPermission`, whose Composition (system's)
 decides which raw resources it becomes. Composite resources in other groups
